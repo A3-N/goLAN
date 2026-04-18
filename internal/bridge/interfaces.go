@@ -128,6 +128,37 @@ func DiscoverInterfaces() ([]NetInterface, error) {
 	return ifaces, nil
 }
 
+// LockdownInterface forcefully isolates a physical network adapter.
+// It tears down its IPv4 routing, disables IPv6 autoconfiguration, and holds it DOWN
+// to guarantee 0 packets leak to the network before goLAN takes over.
+func LockdownInterface(ifName, hardwarePort string) error {
+	var errs []string
+
+	// 1. Administratively cut power
+	if out, err := exec.Command("ifconfig", ifName, "down").CombinedOutput(); err != nil {
+		errs = append(errs, fmt.Sprintf("down failed: %v (%s)", err, strings.TrimSpace(string(out))))
+	}
+
+	// 2. Strip IPv4 leases natively
+	if out, err := exec.Command("ifconfig", ifName, "0.0.0.0").CombinedOutput(); err != nil {
+		// Ignore metric errors if the interface didn't have an IP anyway
+		if !strings.Contains(string(out), "invalid") && !strings.Contains(string(out), "file exists") {
+			errs = append(errs, fmt.Sprintf("ipv4 strip failed: %v (%s)", err, strings.TrimSpace(string(out))))
+		}
+	}
+
+	// 3. Disable OS tracking explicitly (stops configd from running DHCP or bringing it UP on cable hot-plugs)
+	if hardwarePort != "" {
+		_ = exec.Command("networksetup", "-setnetworkserviceenabled", hardwarePort, "off").Run()
+		_ = exec.Command("networksetup", "-setv6off", hardwarePort).Run()
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("lockdown non-fatal errors on %s: %s", ifName, strings.Join(errs, " | "))
+	}
+	return nil
+}
+
 // GetInterfaceDetail fetches live metadata for a given interface.
 func GetInterfaceDetail(device string) InterfaceDetail {
 	var d InterfaceDetail

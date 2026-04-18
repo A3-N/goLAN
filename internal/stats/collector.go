@@ -22,6 +22,7 @@ type InterfaceStats struct {
 	TxErrors   uint64
 	RxDropped  uint64
 	TxDropped  uint64
+	MediaActive bool
 }
 
 // InterfaceDelta holds computed deltas and throughput for a single interface.
@@ -190,6 +191,11 @@ func readInterfaceStats(ifaceName string) InterfaceStats {
 	out, err := exec.Command("netstat", "-I", ifaceName, "-b").Output()
 	if err != nil {
 		return stats
+	}
+
+	// Capture physical media link state natively
+	if outMedia, err := exec.Command("ifconfig", ifaceName).Output(); err == nil {
+		stats.MediaActive = strings.Contains(string(outMedia), "status: active")
 	}
 
 	lines := strings.Split(string(out), "\n")
