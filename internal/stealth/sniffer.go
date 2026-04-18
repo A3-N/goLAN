@@ -13,10 +13,13 @@ import (
 
 // TargetIdentity holds the network identity of the true device we are piggybacking.
 type TargetIdentity struct {
-	MAC     net.HardwareAddr
-	IP      net.IP
-	Netmask net.IPMask
-	Gateway net.IP
+	MAC              net.HardwareAddr
+	IP               net.IP
+	Netmask          net.IPMask
+	Gateway          net.IP
+	EAPOLDetected    bool              // 802.1X frames seen on the wire
+	AuthenticatorMAC net.HardwareAddr  // Switch-side MAC sending EAPOL
+	VLANID           uint16            // 802.1Q VLAN tag (0 = untagged)
 }
 
 // String returns a human readable representation.
@@ -45,15 +48,16 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 	ignoreMAC, _ := net.ParseMAC(ignoreMACStr)
 
 	eventLog(fmt.Sprintf("[*] Initializing Pcap handle on interface: %s", s.iface))
-	handle, err := pcap.OpenLive(s.iface, 1600, true, pcap.BlockForever)
+	handle, err := pcap.OpenLive(s.iface, 65535, true, pcap.BlockForever)
 	if err != nil {
 		return nil, err
 	}
 	defer handle.Close()
 
-	if err := handle.SetBPFFilter("outbound and not arp and not rarp"); err == nil {
-		// Optimization, ignore BPF errors.
-	}
+	// NOTE: No BPF filter is applied here. The previous filter
+	// "outbound and not arp and not rarp" silently blocked EAPOL (0x888E)
+	// frames which prevented 802.1X detection. We now capture everything
+	// and filter in userspace to also detect EAPOL.
 
 	eventLog("[*] Awaiting first valid unicast MAC to lock onto target...")
 
@@ -77,7 +81,19 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 			ethLayer := packet.Layer(layers.LayerTypeEthernet)
 			if ethLayer != nil {
 				eth, _ := ethLayer.(*layers.Ethernet)
-				
+
+				// 1a. Detect 802.1X EAPOL frames (EtherType 0x888E).
+				//     These are sent to the PAE multicast address 01:80:c2:00:00:03.
+				//     We flag them but don't try to use them for MAC discovery.
+				if eth.EthernetType == 0x888E {
+					if !id.EAPOLDetected {
+						id.EAPOLDetected = true
+						id.AuthenticatorMAC = eth.SrcMAC
+						eventLog(fmt.Sprintf("[802.1X] EAPOL frame detected from %s — 802.1X is active on this port", eth.SrcMAC))
+					}
+					continue // Don't process EAPOL as normal traffic
+				}
+
 				// Skip broadcast/multicast sources
 				if eth.SrcMAC[0]&1 != 0 {
 					continue
@@ -101,6 +117,18 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 				// If this packet is not from our target, ignore it.
 				if len(id.MAC) > 0 && !macEqual(eth.SrcMAC, id.MAC) && !macEqual(eth.DstMAC, id.MAC) {
 					continue
+				}
+			}
+
+			// 1b. Detect 802.1Q VLAN tags.
+			// gopacket automatically decodes Dot1Q headers. If present, record the VLAN ID.
+			// This is critical for post-802.1X RADIUS-assigned VLANs.
+			dot1qLayer := packet.Layer(layers.LayerTypeDot1Q)
+			if dot1qLayer != nil {
+				dot1q, _ := dot1qLayer.(*layers.Dot1Q)
+				if id.VLANID == 0 && dot1q.VLANIdentifier != 0 {
+					id.VLANID = dot1q.VLANIdentifier
+					eventLog(fmt.Sprintf("[+] 802.1Q VLAN tag detected: VLAN %d", id.VLANID))
 				}
 			}
 

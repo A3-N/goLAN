@@ -25,6 +25,8 @@ go build -o .
 
 [Guide of non 802.1x Setup](EXAMPLE.md)
 
+[802.1X Scenario Walkthrough](SCENARIOS.md)
+
 ## License
 
 See [LICENSE](LICENSE) for details.
