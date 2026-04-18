@@ -62,6 +62,7 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 
 	id := &TargetIdentity{}
 	hasTriggeredMacCallback := false
+	linkLocalLogged := false
 
 	for {
 		select {
@@ -134,8 +135,12 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 					if macEqual(senderMAC, id.MAC) {
 						if len(id.IP) == 0 && !senderIP.IsUnspecified() {
 							if strings.HasPrefix(senderIP.String(), "169.254") {
-								eventLog(fmt.Sprintf("[*] Ignored Link-Local Self-Assignment: %s", senderIP.String()))
-								eventLog("[*] Waiting indefinitely for native DHCP ACK.")
+								if !linkLocalLogged {
+									eventLog(fmt.Sprintf("[*] Ignored Link-Local Self-Assignment: %s", senderIP.String()))
+									eventLog("[*] Waiting indefinitely for native DHCP ACK.")
+									eventLog("[+] Air-gap finalized. Safe to plug in the Router LAN.")
+									linkLocalLogged = true
+								}
 							} else {
 								id.IP = senderIP
 								eventLog(fmt.Sprintf("[+] Discovered Target Real IP: %s", id.IP.String()))
