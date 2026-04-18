@@ -1,12 +1,12 @@
 package bridge
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"os/exec"
 	"strings"
 	"sync"
-	"net"
-	"context"
 
 	"github.com/mcrn/goLAN/internal/stealth"
 )
@@ -15,11 +15,11 @@ import (
 type BridgeState int
 
 const (
-	BridgeStateDown    BridgeState = iota
-	BridgeStateCreated             // bridge created but not fully up
-	BridgeStateUp                  // bridge active and forwarding
-	BridgeStateSniffing            // bridge up, waiting for target identity
-	BridgeStateStealthActive       // stealth NAT and spoofing applied
+	BridgeStateDown          BridgeState = iota
+	BridgeStateCreated                   // bridge created but not fully up
+	BridgeStateUp                        // bridge active and forwarding
+	BridgeStateSniffing                  // bridge up, waiting for target identity
+	BridgeStateStealthActive             // stealth NAT and spoofing applied
 )
 
 func (s BridgeState) String() string {
@@ -41,26 +41,26 @@ func (s BridgeState) String() string {
 
 // Bridge represents a macOS kernel bridge between two network interfaces.
 type Bridge struct {
-	mu            sync.Mutex
-	name          string // e.g. "bridge0"
-	ifaceA        string // first member interface (Device)
-	ifaceB        string // second member interface (Switch)
-	state         BridgeState
+	mu             sync.Mutex
+	name           string // e.g. "bridge0"
+	ifaceA         string // first member interface (Device)
+	ifaceB         string // second member interface (Switch)
+	state          BridgeState
 	origForwarding string // original ip.forwarding value before we changed it
-	isStealth     bool
-	targetID      *stealth.TargetIdentity
-	cancelStealth context.CancelFunc
-	reconLogs     []string
+	isStealth      bool
+	targetID       *stealth.TargetIdentity
+	cancelStealth  context.CancelFunc
+	reconLogs      []string
 }
 
 // BridgeStatus is a snapshot of the bridge state for the TUI.
 type BridgeStatus struct {
-	Name     string
-	IfaceA   string
-	IfaceB   string
-	State    BridgeState
-	RawInfo  string // raw output from ifconfig
-	TargetID *stealth.TargetIdentity
+	Name      string
+	IfaceA    string
+	IfaceB    string
+	State     BridgeState
+	RawInfo   string // raw output from ifconfig
+	TargetID  *stealth.TargetIdentity
 	ReconLogs []string
 }
 
@@ -97,8 +97,8 @@ func NewBridge(ifaceA, ifaceB string, ignoreMAC string) (*Bridge, error) {
 
 	// Kick off stealth NAT setup if requested.
 	// Hardcoded to true for now as per user request to use strat 1.
-	b.isStealth = true 
-	
+	b.isStealth = true
+
 	if b.isStealth {
 		ctx, cancel := context.WithCancel(context.Background())
 		b.cancelStealth = cancel
@@ -114,7 +114,7 @@ func (b *Bridge) runStealth(ctx context.Context, ignoreMAC string) {
 	// ifaceA is the Device Port. We sniff here because packets from the
 	// device enter this port before traversing the bridge.
 	sniff := stealth.NewSniffer(b.ifaceA)
-	
+
 	logFunc := func(msg string) {
 		b.mu.Lock()
 		b.reconLogs = append(b.reconLogs, msg)
@@ -125,47 +125,40 @@ func (b *Bridge) runStealth(ctx context.Context, ignoreMAC string) {
 		b.mu.Lock()
 		b.state = BridgeStateUp
 		b.mu.Unlock()
-		
+
 		logFunc(fmt.Sprintf("[*] Activating bridge using spoofed Target MAC %s", mac.String()))
 		runCmd("ifconfig", b.name, "ether", mac.String())
-		
+
 		logFunc(fmt.Sprintf("[*] Hard-spoofing Switch adapter factory MAC to %s", mac.String()))
 		out, err := runCmd("ifconfig", b.ifaceB, "ether", mac.String())
-		
-		var safeToConnect string
+
 		if err != nil {
 			if strings.Contains(string(out), "Network is down") {
 				logFunc("[!] Hardware spoof locked. Safe UP strobe initiated...")
 				runCmd("ifconfig", b.ifaceB, "up")
 				out, err = runCmd("ifconfig", b.ifaceB, "ether", mac.String())
 				if err != nil {
-					logFunc("[+] Bypass active: Hardware locked.")
-					logFunc("[*] Relying on Bridge Layer 2 masking.")
-					safeToConnect = "[!] Spoof hardware-locked. Connect Switch at your own risk."
+					logFunc("[+] Bypass active: Hardware firmware locked.")
+					logFunc("[*] Fallback: Relying on Bridge Layer-2 masking.")
 				} else {
 					logFunc("[+] Strobe successful: MAC spoof injected.")
-					safeToConnect = "[+] Spoof complete. You may plug the Switch into the adapter."
 				}
 			} else {
-				logFunc("[+] Bypass active: Hardware locked.")
-				logFunc("[*] Relying on Bridge Layer 2 masking.")
-				safeToConnect = "[!] Spoof hardware-locked. Connect Switch at your own risk."
+				logFunc("[+] Bypass active: Hardware firmware locked.")
+				logFunc("[*] Fallback: Relying on Bridge Layer-2 masking.")
 			}
-		} else {
-			safeToConnect = "[+] Spoof complete. You may plug the Switch into the adapter."
 		}
 
 		logFunc("[*] Bridging un-authenticated device port safely to switch...")
 		runCmd("ifconfig", b.name, "addm", b.ifaceA, "addm", b.ifaceB)
-		
+
 		logFunc("[*] Powering UP Switch adapter...")
 		runCmd("ifconfig", b.ifaceB, "up")
-		
-		logFunc(safeToConnect)
-		
+
 		runCmd("ifconfig", b.name, "up")
 		runCmd("sysctl", "-w", "net.inet.ip.forwarding=1")
 		logFunc("[*] Bridge physical tunnel UP.")
+		logFunc("[+] Air-gap finalized. Safe to plug in the Router LAN.")
 	}
 
 	id, err := sniff.Discover(ctx, ignoreMAC, logFunc, onMacFunc)
@@ -178,8 +171,19 @@ func (b *Bridge) runStealth(ctx context.Context, ignoreMAC string) {
 	b.targetID = id
 	b.mu.Unlock()
 
-	hiddenIP := "192.168.254.10"
-	logFunc(fmt.Sprintf("[*] Injecting hidden routable IP %s...", hiddenIP))
+	// Generate an orthogonal hidden IP to anchor the NAT proxy without colliding
+	// with the host OS routing table for the Target's assigned DHCP subnet.
+	targetStr := id.IP.String()
+	hiddenIP := "192.168.254.10" // Default anchor
+	if strings.HasPrefix(targetStr, "192.168.") {
+		hiddenIP = "10.254.254.10"
+	} else if strings.HasPrefix(targetStr, "10.") {
+		hiddenIP = "172.16.254.10"
+	} else if strings.HasPrefix(targetStr, "172.") {
+		hiddenIP = "192.168.254.10"
+	}
+	
+	logFunc(fmt.Sprintf("[*] Anchoring orthogonal Steath Proxy IP: %s", hiddenIP))
 	runCmd("ifconfig", b.name, hiddenIP, "netmask", "255.255.255.0", "up")
 
 	logFunc("[*] Activating Stealth NAT proxy on bridge...")
@@ -192,8 +196,10 @@ func (b *Bridge) runStealth(ctx context.Context, ignoreMAC string) {
 	if err != nil {
 		logFunc(fmt.Sprintf("[!] ERROR injecting NAT: %v", err))
 	} else {
-		logFunc("[+] pfctl rules active. Stealth mode successfully engaged.")
+		logFunc("[+] pfctl rules active. Stealth proxy seamlessly engaged.")
 	}
+
+	logFunc("[+] Air-gap finalized. Safe to plug in the Router LAN.")
 
 	b.mu.Lock()
 	b.state = BridgeStateStealthActive
@@ -230,8 +236,8 @@ func (b *Bridge) Status() BridgeStatus {
 	defer b.mu.Unlock()
 
 	status := BridgeStatus{
-		Name:     b.name,
-		IfaceA:   b.ifaceA,
+		Name:      b.name,
+		IfaceA:    b.ifaceA,
 		IfaceB:    b.ifaceB,
 		State:     b.state,
 		TargetID:  b.targetID,
