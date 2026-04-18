@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -29,6 +30,7 @@ type DashboardModel struct {
 	width  int
 	height int
 	err    error
+	logScroll int
 }
 
 // statsMsg wraps a stats update for the Bubbletea update loop.
@@ -52,10 +54,9 @@ func NewDashboardModel(ifA, ifB bridge.NetInterface) DashboardModel {
 	}
 }
 
-// createBridge is a tea.Cmd that creates the kernel bridge.
-func createBridge(ifA, ifB string) tea.Cmd {
+func (m DashboardModel) createBridgeCmd(ifA, ifB string, ignoreMAC string) tea.Cmd {
 	return func() tea.Msg {
-		br, err := bridge.NewBridge(ifA, ifB)
+		br, err := bridge.NewBridge(ifA, ifB, ignoreMAC)
 		if err != nil {
 			return bridgeErrorMsg{err: err}
 		}
@@ -75,7 +76,13 @@ func waitForStats(ch <-chan stats.StatsUpdate) tea.Cmd {
 }
 
 func (m DashboardModel) Init() tea.Cmd {
-	return createBridge(m.ifaceA.Name, m.ifaceB.Name)
+	// Lock down both interfaces explicitly before initiating bridge creation
+	// to prevent OS leaks to the physical wire. This happens synchronously
+	// in the TUI thread.
+	_ = bridge.LockdownInterface(m.ifaceA.Name, m.ifaceA.HardwarePort)
+	_ = bridge.LockdownInterface(m.ifaceB.Name, m.ifaceB.HardwarePort)
+
+	return m.createBridgeCmd(m.ifaceA.Name, m.ifaceB.Name, m.ifaceA.CurrentMAC)
 }
 
 func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
@@ -108,7 +115,29 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 		return m, waitForStats(m.statsCh)
 
 	case tea.KeyMsg:
-		// Key handling at dashboard level (esc/q handled by root model).
+		switch msg.String() {
+		case "up", "k":
+			m.logScroll++
+		case "down", "j":
+			m.logScroll--
+		}
+		
+		maxVis := 6
+		logsLen := 0
+		if m.bridge != nil {
+			logsLen = len(m.bridge.Status().ReconLogs)
+		}
+		
+		if m.logScroll > logsLen - maxVis {
+			if logsLen > maxVis {
+				m.logScroll = logsLen - maxVis
+			} else {
+				m.logScroll = 0
+			}
+		}
+		if m.logScroll < 0 {
+			m.logScroll = 0
+		}
 	}
 
 	return m, nil
@@ -161,9 +190,9 @@ func (m DashboardModel) View() string {
 	sb.WriteString(m.renderTrafficStats(contentWidth))
 	sb.WriteString("\n")
 
-	// ── Sparkline Throughput ─────────────────────────────────────
+	// ── Sparkline Throughput & Recon Logs ────────────────────────
 	if m.collector != nil {
-		sb.WriteString(m.renderThroughputGraphs(contentWidth))
+		sb.WriteString(m.renderBottomSection(contentWidth))
 		sb.WriteString("\n")
 	}
 
@@ -173,11 +202,27 @@ func (m DashboardModel) View() string {
 	return sb.String()
 }
 
+
+
 func (m DashboardModel) renderHeader(width int) string {
-	state := styleUp.Render("● ACTIVE")
-	if m.bridge == nil {
-		state = styleDim.Render("○ CONNECTING")
+	var stateStr string
+	bState := bridge.BridgeStateDown
+	if m.bridge != nil {
+		bState = m.bridge.State()
 	}
+
+	switch bState {
+	case bridge.BridgeStateUp:
+		stateStr = styleUp.Render("● ACTIVE")
+	case bridge.BridgeStateSniffing:
+		stateStr = styleWarning.Render("○ RECONNAISSANCE: Sniffing Target Identity...")
+	case bridge.BridgeStateStealthActive:
+		stateStr = styleUp.Render("● STEALTH ACTIVE")
+	default:
+		stateStr = styleDim.Render("○ CONNECTING")
+	}
+
+	state := stateStr
 
 	uptime := ""
 	if m.hasStats {
@@ -241,30 +286,73 @@ func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
 			styleDim.Render(fmt.Sprintf("MTU: %d", m.ifaceB.MTU)),
 	)
 
-	// Middle Man box — always green (it always exists as the passthrough).
+	middleContent := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render("● goLAN Engine") + "\n" +
+		styleDim.Render("Middle Man Proxy") + "\n"
+	
+	bState := bridge.BridgeStateDown
+	if m.bridge != nil {
+		bState = m.bridge.State()
+	}
+
+	if m.bridge != nil {
+		if bState == bridge.BridgeStateStealthActive {
+			middleContent += styleDim.Render("Bridged (Spoofed)") + "\n" +
+				lipgloss.NewStyle().Foreground(colorGreen).Render("NAT Masqueraded")
+		} else if bState == bridge.BridgeStateSniffing {
+			middleContent += lipgloss.NewStyle().Foreground(colorYellow).Render("Reconnaissance...") + "\n" +
+				styleDim.Render("Air-gapped (Secure)")
+		} else {
+			middleContent += styleDim.Render("Transparent") + "\n" +
+				styleDim.Render("L2 Passthrough")
+		}
+	} else {
+		middleContent += "\n\n"
+	}
+
+	// Make the middle man box exactly the same layout structure as the outer cards.
 	middleManBox := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorGreen).
-		Foreground(colorGreen).
-		Bold(true).
-		Padding(1, 2).
-		Render("Middle Man")
+		Padding(0, 1).
+		Width(cardWidth).
+		Render(middleContent)
 
-	// Connection wires — green if bridge is active, red if not.
-	wireActive := m.bridge != nil && m.bridge.State() == bridge.BridgeStateUp
-	wireStyle := lipgloss.NewStyle().Foreground(colorRed).Bold(true)
+	// Connection wires — green if bridge is active, red sequence if not.
+	wireActive := bState == bridge.BridgeStateUp || bState == bridge.BridgeStateStealthActive
+	
+	wireStrA := " ═══❌═══ "
+	wireStrB := " ═══❌═══ "
+	wireStyleA := lipgloss.NewStyle().Foreground(colorRed).Bold(true)
+	wireStyleB := lipgloss.NewStyle().Foreground(colorRed).Bold(true)
+	
 	if wireActive {
-		wireStyle = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
+		wireStrA = " ════════ "
+		wireStrB = " ════════ "
+		wireStyleA = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
+		wireStyleB = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
 	}
 
-	wire := wireStyle.Render(" ══════ ")
+	// Physical overrides: If media is physically inactive (cable unplugged), force the X.
+	if m.hasStats {
+		if !m.latestStats.IfaceA.Stats.MediaActive {
+			wireStrA = " ═══❌═══ "
+			wireStyleA = lipgloss.NewStyle().Foreground(colorRed).Bold(true)
+		}
+		if !m.latestStats.IfaceB.Stats.MediaActive {
+			wireStrB = " ═══❌═══ "
+			wireStyleB = lipgloss.NewStyle().Foreground(colorRed).Bold(true)
+		}
+	}
+
+	wireA := wireStyleA.Render(wireStrA)
+	wireB := wireStyleB.Render(wireStrB)
 
 	diagram := lipgloss.JoinHorizontal(
 		lipgloss.Center,
 		cardA,
-		wire,
+		wireA,
 		middleManBox,
-		wire,
+		wireB,
 		cardB,
 	)
 
@@ -323,13 +411,13 @@ func (m DashboardModel) renderTrafficStats(width int) string {
 	return section
 }
 
-func (m DashboardModel) renderThroughputGraphs(width int) string {
-	sparkWidth := (width - 16) / 2
+func (m DashboardModel) renderBottomSection(width int) string {
+	sparkWidth := (width - 20) / 3
 	if sparkWidth < 20 {
 		sparkWidth = 20
 	}
-	if sparkWidth > 60 {
-		sparkWidth = 60
+	if sparkWidth > 50 {
+		sparkWidth = 50
 	}
 
 	histARx := m.collector.History(m.ifaceA.Name + "_rx")
@@ -339,16 +427,85 @@ func (m DashboardModel) renderThroughputGraphs(width int) string {
 
 	renderSpark := func(label string, rxHist, txHist []float64, style lipgloss.Style) string {
 		var sb strings.Builder
-		sb.WriteString(styleDim.Render("  "+label) + "\n")
-		sb.WriteString(styleDim.Render("  RX ") + renderSparkline(rxHist, sparkWidth, style) + "\n")
-		sb.WriteString(styleDim.Render("  TX ") + renderSparkline(txHist, sparkWidth, style) + "\n")
+		sb.WriteString(styleLabel.Render(label) + "\n")
+		sb.WriteString(styleDim.Render("RX ") + renderSparkline(rxHist, sparkWidth, style) + "\n")
+		sb.WriteString(styleDim.Render("TX ") + renderSparkline(txHist, sparkWidth, style) + "\n")
 		return sb.String()
 	}
 
 	graphA := renderSpark(m.ifaceA.Name+" (Device)", histARx, histATx, styleSparkDevice)
 	graphB := renderSpark(m.ifaceB.Name+" (Switch)", histBRx, histBTx, styleSparkSwitch)
+	graphs := graphA + "\n" + graphB
 
-	return "  " + styleLabel.Render("Throughput") + "\n" + graphA + graphB
+	// ── Recon Logs ──────────────────────────────────────────────────
+	var logsPanel string
+	if m.bridge != nil {
+		status := m.bridge.Status()
+		// Only render logs if we have them, or if we are actively sniffing
+		if len(status.ReconLogs) > 0 || status.State == bridge.BridgeStateSniffing || status.State == bridge.BridgeStateStealthActive {
+			var sb strings.Builder
+			sb.WriteString(styleLabel.Render("Reconnaissance Log") + styleDim.Render("  (Use Up/Down or J/K to scroll)") + "\n")
+			logs := []string{"[*] Waiting for sniffer to initialize..."}
+			if len(status.ReconLogs) > 0 {
+				logs = status.ReconLogs
+			}
+			
+			maxVis := 6
+			logsLen := len(logs)
+			
+			start := logsLen - maxVis - m.logScroll
+			if start < 0 { start = 0 }
+			end := start + maxVis
+			if end > logsLen { end = logsLen }
+			
+			for _, log := range logs[start:end] {
+				sb.WriteString(formatLogLine(log) + "\n")
+			}
+			// Wrap in a fixed-height container so the UI never physically jumps
+			logsPanel = lipgloss.NewStyle().Height(10).Render(sb.String())
+		}
+	}
+
+	// Join both columns horizontally
+	columns := lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		lipgloss.NewStyle().Width(sparkWidth + 10).Render(graphs),
+		lipgloss.NewStyle().MarginLeft(4).Render(logsPanel),
+	)
+
+	return "  " + styleLabel.Render("Throughput & Identity") + "\n" +
+		lipgloss.NewStyle().MarginLeft(2).Render(columns)
+}
+
+var (
+	colorBulletBlue  = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
+	colorBulletGreen = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+	colorBulletRed   = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	colorGray        = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	colorBoldWhite   = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true)
+	
+	macRegex = regexp.MustCompile(`(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}`)
+	ipRegex  = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
+)
+
+func formatLogLine(line string) string {
+	line = macRegex.ReplaceAllStringFunc(line, func(m string) string {
+		return "\x1b[0m\x1b[1;38;5;255m" + m + "\x1b[0m\x1b[38;5;241m"
+	})
+	line = ipRegex.ReplaceAllStringFunc(line, func(m string) string {
+		return "\x1b[0m\x1b[1;38;5;255m" + m + "\x1b[0m\x1b[38;5;241m"
+	})
+
+	if strings.HasPrefix(line, "[*]") {
+		return colorBulletBlue.Render("[*]") + colorGray.Render(line[3:])
+	} else if strings.HasPrefix(line, "[+]") {
+		return colorBulletGreen.Render("[+]") + colorGray.Render(line[3:])
+	} else if strings.HasPrefix(line, "[!]") {
+		return colorBulletRed.Render("[!]") + colorGray.Render(line[3:])
+	} else if strings.HasPrefix(line, "    ") {
+		return "    " + colorGray.Render(line[4:])
+	}
+	return colorGray.Render("• " + line)
 }
 
 func (m DashboardModel) renderFooter() string {
