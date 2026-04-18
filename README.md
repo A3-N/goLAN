@@ -2,6 +2,8 @@
 
 Software Layer 2 network bridge for macOS; virtual female-to-female RJ45 adapter.
 
+# WIP 2 802.1X
+
 > [!IMPORTANT]
 > Requires root privileges to run.
 
