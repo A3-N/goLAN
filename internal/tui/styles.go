@@ -20,6 +20,7 @@ var (
 	colorDevice = lipgloss.Color("#ff9100") // Orange — Device port
 	colorSwitch = lipgloss.Color("#e040fb") // Magenta — Switch port
 	colorConflict = lipgloss.Color("#ff1744") // Red — both on same row
+	color802dot1X = lipgloss.Color("#7c4dff") // Purple — 802.1X indicators
 )
 
 // ─── Layout Styles ──────────────────────────────────────────────────────────

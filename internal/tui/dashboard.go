@@ -218,6 +218,16 @@ func (m DashboardModel) renderHeader(width int) string {
 		stateStr = styleWarning.Render("○ RECONNAISSANCE: Sniffing Target Identity...")
 	case bridge.BridgeStateStealthActive:
 		stateStr = styleUp.Render("● STEALTH ACTIVE")
+	case bridge.BridgeStateEAPOLDetected:
+		stateStr = lipgloss.NewStyle().Foreground(color802dot1X).Bold(true).Render("◎ 802.1X DETECTED")
+	case bridge.BridgeStateEAPOLRelaying:
+		stateStr = lipgloss.NewStyle().Foreground(color802dot1X).Bold(true).Render("◎ 802.1X AUTHENTICATING...")
+	case bridge.BridgeStateEAPOLAuthenticated:
+		stateStr = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render("● 802.1X AUTHENTICATED")
+	case bridge.BridgeStateEAPOLFailed:
+		stateStr = styleError.Render("✗ 802.1X FAILED")
+	case bridge.BridgeStateDowngrading:
+		stateStr = styleWarning.Render("⟳ MACSEC DOWNGRADE...")
 	default:
 		stateStr = styleDim.Render("○ CONNECTING")
 	}
@@ -295,13 +305,35 @@ func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
 	}
 
 	if m.bridge != nil {
-		if bState == bridge.BridgeStateStealthActive {
+		switch bState {
+		case bridge.BridgeStateStealthActive:
 			middleContent += styleDim.Render("Bridged (Spoofed)") + "\n" +
 				lipgloss.NewStyle().Foreground(colorGreen).Render("NAT Masqueraded")
-		} else if bState == bridge.BridgeStateSniffing {
+		case bridge.BridgeStateSniffing:
 			middleContent += lipgloss.NewStyle().Foreground(colorYellow).Render("Reconnaissance...") + "\n" +
 				styleDim.Render("Air-gapped (Secure)")
-		} else {
+		case bridge.BridgeStateEAPOLDetected:
+			middleContent += lipgloss.NewStyle().Foreground(color802dot1X).Bold(true).Render("802.1X Detected") + "\n" +
+				styleDim.Render("EAPOL Relay Pending")
+		case bridge.BridgeStateEAPOLRelaying:
+			status := m.bridge.Status()
+			methodStr := "Negotiating..."
+			if status.EAPMethod != "" && status.EAPMethod != "Unknown" {
+				methodStr = status.EAPMethod
+			}
+			middleContent += lipgloss.NewStyle().Foreground(color802dot1X).Bold(true).Render("EAPOL Relay Active") + "\n" +
+				styleDim.Render("Method: "+methodStr)
+		case bridge.BridgeStateEAPOLAuthenticated:
+			status := m.bridge.Status()
+			middleContent += lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render("802.1X Authenticated") + "\n" +
+				styleDim.Render("Method: "+status.EAPMethod)
+		case bridge.BridgeStateEAPOLFailed:
+			middleContent += lipgloss.NewStyle().Foreground(colorRed).Bold(true).Render("802.1X FAILED") + "\n" +
+				styleDim.Render("Auth Rejected")
+		case bridge.BridgeStateDowngrading:
+			middleContent += lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("MACsec Downgrade") + "\n" +
+				styleDim.Render("Stripping MKA...")
+		default:
 			middleContent += styleDim.Render("Transparent") + "\n" +
 				styleDim.Render("L2 Passthrough")
 		}
@@ -318,7 +350,8 @@ func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
 		Render(middleContent)
 
 	// Connection wires — green if bridge is active, red sequence if not.
-	wireActive := bState == bridge.BridgeStateUp || bState == bridge.BridgeStateStealthActive
+	wireActive := bState == bridge.BridgeStateUp || bState == bridge.BridgeStateStealthActive ||
+		bState == bridge.BridgeStateEAPOLAuthenticated || bState == bridge.BridgeStateEAPOLRelaying
 	
 	wireStrA := " ═══❌═══ "
 	wireStrB := " ═══❌═══ "
@@ -481,8 +514,8 @@ var (
 	colorBulletBlue  = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
 	colorBulletGreen = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
 	colorBulletRed   = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	colorBulletPurple = lipgloss.NewStyle().Foreground(color802dot1X).Bold(true)
 	colorGray        = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	colorBoldWhite   = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true)
 	
 	macRegex = regexp.MustCompile(`(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}`)
 	ipRegex  = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
@@ -502,6 +535,12 @@ func formatLogLine(line string) string {
 		return colorBulletGreen.Render("[+]") + colorGray.Render(line[3:])
 	} else if strings.HasPrefix(line, "[!]") {
 		return colorBulletRed.Render("[!]") + colorGray.Render(line[3:])
+	} else if strings.HasPrefix(line, "[802.1X]") {
+		return colorBulletPurple.Render("[802.1X]") + colorGray.Render(line[8:])
+	} else if strings.HasPrefix(line, "[RELAY]") {
+		return colorBulletPurple.Render("[RELAY]") + colorGray.Render(line[7:])
+	} else if strings.HasPrefix(line, "[MACSEC]") {
+		return colorBulletPurple.Render("[MACSEC]") + colorGray.Render(line[8:])
 	} else if strings.HasPrefix(line, "    ") {
 		return "    " + colorGray.Render(line[4:])
 	}
