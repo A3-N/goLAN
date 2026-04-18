@@ -159,24 +159,8 @@ func (b *Bridge) destroy() error {
 
 	var errs []string
 
-	// Bring bridge down.
-	if _, err := runCmd("ifconfig", b.name, "down"); err != nil {
-		errs = append(errs, fmt.Sprintf("bringing down %s: %v", b.name, err))
-	}
-
-	// Remove members.
-	if b.ifaceA != "" {
-		if _, err := runCmd("ifconfig", b.name, "deletem", b.ifaceA); err != nil {
-			errs = append(errs, fmt.Sprintf("removing %s: %v", b.ifaceA, err))
-		}
-	}
-	if b.ifaceB != "" {
-		if _, err := runCmd("ifconfig", b.name, "deletem", b.ifaceB); err != nil {
-			errs = append(errs, fmt.Sprintf("removing %s: %v", b.ifaceB, err))
-		}
-	}
-
-	// Destroy the bridge interface.
+	// On macOS, destroying the bridge interface automatically unbinds all members.
+	// This reduces 4 synchronous commands down to 1, eliminating TUI freezing.
 	if _, err := runCmd("ifconfig", b.name, "destroy"); err != nil {
 		errs = append(errs, fmt.Sprintf("destroying %s: %v", b.name, err))
 	}
@@ -206,10 +190,8 @@ func CleanupStaleBridges() ([]string, error) {
 	var cleaned []string
 	for _, name := range strings.Fields(out) {
 		if strings.HasPrefix(name, "bridge") {
-			if _, err := runCmd("ifconfig", name, "down"); err == nil {
-				if _, err := runCmd("ifconfig", name, "destroy"); err == nil {
-					cleaned = append(cleaned, name)
-				}
+			if _, err := runCmd("ifconfig", name, "destroy"); err == nil {
+				cleaned = append(cleaned, name)
 			}
 		}
 	}

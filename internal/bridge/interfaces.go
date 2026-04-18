@@ -97,7 +97,7 @@ func DiscoverInterfaces() ([]NetInterface, error) {
 	// Enrich each interface.
 	for i := range ifaces {
 		ifaces[i].CurrentMAC = getCurrentMAC(ifaces[i].Name)
-		ifaces[i].PermanentMAC = getPermanentMAC(ifaces[i].Name)
+		// Permanent MAC is now parsed directly from networksetup -listallhardwareports
 		ifaces[i].IsUp = isInterfaceUp(ifaces[i].Name)
 		ifaces[i].Type = classifyType(ifaces[i].HardwarePort)
 		ifaces[i].IsUSB = ifaces[i].Type == TypeUSBEthernet
@@ -346,6 +346,8 @@ func parseHardwarePorts(output string) []NetInterface {
 			inEntry = true
 		} else if strings.HasPrefix(line, "Device:") {
 			current.Name = strings.TrimPrefix(line, "Device: ")
+		} else if strings.HasPrefix(line, "Ethernet Address:") {
+			current.PermanentMAC = strings.TrimSpace(strings.TrimPrefix(line, "Ethernet Address:"))
 		}
 	}
 	if inEntry && current.Name != "" {
@@ -394,20 +396,7 @@ func getCurrentMAC(device string) string {
 	return ""
 }
 
-// getPermanentMAC retrieves the hardware/permanent MAC via networksetup.
-func getPermanentMAC(device string) string {
-	out, err := exec.Command("networksetup", "-getmacaddress", device).CombinedOutput()
-	if err != nil {
-		return ""
-	}
-	fields := strings.Fields(string(out))
-	for _, f := range fields {
-		if strings.Count(f, ":") == 5 && len(f) == 17 {
-			return strings.ToLower(f)
-		}
-	}
-	return ""
-}
+
 
 // isInterfaceUp checks ifconfig status flags for active status.
 func isInterfaceUp(device string) bool {
