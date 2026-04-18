@@ -1,20 +1,23 @@
 .PHONY: build run clean cleanup fmt vet
 
-BINARY  := bin/golan
+BINARY  := golan
 MODULE  := github.com/mcrn/goLAN
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
 build:
 	@echo "Building $(BINARY)..."
-	@mkdir -p bin
 	@go build -ldflags "-X main.version=$(VERSION)" -o $(BINARY) ./cmd/golan
+
+install: build
+	@echo "Installing goLAN..."
+	@go install ./cmd/golan
 
 run: build
 	@echo "Starting goLAN (requires sudo)..."
 	@sudo ./$(BINARY)
 
 clean:
-	@rm -rf bin/
+	@rm -f $(BINARY)
 	@echo "Cleaned."
 
 cleanup: build
