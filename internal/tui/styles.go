@@ -21,6 +21,7 @@ var (
 	colorSwitch = lipgloss.Color("#e040fb") // Magenta — Switch port
 	colorConflict = lipgloss.Color("#ff1744") // Red — both on same row
 	color802dot1X = lipgloss.Color("#7c4dff") // Purple — 802.1X indicators
+	colorReady    = lipgloss.Color("#ffab40") // Amber — ready for action
 )
 
 // ─── Layout Styles ──────────────────────────────────────────────────────────
@@ -202,4 +203,10 @@ var (
 // keyHint renders a key hint like "[R] Random".
 func keyHint(key, desc string) string {
 	return styleKey.Render("["+key+"]") + " " + styleKeyDesc.Render(desc)
+}
+
+// keyHintDisabled renders a greyed-out key hint for unavailable actions.
+func keyHintDisabled(key, desc string) string {
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#333333"))
+	return dim.Render("[" + key + "] " + desc)
 }
