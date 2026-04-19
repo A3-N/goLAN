@@ -138,8 +138,8 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 				logFunc := m.bridgeLogFunc()
 				go m.bridge.RunAutoMode(logFunc)
 			}
-		case "e", "E":
-			if m.bridge != nil && bState == bridge.BridgeStateReady {
+		case "e", "E", "l", "L":
+			if m.bridge != nil && (bState == bridge.BridgeStateReady || bState == bridge.BridgeStateEAPOLListening) {
 				logFunc := m.bridgeLogFunc()
 				go m.bridge.RunListenEAPOL(logFunc)
 			}
@@ -398,22 +398,35 @@ func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
 			styleDim.Render(fmt.Sprintf("MTU: %d", m.ifaceB.MTU)),
 	)
 
-	// Connection wires — green if bridge is active, red sequence if not.
-	wireActive := bState == bridge.BridgeStateUp || bState == bridge.BridgeStateStealthActive ||
-		bState == bridge.BridgeStateEAPOLAuthenticated || bState == bridge.BridgeStateEAPOLRelaying ||
-		bState == bridge.BridgeStateReady || bState == bridge.BridgeStateEAPOLDetected
-	
-	wireStrA := " ═══❌═══ "
-	wireStrB := " ═══❌═══ "
-	wireStyleA := lipgloss.NewStyle().Foreground(colorRed).Bold(true)
-	wireStyleB := lipgloss.NewStyle().Foreground(colorRed).Bold(true)
-	
-	if wireActive {
-		wireStrA = " ════════ "
-		wireStrB = " ════════ "
-		wireStyleA = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
-		wireStyleB = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
+	// Connection wires
+	wireStr := " ═══❌═══ "
+	wireColor := colorRed
+
+	var status bridge.BridgeStatus
+	if m.bridge != nil {
+		status = m.bridge.Status()
 	}
+	isNAT := bState == bridge.BridgeStateStealthActive
+	isAuth := bState == bridge.BridgeStateEAPOLAuthenticated || status.EAPOLAuthenticated
+
+	if isNAT && isAuth {
+		wireStr = " ══🌐🔑══ "
+		wireColor = colorGreen
+	} else if isNAT {
+		wireStr = " ═══🌐═══ "
+		wireColor = colorGreen
+	} else if isAuth {
+		wireStr = " ═══🔑═══ "
+		wireColor = colorGreen
+	} else if bState == bridge.BridgeStateReady || bState == bridge.BridgeStateEAPOLDetected || bState == bridge.BridgeStateEAPOLRelaying || bState == bridge.BridgeStateEAPOLListening || bState == bridge.BridgeStateUp {
+		wireStr = " ═══🔗═══ "
+		wireColor = colorYellow
+	}
+
+	wireStrA := wireStr
+	wireStrB := wireStr
+	wireStyleA := lipgloss.NewStyle().Foreground(wireColor).Bold(true)
+	wireStyleB := lipgloss.NewStyle().Foreground(wireColor).Bold(true)
 
 	// Physical overrides: If media is physically inactive (cable unplugged), force the X.
 	if m.hasStats {
@@ -648,7 +661,19 @@ func formatLogLine(line string) string {
 		return "\x1b[0m\x1b[1;38;5;255m" + m + "\x1b[0m\x1b[38;5;241m"
 	})
 
-	if strings.HasPrefix(line, "[*]") {
+	if strings.HasPrefix(line, "[+][802.1X]") {
+		return colorBulletGreen.Render("[+]") + colorBulletPurple.Render("[802.1X]") + colorGray.Render(line[11:])
+	} else if strings.HasPrefix(line, "[!][802.1X]") {
+		return colorBulletRed.Render("[!]") + colorBulletPurple.Render("[802.1X]") + colorGray.Render(line[11:])
+	} else if strings.HasPrefix(line, "[+][MACSEC]") {
+		return colorBulletGreen.Render("[+]") + colorBulletPurple.Render("[MACSEC]") + colorGray.Render(line[11:])
+	} else if strings.HasPrefix(line, "[!][MACSEC]") {
+		return colorBulletRed.Render("[!]") + colorBulletPurple.Render("[MACSEC]") + colorGray.Render(line[11:])
+	} else if strings.HasPrefix(line, "[+][RELAY]") {
+		return colorBulletGreen.Render("[+]") + colorBulletPurple.Render("[RELAY]") + colorGray.Render(line[10:])
+	} else if strings.HasPrefix(line, "[!][RELAY]") {
+		return colorBulletRed.Render("[!]") + colorBulletPurple.Render("[RELAY]") + colorGray.Render(line[10:])
+	} else if strings.HasPrefix(line, "[*]") {
 		return colorBulletBlue.Render("[*]") + colorGray.Render(line[3:])
 	} else if strings.HasPrefix(line, "[+]") {
 		return colorBulletGreen.Render("[+]") + colorGray.Render(line[3:])
@@ -663,7 +688,7 @@ func formatLogLine(line string) string {
 	} else if strings.HasPrefix(line, "    ") {
 		return "    " + colorGray.Render(line[4:])
 	}
-	return colorGray.Render("• " + line)
+	return colorBulletBlue.Render("[*]") + colorGray.Render(" " + line)
 }
 
 func (m DashboardModel) renderFooter() string {
@@ -682,6 +707,7 @@ func (m DashboardModel) renderFooter() string {
 
 	// Determine which actions are available in the current state.
 	ready := bState == bridge.BridgeStateReady
+	listening := bState == bridge.BridgeStateEAPOLListening
 	eapolDetected := bState == bridge.BridgeStateEAPOLDetected
 	authenticated := bState == bridge.BridgeStateEAPOLAuthenticated
 
@@ -703,7 +729,7 @@ func (m DashboardModel) renderFooter() string {
 	// Action shortcuts — always visible, greyed when unavailable.
 	parts = append(parts,
 		hint(ready && gatewayKnown, "A", "auto"),
-		hint(ready, "E", "802.1X listen"),
+		hint(ready || listening, "E", "802.1X listen"),
 		hint(ready, "S", "802.1X send"),
 		hint(ready || eapolDetected, "R", "relay"),
 		hint((ready || authenticated) && gatewayKnown, "N", "NAT proxy"),
