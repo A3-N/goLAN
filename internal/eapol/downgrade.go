@@ -52,13 +52,27 @@ func (d *Downgrader) ShouldDrop(packet gopacket.Packet) bool {
 
 	eapol, _ := eapolLayer.(*layers.EAPOL)
 
-	// EAPOL-Key (type 3) carries MACsec key negotiation.
-	if eapol.Type == layers.EAPOLTypeKey {
+	// MKA (type 5) carries MACsec key negotiation.
+	if eapol.Type == layers.EAPOLType(5) {
 		d.droppedMKA++
 		return true
 	}
 
 	return false
+}
+
+// RecordDrop increments the dropped MKA stat block manually.
+func (d *Downgrader) RecordDrop() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.droppedMKA++
+}
+
+// IsEnabled returns true if the downgrader is active.
+func (d *Downgrader) IsEnabled() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.enabled
 }
 
 // DroppedCount returns the number of MKA frames that were dropped.

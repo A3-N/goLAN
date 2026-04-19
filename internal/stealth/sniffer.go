@@ -180,7 +180,7 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 						if len(id.Gateway) == 0 && targetIP.Equal(id.IP) {
 							// The sender is likely the Gateway trying to reach our Target Device.
 							id.Gateway = senderIP
-							eventLog(fmt.Sprintf("> ARP Request revealed possible Gateway IP: %s", id.Gateway.String()))
+							eventLog(fmt.Sprintf("[+] ARP Request revealed possible Gateway IP: %s", id.Gateway.String()))
 						}
 					}
 				} else if arp.Operation == layers.ARPReply {
@@ -190,14 +190,14 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 					if macEqual(senderMAC, id.MAC) {
 						if len(id.IP) == 0 && !senderIP.IsUnspecified() {
 							id.IP = senderIP
-							eventLog(fmt.Sprintf("> ARP Reply revealed Target IP: %s", id.IP.String()))
+							eventLog(fmt.Sprintf("[+] ARP Reply revealed Target IP: %s", id.IP.String()))
 						}
 					} else {
 						// Reply from Gateway or switch?
 						if len(id.Gateway) == 0 && len(id.IP) > 0 {
 							// If someone replied to our MAC, they might be the gateway.
 							id.Gateway = senderIP
-							eventLog(fmt.Sprintf("> ARP Reply revealed Gateway IP: %s", id.Gateway.String()))
+							eventLog(fmt.Sprintf("[+] ARP Reply revealed Gateway IP: %s", id.Gateway.String()))
 						}
 					}
 				}
@@ -215,17 +215,17 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 							// It's a DHCP ACK meant for our Target
 							if dhcp.Operation == layers.DHCPOpReply && dhcp.YourClientIP != nil {
 								id.IP = dhcp.YourClientIP
-								eventLog(fmt.Sprintf("> DHCP ACK assigned Target IP: %s", id.IP.String()))
+								eventLog(fmt.Sprintf("[+] DHCP ACK assigned Target IP: %s", id.IP.String()))
 
 								// Parse options for Subnet and Router
 								for _, opt := range dhcp.Options {
 									if opt.Type == layers.DHCPOptSubnetMask {
 										id.Netmask = net.IPMask(opt.Data)
-										eventLog(fmt.Sprintf("> DHCP ACK revealed Subnet Mask: %s", id.Netmask.String()))
+										eventLog(fmt.Sprintf("[+] DHCP ACK revealed Subnet Mask: %s", id.Netmask.String()))
 									} else if opt.Type == layers.DHCPOptRouter {
 										if len(opt.Data) >= 4 {
 											id.Gateway = net.IP(opt.Data[:4])
-											eventLog(fmt.Sprintf("> DHCP ACK revealed Router/Gateway: %s", id.Gateway.String()))
+											eventLog(fmt.Sprintf("[+] DHCP ACK revealed Router/Gateway: %s", id.Gateway.String()))
 										}
 									}
 								}

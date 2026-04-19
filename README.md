@@ -9,7 +9,7 @@ Software Layer 2 network bridge for macOS; virtual female-to-female RJ45 adapter
 
 Built with Go, [Bubbletea](https://github.com/charmbracelet/bubbletea), and [Lipgloss](https://github.com/charmbracelet/lipgloss).
 
-![alt text](img/G3.png)
+![alt text](img/G4.png)
 
 ## Install
 

@@ -33,6 +33,14 @@ type Relay struct {
 	suppressLogoff   bool
 	downgrader       *Downgrader
 	authSignal       chan AuthResult
+
+	// Log deduplication
+	lastReqMethod  EAPMethod
+	lastRespMethod EAPMethod
+	startLoggedDev bool
+	startLoggedSwi bool
+	successLogged  bool
+	failureLogged  bool
 }
 
 // NewRelay creates a new EAPOL relay between two interfaces.
@@ -168,7 +176,19 @@ func (r *Relay) relayDirection(ctx context.Context, src, dst *pcap.Handle, label
 				r.handleEAPFrame(packet, eth, label)
 
 			case layers.EAPOLTypeStart:
-				r.logFunc(fmt.Sprintf("[RELAY] %s: EAPOL-Start from %s", label, eth.SrcMAC))
+				r.mu.Lock()
+				shouldLog := false
+				if label == "device→switch" && !r.startLoggedDev {
+					r.startLoggedDev = true
+					shouldLog = true
+				} else if label == "switch→device" && !r.startLoggedSwi {
+					r.startLoggedSwi = true
+					shouldLog = true
+				}
+				r.mu.Unlock()
+				if shouldLog {
+					r.logFunc(fmt.Sprintf("[RELAY] %s: EAPOL-Start from %s", label, eth.SrcMAC))
+				}
 
 			case layers.EAPOLTypeLogOff:
 				r.mu.Lock()
@@ -176,30 +196,44 @@ func (r *Relay) relayDirection(ctx context.Context, src, dst *pcap.Handle, label
 				r.mu.Unlock()
 
 				if suppress {
-					r.logFunc(fmt.Sprintf("[RELAY] %s: EAPOL-Logoff from %s — SUPPRESSED (keeping session alive)", label, eth.SrcMAC))
+					r.logFunc(fmt.Sprintf("[!][RELAY] %s: EAPOL-Logoff received from %s", label, eth.SrcMAC))
+					r.logFunc("           DROPPING PACKET to keep session alive")
 					r.session.RecordDrop()
 					shouldDrop = true
 				} else {
 					r.logFunc(fmt.Sprintf("[RELAY] %s: EAPOL-Logoff from %s — forwarding", label, eth.SrcMAC))
 				}
 
-			case layers.EAPOLTypeKey:
+			case layers.EAPOLTypeKey, layers.EAPOLType(5):
+				// Always track MACsec presence.
+				r.session.mu.Lock()
+				isFirstTime := !r.session.MACsecDetected
+				r.session.MACsecDetected = true
+				r.session.mu.Unlock()
+
 				r.mu.Lock()
 				dg := r.downgrader
 				r.mu.Unlock()
 
-				if dg != nil && dg.ShouldDrop(packet) {
-					r.logFunc(fmt.Sprintf("[MACSEC] %s: EAPOL-Key/MKA dropped (downgrade active)", label))
+				isDroppedByRule := false
+				if dg != nil && dg.IsEnabled() {
+					if eapol.Type == layers.EAPOLType(5) {
+						dg.RecordDrop()
+						isDroppedByRule = true
+					}
+				}
+
+				if isDroppedByRule {
+					r.logFunc(fmt.Sprintf("[!][MACSEC] %s: MACsec (EAPOL Type %d) discovered. DROPPING PACKET to force downgrade", label, eapol.Type))
 					r.session.RecordDrop()
 					shouldDrop = true
-				} else {
-					// Track MACsec detection even if not downgrading.
-					r.session.mu.Lock()
-					if !r.session.MACsecDetected {
-						r.session.MACsecDetected = true
-						r.logFunc(fmt.Sprintf("[MACSEC] %s: MACsec key negotiation detected from %s", label, eth.SrcMAC))
+				} else if isFirstTime {
+					if dg == nil || !dg.IsEnabled() {
+						r.logFunc(fmt.Sprintf("[MACSEC] %s: MACsec (EAPOL Type %d) key negotiation detected but DWNGRD IS DISABLED on proxy", label, eapol.Type))
+					} else {
+						// Downgrade is active, but this packet type (e.g. Type 3) is allowed to securely pass.
+						r.logFunc(fmt.Sprintf("[MACSEC] %s: MACsec (EAPOL Type %d) key negotiation safely bypassed from %s", label, eapol.Type, eth.SrcMAC))
 					}
-					r.session.mu.Unlock()
 				}
 			}
 
@@ -244,7 +278,17 @@ func (r *Relay) handleEAPFrame(packet gopacket.Packet, eth *layers.Ethernet, lab
 	switch eap.Code {
 	case layers.EAPCodeRequest:
 		method := eapTypeToMethod(uint8(eap.Type))
-		r.logFunc(fmt.Sprintf("[RELAY] %s: EAP-Request ID=%d Type=%s from %s", label, eap.Id, method, eth.SrcMAC))
+		r.mu.Lock()
+		r.startLoggedDev = false
+		r.startLoggedSwi = false
+		r.successLogged = false
+		r.failureLogged = false
+		if r.lastReqMethod != method {
+			r.lastReqMethod = method
+			// Included the ID previously, but removed for dedup since fragment IDs change constantly.
+			r.logFunc(fmt.Sprintf("[RELAY] %s: EAP-Request Type=%s from %s", label, method, eth.SrcMAC))
+		}
+		r.mu.Unlock()
 
 		// Update method if we see something more specific than Identity.
 		if method != MethodUnknown && method != MethodIdentity {
@@ -270,10 +314,21 @@ func (r *Relay) handleEAPFrame(packet gopacket.Packet, eth *layers.Ethernet, lab
 
 	case layers.EAPCodeResponse:
 		method := eapTypeToMethod(uint8(eap.Type))
-		r.logFunc(fmt.Sprintf("[RELAY] %s: EAP-Response ID=%d Type=%s from %s", label, eap.Id, method, eth.SrcMAC))
+		r.mu.Lock()
+		if r.lastRespMethod != method {
+			r.lastRespMethod = method
+			r.logFunc(fmt.Sprintf("[RELAY] %s: EAP-Response Type=%s from %s", label, method, eth.SrcMAC))
+		}
+		r.mu.Unlock()
 
 	case layers.EAPCodeSuccess:
-		r.logFunc(fmt.Sprintf("[802.1X] ✓ EAP-Success received (ID=%d) — port is AUTHORIZED", eap.Id))
+		r.mu.Lock()
+		shouldLog := !r.successLogged
+		r.successLogged = true
+		r.mu.Unlock()
+		if shouldLog {
+			r.logFunc(fmt.Sprintf("[+][802.1X] EAP-Success received (ID=%d) port AUTHORIZED", eap.Id))
+		}
 		r.session.MarkAuthenticated()
 
 		// Non-blocking send so the relay doesn't deadlock if nobody is waiting.
@@ -287,7 +342,13 @@ func (r *Relay) handleEAPFrame(packet gopacket.Packet, eth *layers.Ethernet, lab
 		}
 
 	case layers.EAPCodeFailure:
-		r.logFunc(fmt.Sprintf("[802.1X] ✗ EAP-Failure received (ID=%d) — authentication REJECTED", eap.Id))
+		r.mu.Lock()
+		shouldLog := !r.failureLogged
+		r.failureLogged = true
+		r.mu.Unlock()
+		if shouldLog {
+			r.logFunc(fmt.Sprintf("[!][802.1X] EAP-Failure received (ID=%d) — authentication REJECTED", eap.Id))
+		}
 		r.session.MarkFailed()
 
 		r.session.mu.Lock()
