@@ -122,7 +122,7 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 			m.logScroll--
 		}
 		
-		maxVis := 6
+		maxVis := m.reconMaxVis()
 		logsLen := 0
 		if m.bridge != nil {
 			logsLen = len(m.bridge.Status().ReconLogs)
@@ -186,15 +186,9 @@ func (m DashboardModel) View() string {
 	sb.WriteString(m.renderBridgeDiagram(contentWidth))
 	sb.WriteString("\n")
 
-	// ── Traffic Statistics ───────────────────────────────────────
-	sb.WriteString(m.renderTrafficStats(contentWidth))
+	// ── Two-Column Layout: Left (Traffic + Throughput) | Right (Recon) ──
+	sb.WriteString(m.renderMainContent(contentWidth))
 	sb.WriteString("\n")
-
-	// ── Sparkline Throughput & Recon Logs ────────────────────────
-	if m.collector != nil {
-		sb.WriteString(m.renderBottomSection(contentWidth))
-		sb.WriteString("\n")
-	}
 
 	// ── Footer ──────────────────────────────────────────────────
 	sb.WriteString(m.renderFooter())
@@ -211,25 +205,23 @@ func (m DashboardModel) renderHeader(width int) string {
 		bState = m.bridge.State()
 	}
 
-	switch bState {
-	case bridge.BridgeStateUp:
+	// Derive a simple tri-state status for the header.
+	// Detailed state info is shown in the bridge diagram and recon logs.
+	bridgeUp := bState == bridge.BridgeStateUp ||
+		bState == bridge.BridgeStateStealthActive ||
+		bState == bridge.BridgeStateEAPOLAuthenticated ||
+		bState == bridge.BridgeStateEAPOLRelaying
+
+	mediaDisrupt := m.hasStats &&
+		(!m.latestStats.IfaceA.Stats.MediaActive || !m.latestStats.IfaceB.Stats.MediaActive)
+
+	switch {
+	case bridgeUp && mediaDisrupt:
+		stateStr = styleError.Render("⚠ DISRUPT")
+	case bridgeUp:
 		stateStr = styleUp.Render("● ACTIVE")
-	case bridge.BridgeStateSniffing:
-		stateStr = styleWarning.Render("○ RECONNAISSANCE: Sniffing Target Identity...")
-	case bridge.BridgeStateStealthActive:
-		stateStr = styleUp.Render("● STEALTH ACTIVE")
-	case bridge.BridgeStateEAPOLDetected:
-		stateStr = lipgloss.NewStyle().Foreground(color802dot1X).Bold(true).Render("◎ 802.1X DETECTED")
-	case bridge.BridgeStateEAPOLRelaying:
-		stateStr = lipgloss.NewStyle().Foreground(color802dot1X).Bold(true).Render("◎ 802.1X AUTHENTICATING...")
-	case bridge.BridgeStateEAPOLAuthenticated:
-		stateStr = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render("● 802.1X AUTHENTICATED")
-	case bridge.BridgeStateEAPOLFailed:
-		stateStr = styleError.Render("✗ 802.1X FAILED")
-	case bridge.BridgeStateDowngrading:
-		stateStr = styleWarning.Render("⟳ MACSEC DOWNGRADE...")
 	default:
-		stateStr = styleDim.Render("○ CONNECTING")
+		stateStr = styleWarning.Render("○ STOPPED")
 	}
 
 	state := stateStr
@@ -280,22 +272,7 @@ func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
 
 	cardWidth := 30
 
-	// Left card = Device (orange).
-	cardA := styleIfaceCardDevice.Width(cardWidth).Render(
-		styleIfaceNameDevice.Render("● "+m.ifaceA.Name) + "\n" +
-			styleDim.Render("Device Port") + "\n" +
-			styleDim.Render("MAC: "+macA) + "\n" +
-			styleDim.Render(fmt.Sprintf("MTU: %d", m.ifaceA.MTU)),
-	)
-
-	// Right card = Switch (magenta).
-	cardB := styleIfaceCardSwitch.Width(cardWidth).Render(
-		styleIfaceNameSwitch.Render("● "+m.ifaceB.Name) + "\n" +
-			styleDim.Render("Switch Port") + "\n" +
-			styleDim.Render("MAC: "+macB) + "\n" +
-			styleDim.Render(fmt.Sprintf("MTU: %d", m.ifaceB.MTU)),
-	)
-
+	// Build the middle card FIRST so we can match its height.
 	middleContent := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render("● goLAN Engine") + "\n" +
 		styleDim.Render("Middle Man Proxy") + "\n"
 	
@@ -341,13 +318,31 @@ func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
 		middleContent += "\n\n"
 	}
 
-	// Make the middle man box exactly the same layout structure as the outer cards.
 	middleManBox := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorGreen).
 		Padding(0, 1).
 		Width(cardWidth).
 		Render(middleContent)
+
+	// Measure the green card height and force side cards to match.
+	targetHeight := lipgloss.Height(middleManBox)
+
+	// Left card = Device (orange).
+	cardA := styleIfaceCardDevice.Width(cardWidth).Height(targetHeight - 2).Render(
+		styleIfaceNameDevice.Render("● "+m.ifaceA.Name) + "\n" +
+			styleDim.Render("Device Port") + "\n" +
+			styleDim.Render("MAC: "+macA) + "\n" +
+			styleDim.Render(fmt.Sprintf("MTU: %d", m.ifaceA.MTU)),
+	)
+
+	// Right card = Switch (magenta).
+	cardB := styleIfaceCardSwitch.Width(cardWidth).Height(targetHeight - 2).Render(
+		styleIfaceNameSwitch.Render("● "+m.ifaceB.Name) + "\n" +
+			styleDim.Render("Switch Port") + "\n" +
+			styleDim.Render("MAC: "+macB) + "\n" +
+			styleDim.Render(fmt.Sprintf("MTU: %d", m.ifaceB.MTU)),
+	)
 
 	// Connection wires — green if bridge is active, red sequence if not.
 	wireActive := bState == bridge.BridgeStateUp || bState == bridge.BridgeStateStealthActive ||
@@ -389,7 +384,59 @@ func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
 		cardB,
 	)
 
-	return lipgloss.NewStyle().MarginLeft(2).Render(diagram)
+	// Center the diagram horizontally within the full content width.
+	return lipgloss.Place(contentWidth, lipgloss.Height(diagram), lipgloss.Center, lipgloss.Top, diagram)
+}
+
+// reconMaxVis computes the maximum visible recon log lines based on terminal height.
+func (m DashboardModel) reconMaxVis() int {
+	// Estimate overhead: header(2) + diagram(8) + footer(3) + margins(3) = ~16 lines
+	maxVis := m.height - 16
+	if maxVis < 6 {
+		maxVis = 6
+	}
+	return maxVis
+}
+
+// renderMainContent renders the two-column layout below the bridge diagram:
+// Left column = Traffic Statistics + Throughput sparklines
+// Right column = Reconnaissance Log (fills the full height)
+func (m DashboardModel) renderMainContent(width int) string {
+	leftWidth := (width - 6) / 3
+	if leftWidth < 38 {
+		leftWidth = 38
+	}
+	rightWidth := width - leftWidth - 6
+	if rightWidth < 38 {
+		rightWidth = 38
+	}
+
+	// ── Left Column: Traffic Stats + Throughput Sparklines ──────
+	leftColumn := m.renderLeftColumn(leftWidth)
+
+	// ── Right Column: Reconnaissance Log ────────────────────────
+	leftHeight := lipgloss.Height(leftColumn)
+	rightColumn := m.renderReconPanel(rightWidth, leftHeight)
+
+	return lipgloss.NewStyle().MarginLeft(2).Render(
+		lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, "  ", rightColumn),
+	)
+}
+
+// renderLeftColumn renders Traffic Statistics (stacked) and Throughput sparklines.
+func (m DashboardModel) renderLeftColumn(width int) string {
+	var sb strings.Builder
+
+	// Traffic Statistics.
+	sb.WriteString(m.renderTrafficStats(width))
+	sb.WriteString("\n")
+
+	// Throughput sparklines.
+	if m.collector != nil {
+		sb.WriteString(m.renderThroughput(width))
+	}
+
+	return sb.String()
 }
 
 func (m DashboardModel) renderTrafficStats(width int) string {
@@ -400,18 +447,21 @@ func (m DashboardModel) renderTrafficStats(width int) string {
 
 	renderIface := func(label string, d stats.InterfaceDelta, nameStyle lipgloss.Style) string {
 		var sb strings.Builder
-		sb.WriteString(nameStyle.Render(label) + "\n\n")
-		sb.WriteString(renderKeyValue("RX Total", stats.HumanizeBytes(d.Stats.RxBytes)) + "\n")
-		sb.WriteString(renderKeyValue("TX Total", stats.HumanizeBytes(d.Stats.TxBytes)) + "\n")
-		sb.WriteString(renderKeyValue("RX Rate", stats.HumanizeThroughput(d.RxBytesPerSec)) + "\n")
-		sb.WriteString(renderKeyValue("TX Rate", stats.HumanizeThroughput(d.TxBytesPerSec)) + "\n")
-		sb.WriteString(renderKeyValue("RX Packets", humanizePacketRate(d.RxPktPerSec)) + "\n")
-		sb.WriteString(renderKeyValue("TX Packets", humanizePacketRate(d.TxPktPerSec)) + "\n")
+		sb.WriteString(nameStyle.Render(label) + "\n")
+		sb.WriteString(renderKeyValue("Total",
+			styleUp.Render("▼")+styleVal.Render(" "+stats.HumanizeBytes(d.Stats.RxBytes))+"  "+
+				styleKey.Render("▲")+styleVal.Render(" "+stats.HumanizeBytes(d.Stats.TxBytes))) + "\n")
+		sb.WriteString(renderKeyValue("Rate",
+			styleUp.Render("▼")+styleVal.Render(" "+stats.HumanizeThroughput(d.RxBytesPerSec))+"  "+
+				styleKey.Render("▲")+styleVal.Render(" "+stats.HumanizeThroughput(d.TxBytesPerSec))) + "\n")
+		sb.WriteString(renderKeyValue("Packets",
+			styleUp.Render("▼")+styleVal.Render(" "+humanizePacketRate(d.RxPktPerSec))+"  "+
+				styleKey.Render("▲")+styleVal.Render(" "+humanizePacketRate(d.TxPktPerSec))) + "\n")
 		sb.WriteString(renderKeyValue("Errors", fmt.Sprintf("RX:%d TX:%d", d.Stats.RxErrors, d.Stats.TxErrors)) + "\n")
 		return sb.String()
 	}
 
-	// Device (orange) on left, Switch (magenta) on right.
+	// Device (orange) on top, Switch (magenta) below — stacked vertically.
 	statsA := renderIface(
 		"▎ "+m.ifaceA.Name+" (Device)",
 		s.IfaceA,
@@ -424,28 +474,20 @@ func (m DashboardModel) renderTrafficStats(width int) string {
 		styleIfaceNameSwitch,
 	)
 
-	cardWidth := (width - 10) / 2
-	if cardWidth < 34 {
-		cardWidth = 34
+	cardWidth := width - 4
+	if cardWidth < 30 {
+		cardWidth = 30
 	}
 
 	boxA := styleStatsBox.Width(cardWidth).Render(statsA)
 	boxB := styleStatsBox.Width(cardWidth).Render(statsB)
 
-	boxes := lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		boxA,
-		lipgloss.NewStyle().MarginLeft(2).Render(boxB),
-	)
-
-	section := "  " + styleLabel.Render("Traffic Statistics") + "\n" +
-		lipgloss.NewStyle().MarginLeft(2).Render(boxes)
-
-	return section
+	return boxA + "\n" + boxB
 }
 
-func (m DashboardModel) renderBottomSection(width int) string {
-	sparkWidth := (width - 20) / 3
+// renderThroughput renders sparkline graphs for both interfaces.
+func (m DashboardModel) renderThroughput(width int) string {
+	sparkWidth := width - 8
 	if sparkWidth < 20 {
 		sparkWidth = 20
 	}
@@ -468,46 +510,68 @@ func (m DashboardModel) renderBottomSection(width int) string {
 
 	graphA := renderSpark(m.ifaceA.Name+" (Device)", histARx, histATx, styleSparkDevice)
 	graphB := renderSpark(m.ifaceB.Name+" (Switch)", histBRx, histBTx, styleSparkSwitch)
-	graphs := graphA + "\n" + graphB
 
-	// ── Recon Logs ──────────────────────────────────────────────────
-	var logsPanel string
-	if m.bridge != nil {
-		status := m.bridge.Status()
-		// Only render logs if we have them, or if we are actively sniffing
-		if len(status.ReconLogs) > 0 || status.State == bridge.BridgeStateSniffing || status.State == bridge.BridgeStateStealthActive {
-			var sb strings.Builder
-			sb.WriteString(styleLabel.Render("Reconnaissance Log") + styleDim.Render("  (Use Up/Down or J/K to scroll)") + "\n")
-			logs := []string{"[*] Waiting for sniffer to initialize..."}
-			if len(status.ReconLogs) > 0 {
-				logs = status.ReconLogs
-			}
-			
-			maxVis := 6
-			logsLen := len(logs)
-			
-			start := logsLen - maxVis - m.logScroll
-			if start < 0 { start = 0 }
-			end := start + maxVis
-			if end > logsLen { end = logsLen }
-			
-			for _, log := range logs[start:end] {
-				sb.WriteString(formatLogLine(log) + "\n")
-			}
-			// Wrap in a fixed-height container so the UI never physically jumps
-			logsPanel = lipgloss.NewStyle().Height(10).Render(sb.String())
-		}
+	return graphA + "\n" + graphB
+}
+
+// renderReconPanel renders the Reconnaissance Log panel for the right column.
+// targetHeight is the left column height so the panel stretches to match.
+func (m DashboardModel) renderReconPanel(width int, targetHeight int) string {
+	if m.bridge == nil {
+		return ""
 	}
 
-	// Join both columns horizontally
-	columns := lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		lipgloss.NewStyle().Width(sparkWidth + 10).Render(graphs),
-		lipgloss.NewStyle().MarginLeft(4).Render(logsPanel),
-	)
+	status := m.bridge.Status()
+	// Only render if we have logs or are actively sniffing.
+	if len(status.ReconLogs) == 0 && status.State != bridge.BridgeStateSniffing && status.State != bridge.BridgeStateStealthActive {
+		return ""
+	}
 
-	return "  " + styleLabel.Render("Throughput & Identity") + "\n" +
-		lipgloss.NewStyle().MarginLeft(2).Render(columns)
+	var sb strings.Builder
+	sb.WriteString(styleLabel.Render("Reconnaissance Log") + styleDim.Render("  (↑↓/jk scroll)") + "\n")
+
+	sep := strings.Repeat("─", width-4)
+	sb.WriteString(lipgloss.NewStyle().Foreground(colorBorder).Render(sep) + "\n")
+
+	logs := []string{"[*] Waiting for sniffer to initialize..."}
+	if len(status.ReconLogs) > 0 {
+		logs = status.ReconLogs
+	}
+
+	// Dynamic maxVis — fill the available height (minus header/sep/border).
+	maxVis := targetHeight - 6
+	if maxVis < 6 {
+		maxVis = 6
+	}
+
+	logsLen := len(logs)
+	start := logsLen - maxVis - m.logScroll
+	if start < 0 {
+		start = 0
+	}
+	end := start + maxVis
+	if end > logsLen {
+		end = logsLen
+	}
+
+	for _, log := range logs[start:end] {
+		sb.WriteString(formatLogLine(log) + "\n")
+	}
+
+	// Wrap in a bordered box that stretches to the target height.
+	content := sb.String()
+	panelHeight := targetHeight - 2
+	if panelHeight < 8 {
+		panelHeight = 8
+	}
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorBorder).
+		Padding(0, 1).
+		Width(width).
+		Height(panelHeight).
+		Render(content)
 }
 
 var (

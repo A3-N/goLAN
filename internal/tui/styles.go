@@ -142,12 +142,12 @@ var (
 	styleIfaceCardDevice = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(colorDevice).
-				Padding(1, 2)
+				Padding(0, 1)
 
 	styleIfaceCardSwitch = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(colorSwitch).
-				Padding(1, 2)
+				Padding(0, 1)
 
 	styleIfaceNameDevice = lipgloss.NewStyle().
 				Foreground(colorDevice).
