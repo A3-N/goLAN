@@ -237,11 +237,15 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 
 			// Check if we have enough information to form the identity.
 			if id.IsComplete() {
-				eventLog("Identity fully constructed. Reconnaissance complete.")
+				if id.HasGateway() {
+					eventLog("[+] Identity fully constructed. Reconnaissance complete.")
+				} else {
+					eventLog("[+] MAC + IP discovered. Gateway pending (NAT unavailable until found).")
+				}
 				// We fall back nicely if we couldn't naturally capture a DHCP subnet mask.
 				if len(id.Netmask) == 0 {
 					id.Netmask = id.IP.DefaultMask()
-					eventLog(fmt.Sprintf("Falling back to default subnet mask: %s", id.Netmask.String()))
+					eventLog(fmt.Sprintf("[*] Falling back to default subnet mask: %s", id.Netmask.String()))
 				}
 				return id, nil
 			}
@@ -249,9 +253,85 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 	}
 }
 
-// IsComplete verifies we have collected the minimum required data for a stealth NAT piggyback.
+// IsComplete verifies we have collected the minimum required data to proceed.
+// Only MAC and IP are required — gateway is optional (needed only for NAT).
 func (t TargetIdentity) IsComplete() bool {
-	return len(t.MAC) > 0 && len(t.IP) > 0 && len(t.Gateway) > 0
+	return len(t.MAC) > 0 && len(t.IP) > 0
+}
+
+// HasGateway returns whether the gateway has been discovered (needed for NAT proxy).
+func (t TargetIdentity) HasGateway() bool {
+	return len(t.Gateway) > 0
+}
+
+// DiscoverGateway passively sniffs for gateway information only.
+// It watches for ARP requests/replies targeting the given MAC's IP and DHCP ACKs.
+// Returns when the gateway is found or the context is cancelled.
+func (s *Sniffer) DiscoverGateway(ctx context.Context, ignoreMACStr string, eventLog func(string), _ func(mac net.HardwareAddr)) (*TargetIdentity, error) {
+	handle, err := pcap.OpenLive(s.iface, 65535, true, pcap.BlockForever)
+	if err != nil {
+		return nil, err
+	}
+	defer handle.Close()
+
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	packets := packetSource.Packets()
+
+	id := &TargetIdentity{}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return id, ctx.Err()
+		case packet := <-packets:
+			if packet == nil {
+				continue
+			}
+
+			// Look for ARP that reveals gateway.
+			arpLayer := packet.Layer(layers.LayerTypeARP)
+			if arpLayer != nil {
+				arp, _ := arpLayer.(*layers.ARP)
+				senderIP := net.IP(arp.SourceProtAddress)
+				if !senderIP.IsUnspecified() && !senderIP.IsLoopback() {
+					if arp.Operation == layers.ARPRequest || arp.Operation == layers.ARPReply {
+						if len(id.Gateway) == 0 {
+							id.Gateway = senderIP
+							return id, nil
+						}
+					}
+				}
+			}
+
+			// Look for DHCP ACK with Router option.
+			udpLayer := packet.Layer(layers.LayerTypeUDP)
+			if udpLayer != nil {
+				udp, _ := udpLayer.(*layers.UDP)
+				if udp.SrcPort == 67 {
+					dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4)
+					if dhcpLayer != nil {
+						dhcp, _ := dhcpLayer.(*layers.DHCPv4)
+						if dhcp.Operation == layers.DHCPOpReply {
+							for _, opt := range dhcp.Options {
+								if opt.Type == layers.DHCPOptRouter && len(opt.Data) >= 4 {
+									id.Gateway = net.IP(opt.Data[:4])
+									if opt.Type == layers.DHCPOptSubnetMask {
+										id.Netmask = net.IPMask(opt.Data)
+									}
+								}
+								if opt.Type == layers.DHCPOptSubnetMask {
+									id.Netmask = net.IPMask(opt.Data)
+								}
+							}
+							if id.HasGateway() {
+								return id, nil
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 func macEqual(a, b net.HardwareAddr) bool {

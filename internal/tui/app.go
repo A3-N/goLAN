@@ -34,17 +34,31 @@ func (m Model) Init() tea.Cmd {
 	return m.selector.Init()
 }
 
+type teardownDoneMsg struct{}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case teardownDoneMsg:
+		return m, tea.Quit
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
+			if m.quitting {
+				return m, nil
+			}
 			m.quitting = true
 			if m.view == viewDashboard {
-				_ = m.dashboard.Shutdown()
+				return m, func() tea.Msg {
+					_ = m.dashboard.Shutdown()
+					return teardownDoneMsg{}
+				}
 			}
 			return m, tea.Quit
 		case "esc":
+			if m.quitting {
+				return m, nil
+			}
 			if m.view == viewSelector {
 				// Esc on selector = quit.
 				m.quitting = true

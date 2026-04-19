@@ -115,13 +115,58 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 		return m, waitForStats(m.statsCh)
 
 	case tea.KeyMsg:
+		bState := bridge.BridgeStateDown
+		if m.bridge != nil {
+			bState = m.bridge.State()
+		}
+
 		switch msg.String() {
 		case "up", "k":
 			m.logScroll++
 		case "down", "j":
 			m.logScroll--
+
+		// Continue from paused state.
+		case "c", "C":
+			if m.bridge != nil && bState == bridge.BridgeStatePaused {
+				m.bridge.Continue()
+			}
+
+		// Action modes — only available when bridge is Ready.
+		case "a", "A":
+			if m.bridge != nil && bState == bridge.BridgeStateReady && m.bridge.GatewayKnown() {
+				logFunc := m.bridgeLogFunc()
+				go m.bridge.RunAutoMode(logFunc)
+			}
+		case "e", "E":
+			if m.bridge != nil && bState == bridge.BridgeStateReady {
+				logFunc := m.bridgeLogFunc()
+				go m.bridge.RunListenEAPOL(logFunc)
+			}
+		case "r", "R":
+			if m.bridge != nil && (bState == bridge.BridgeStateReady || bState == bridge.BridgeStateEAPOLDetected) {
+				logFunc := m.bridgeLogFunc()
+				go m.bridge.RunEAPOLRelay(logFunc)
+			}
+		case "n", "N":
+			if m.bridge != nil && (bState == bridge.BridgeStateReady || bState == bridge.BridgeStateEAPOLAuthenticated) && m.bridge.GatewayKnown() {
+				logFunc := m.bridgeLogFunc()
+				go m.bridge.RunNATProxy(logFunc)
+			}
+		case "s", "S":
+			if m.bridge != nil && bState == bridge.BridgeStateReady {
+				logFunc := m.bridgeLogFunc()
+				go m.bridge.RunInjectEAPOL(logFunc)
+			}
+
+		// Toggle: MACsec Downgrade
+		case "m", "M":
+			if m.bridge != nil {
+				current := m.bridge.MACsecDowngrade()
+				m.bridge.SetMACsecDowngrade(!current)
+			}
 		}
-		
+
 		maxVis := m.reconMaxVis()
 		logsLen := 0
 		if m.bridge != nil {
@@ -205,8 +250,7 @@ func (m DashboardModel) renderHeader(width int) string {
 		bState = m.bridge.State()
 	}
 
-	// Derive a simple tri-state status for the header.
-	// Detailed state info is shown in the bridge diagram and recon logs.
+	// Derive status for the header based on bridge state.
 	bridgeUp := bState == bridge.BridgeStateUp ||
 		bState == bridge.BridgeStateStealthActive ||
 		bState == bridge.BridgeStateEAPOLAuthenticated ||
@@ -216,6 +260,10 @@ func (m DashboardModel) renderHeader(width int) string {
 		(!m.latestStats.IfaceA.Stats.MediaActive || !m.latestStats.IfaceB.Stats.MediaActive)
 
 	switch {
+	case bState == bridge.BridgeStatePaused:
+		stateStr = styleError.Render("⚠ PAUSED")
+	case bState == bridge.BridgeStateReady:
+		stateStr = lipgloss.NewStyle().Foreground(colorReady).Bold(true).Render("◉ READY")
 	case bridgeUp && mediaDisrupt:
 		stateStr = styleError.Render("⚠ DISRUPT")
 	case bridgeUp:
@@ -283,6 +331,12 @@ func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
 
 	if m.bridge != nil {
 		switch bState {
+		case bridge.BridgeStatePaused:
+			middleContent += lipgloss.NewStyle().Foreground(colorRed).Bold(true).Render("⚠ PAUSED") + "\n" +
+				styleDim.Render("Press [C] to continue")
+		case bridge.BridgeStateReady:
+			middleContent += lipgloss.NewStyle().Foreground(colorReady).Bold(true).Render("Ready") + "\n" +
+				styleDim.Render("Awaiting action...")
 		case bridge.BridgeStateStealthActive:
 			middleContent += styleDim.Render("Bridged (Spoofed)") + "\n" +
 				lipgloss.NewStyle().Foreground(colorGreen).Render("NAT Masqueraded")
@@ -346,7 +400,8 @@ func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
 
 	// Connection wires — green if bridge is active, red sequence if not.
 	wireActive := bState == bridge.BridgeStateUp || bState == bridge.BridgeStateStealthActive ||
-		bState == bridge.BridgeStateEAPOLAuthenticated || bState == bridge.BridgeStateEAPOLRelaying
+		bState == bridge.BridgeStateEAPOLAuthenticated || bState == bridge.BridgeStateEAPOLRelaying ||
+		bState == bridge.BridgeStateReady || bState == bridge.BridgeStateEAPOLDetected
 	
 	wireStrA := " ═══❌═══ "
 	wireStrB := " ═══❌═══ "
@@ -612,9 +667,57 @@ func formatLogLine(line string) string {
 }
 
 func (m DashboardModel) renderFooter() string {
+	bState := bridge.BridgeStateDown
+	if m.bridge != nil {
+		bState = m.bridge.State()
+	}
+
+	// Helper: pick active/disabled based on condition.
+	hint := func(enabled bool, key, desc string) string {
+		if enabled {
+			return keyHint(key, desc)
+		}
+		return keyHintDisabled(key, desc)
+	}
+
+	// Determine which actions are available in the current state.
+	ready := bState == bridge.BridgeStateReady
+	eapolDetected := bState == bridge.BridgeStateEAPOLDetected
+	authenticated := bState == bridge.BridgeStateEAPOLAuthenticated
+
+	// Toggle values.
+	macsecStr := "DWNGRD"
+	if m.bridge != nil && !m.bridge.MACsecDowngrade() {
+		macsecStr = "IGNORE"
+	}
+
+	hasBridge := m.bridge != nil
+	gatewayKnown := hasBridge && m.bridge.GatewayKnown()
+
+	// Navigation first (left side), then actions (right side).
 	parts := []string{
 		keyHint("Esc", "back"),
-		keyHint("q", "quit & teardown"),
+		keyHint("q", "quit"),
 	}
+
+	// Action shortcuts — always visible, greyed when unavailable.
+	parts = append(parts,
+		hint(ready && gatewayKnown, "A", "auto"),
+		hint(ready, "E", "802.1X listen"),
+		hint(ready, "S", "802.1X send"),
+		hint(ready || eapolDetected, "R", "relay"),
+		hint((ready || authenticated) && gatewayKnown, "N", "NAT proxy"),
+		hint(hasBridge, "M", "MACsec:"+macsecStr),
+	)
+
 	return styleFooter.Width(m.width - 4).Render("  " + strings.Join(parts, "   "))
+}
+
+// bridgeLogFunc returns a log function that appends to the bridge's recon logs.
+func (m DashboardModel) bridgeLogFunc() func(string) {
+	return func(msg string) {
+		if m.bridge != nil {
+			m.bridge.AppendLog(msg)
+		}
+	}
 }
