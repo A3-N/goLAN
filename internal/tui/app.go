@@ -35,11 +35,20 @@ func (m Model) Init() tea.Cmd {
 }
 
 type teardownDoneMsg struct{}
+type returnToSelectorMsg struct{}
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case teardownDoneMsg:
 		return m, tea.Quit
+
+	case returnToSelectorMsg:
+		m.view = viewSelector
+		m.selector = NewSelectorModel()
+		m.selector.width = m.width
+		m.selector.height = m.height
+		m.quitting = false
+		return m, m.selector.Init()
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -64,13 +73,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.quitting = true
 				return m, tea.Quit
 			} else if m.view == viewDashboard {
-				// Esc on dashboard = tear down bridge, go back to selector.
-				_ = m.dashboard.Shutdown()
-				m.view = viewSelector
-				m.selector = NewSelectorModel()
-				m.selector.width = m.width
-				m.selector.height = m.height
-				return m, m.selector.Init()
+				// Esc on dashboard = tear down bridge asynchronously, then go back to selector.
+				m.quitting = true // Show "shutting down" while teardown runs
+				return m, func() tea.Msg {
+					_ = m.dashboard.Shutdown()
+					return returnToSelectorMsg{}
+				}
 			}
 		}
 

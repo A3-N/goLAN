@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -78,9 +79,13 @@ func waitForStats(ch <-chan stats.StatsUpdate) tea.Cmd {
 func (m DashboardModel) Init() tea.Cmd {
 	// Lock down both interfaces explicitly before initiating bridge creation
 	// to prevent OS leaks to the physical wire. This happens synchronously
-	// in the TUI thread.
-	_ = bridge.LockdownInterface(m.ifaceA.Name, m.ifaceA.HardwarePort)
-	_ = bridge.LockdownInterface(m.ifaceB.Name, m.ifaceB.HardwarePort)
+	// in the TUI thread. Errors are non-fatal but logged for debugging.
+	if err := bridge.LockdownInterface(m.ifaceA.Name, m.ifaceA.HardwarePort); err != nil {
+		fmt.Fprintf(os.Stderr, "[lockdown] %s: %v\n", m.ifaceA.Name, err)
+	}
+	if err := bridge.LockdownInterface(m.ifaceB.Name, m.ifaceB.HardwarePort); err != nil {
+		fmt.Fprintf(os.Stderr, "[lockdown] %s: %v\n", m.ifaceB.Name, err)
+	}
 
 	return m.createBridgeCmd(m.ifaceA.Name, m.ifaceB.Name, m.ifaceA.CurrentMAC)
 }
@@ -149,9 +154,16 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 				go m.bridge.RunEAPOLRelay(logFunc)
 			}
 		case "n", "N":
-			if m.bridge != nil && (bState == bridge.BridgeStateReady || bState == bridge.BridgeStateEAPOLAuthenticated) && m.bridge.GatewayKnown() {
-				logFunc := m.bridgeLogFunc()
-				go m.bridge.RunNATProxy(logFunc)
+			if m.bridge != nil {
+				// If NAT is already active, hitting N acts as Disable (toggle off).
+				if m.bridge.IsNATActive() {
+					logFunc := m.bridgeLogFunc()
+					go m.bridge.DisableNATProxy(logFunc)
+				} else if (bState == bridge.BridgeStateReady || bState == bridge.BridgeStateEAPOLAuthenticated) && m.bridge.GatewayKnown() {
+					// Otherwise, if conditions permit, spin NAT up.
+					logFunc := m.bridgeLogFunc()
+					go m.bridge.RunNATProxy(logFunc)
+				}
 			}
 		case "s", "S":
 			if m.bridge != nil && bState == bridge.BridgeStateReady {
@@ -643,11 +655,12 @@ func (m DashboardModel) renderReconPanel(width int, targetHeight int) string {
 }
 
 var (
-	colorBulletBlue  = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
-	colorBulletGreen = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
-	colorBulletRed   = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	colorBulletBlue   = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
+	colorBulletGreen  = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+	colorBulletRed    = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 	colorBulletPurple = lipgloss.NewStyle().Foreground(color802dot1X).Bold(true)
-	colorGray        = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	colorBulletCyan   = lipgloss.NewStyle().Foreground(lipgloss.Color("#00CED1")).Bold(true)
+	colorGray         = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	
 	macRegex = regexp.MustCompile(`(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}`)
 	ipRegex  = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
@@ -673,6 +686,20 @@ func formatLogLine(line string) string {
 		return colorBulletGreen.Render("[+]") + colorBulletPurple.Render("[RELAY]") + colorGray.Render(line[10:])
 	} else if strings.HasPrefix(line, "[!][RELAY]") {
 		return colorBulletRed.Render("[!]") + colorBulletPurple.Render("[RELAY]") + colorGray.Render(line[10:])
+	} else if strings.HasPrefix(line, "[+][RECON]") {
+		return colorBulletGreen.Render("[+]") + colorBulletCyan.Render("[RECON]") + colorGray.Render(line[10:])
+	} else if strings.HasPrefix(line, "[*][RECON]") {
+		return colorBulletBlue.Render("[*]") + colorBulletCyan.Render("[RECON]") + colorGray.Render(line[10:])
+	} else if strings.HasPrefix(line, "[!][RECON]") {
+		return colorBulletRed.Render("[!]") + colorBulletCyan.Render("[RECON]") + colorGray.Render(line[10:])
+	} else if strings.HasPrefix(line, "[+][VLAN]") {
+		return colorBulletGreen.Render("[+]") + colorBulletPurple.Render("[VLAN]") + colorGray.Render(line[9:])
+	} else if strings.HasPrefix(line, "[!][VLAN]") {
+		return colorBulletRed.Render("[!]") + colorBulletPurple.Render("[VLAN]") + colorGray.Render(line[9:])
+	} else if strings.HasPrefix(line, "[+][NET]") {
+		return colorBulletGreen.Render("[+]") + colorBulletCyan.Render("[NET]") + colorGray.Render(line[8:])
+	} else if strings.HasPrefix(line, "[*][NET]") {
+		return colorBulletBlue.Render("[*]") + colorBulletCyan.Render("[NET]") + colorGray.Render(line[8:])
 	} else if strings.HasPrefix(line, "[*]") {
 		return colorBulletBlue.Render("[*]") + colorGray.Render(line[3:])
 	} else if strings.HasPrefix(line, "[+]") {
@@ -685,6 +712,12 @@ func formatLogLine(line string) string {
 		return colorBulletPurple.Render("[RELAY]") + colorGray.Render(line[7:])
 	} else if strings.HasPrefix(line, "[MACSEC]") {
 		return colorBulletPurple.Render("[MACSEC]") + colorGray.Render(line[8:])
+	} else if strings.HasPrefix(line, "[RECON]") {
+		return colorBulletCyan.Render("[RECON]") + colorGray.Render(line[7:])
+	} else if strings.HasPrefix(line, "[VLAN]") {
+		return colorBulletPurple.Render("[VLAN]") + colorGray.Render(line[6:])
+	} else if strings.HasPrefix(line, "[NET]") {
+		return colorBulletCyan.Render("[NET]") + colorGray.Render(line[5:])
 	} else if strings.HasPrefix(line, "    ") {
 		return "    " + colorGray.Render(line[4:])
 	}
@@ -726,13 +759,15 @@ func (m DashboardModel) renderFooter() string {
 		keyHint("q", "quit"),
 	}
 
+	natActive := hasBridge && m.bridge.IsNATActive()
+
 	// Action shortcuts — always visible, greyed when unavailable.
 	parts = append(parts,
 		hint(ready && gatewayKnown, "A", "auto"),
 		hint(ready || listening, "E", "802.1X listen"),
 		hint(ready, "S", "802.1X send"),
 		hint(ready || eapolDetected, "R", "relay"),
-		hint((ready || authenticated) && gatewayKnown, "N", "NAT proxy"),
+		hint((ready || authenticated || natActive) && gatewayKnown, "N", "NAT: "+map[bool]string{true: "ON", false: "OFF"}[natActive]),
 		hint(hasBridge, "M", "MACsec:"+macsecStr),
 	)
 

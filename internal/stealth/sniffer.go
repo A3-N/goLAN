@@ -19,7 +19,9 @@ type TargetIdentity struct {
 	Gateway          net.IP
 	EAPOLDetected    bool              // 802.1X frames seen on the wire
 	AuthenticatorMAC net.HardwareAddr  // Switch-side MAC sending EAPOL
-	VLANID           uint16            // 802.1Q VLAN tag (0 = untagged)
+	VLANID           uint16            // Primary 802.1Q VLAN tag (first seen, 0 = untagged)
+	VLANs            []uint16          // All VLAN IDs observed on the wire
+	NetworkMap       *NetworkMap       // Populated by observer after bridge UP
 }
 
 // String returns a human readable representation.
@@ -126,9 +128,25 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 			dot1qLayer := packet.Layer(layers.LayerTypeDot1Q)
 			if dot1qLayer != nil {
 				dot1q, _ := dot1qLayer.(*layers.Dot1Q)
-				if id.VLANID == 0 && dot1q.VLANIdentifier != 0 {
-					id.VLANID = dot1q.VLANIdentifier
-					eventLog(fmt.Sprintf("[+] 802.1Q VLAN tag detected: VLAN %d", id.VLANID))
+				if dot1q.VLANIdentifier != 0 {
+					if id.VLANID == 0 {
+						id.VLANID = dot1q.VLANIdentifier
+						eventLog(fmt.Sprintf("[+][VLAN] Primary 802.1Q VLAN tag detected: VLAN %d", id.VLANID))
+					}
+					// Track all VLANs seen during initial recon.
+					vlanSeen := false
+					for _, v := range id.VLANs {
+						if v == dot1q.VLANIdentifier {
+							vlanSeen = true
+							break
+						}
+					}
+					if !vlanSeen {
+						id.VLANs = append(id.VLANs, dot1q.VLANIdentifier)
+						if len(id.VLANs) > 1 {
+							eventLog(fmt.Sprintf("[!][VLAN] Additional VLAN %d detected — possible trunk port", dot1q.VLANIdentifier))
+						}
+					}
 				}
 			}
 
@@ -175,29 +193,33 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 							}
 						}
 					} else {
-						// Someone else (gateway/switch) is ARPing for our target device?
-						// Or it's a broadcast.
-						if len(id.Gateway) == 0 && targetIP.Equal(id.IP) {
-							// The sender is likely the Gateway trying to reach our Target Device.
-							id.Gateway = senderIP
-							eventLog(fmt.Sprintf("[+] ARP Request revealed possible Gateway IP: %s", id.Gateway.String()))
+						// Someone else (gateway/switch) is ARPing for our target device.
+						// Only treat as gateway if they're specifically asking for our target's IP.
+						if len(id.Gateway) == 0 && len(id.IP) > 0 && targetIP.Equal(id.IP) && !senderIP.IsUnspecified() {
+							// Filter out link-local (169.254.x.x) — these are self-assigned, not gateways.
+							if !strings.HasPrefix(senderIP.String(), "169.254") {
+								id.Gateway = senderIP
+								eventLog(fmt.Sprintf("[+] ARP Request revealed possible Gateway IP: %s", id.Gateway.String()))
+							}
 						}
 					}
 				} else if arp.Operation == layers.ARPReply {
 					senderMAC := net.HardwareAddr(arp.SourceHwAddress)
 					senderIP := net.IP(arp.SourceProtAddress)
-					
+					targetMAC := net.HardwareAddr(arp.DstHwAddress)
+
 					if macEqual(senderMAC, id.MAC) {
 						if len(id.IP) == 0 && !senderIP.IsUnspecified() {
 							id.IP = senderIP
 							eventLog(fmt.Sprintf("[+] ARP Reply revealed Target IP: %s", id.IP.String()))
 						}
 					} else {
-						// Reply from Gateway or switch?
-						if len(id.Gateway) == 0 && len(id.IP) > 0 {
-							// If someone replied to our MAC, they might be the gateway.
-							id.Gateway = senderIP
-							eventLog(fmt.Sprintf("[+] ARP Reply revealed Gateway IP: %s", id.Gateway.String()))
+						// Reply directed specifically to our target MAC is likely from the gateway.
+						if len(id.Gateway) == 0 && len(id.IP) > 0 && macEqual(targetMAC, id.MAC) {
+							if !senderIP.IsUnspecified() && !strings.HasPrefix(senderIP.String(), "169.254") {
+								id.Gateway = senderIP
+								eventLog(fmt.Sprintf("[+] ARP Reply revealed Gateway IP: %s", id.Gateway.String()))
+							}
 						}
 					}
 				}
@@ -267,7 +289,7 @@ func (t TargetIdentity) HasGateway() bool {
 // DiscoverGateway passively sniffs for gateway information only.
 // It watches for ARP requests/replies targeting the given MAC's IP and DHCP ACKs.
 // Returns when the gateway is found or the context is cancelled.
-func (s *Sniffer) DiscoverGateway(ctx context.Context, ignoreMACStr string, eventLog func(string), _ func(mac net.HardwareAddr)) (*TargetIdentity, error) {
+func (s *Sniffer) DiscoverGateway(ctx context.Context, ignoreMACStr string, eventLog func(string)) (*TargetIdentity, error) {
 	handle, err := pcap.OpenLive(s.iface, 65535, true, pcap.BlockForever)
 	if err != nil {
 		return nil, err
@@ -289,14 +311,17 @@ func (s *Sniffer) DiscoverGateway(ctx context.Context, ignoreMACStr string, even
 			}
 
 			// Look for ARP that reveals gateway.
+			// Filter carefully: reject link-local, loopback, unspecified, and multicast.
 			arpLayer := packet.Layer(layers.LayerTypeARP)
 			if arpLayer != nil {
 				arp, _ := arpLayer.(*layers.ARP)
 				senderIP := net.IP(arp.SourceProtAddress)
-				if !senderIP.IsUnspecified() && !senderIP.IsLoopback() {
+				if !senderIP.IsUnspecified() && !senderIP.IsLoopback() && !senderIP.IsMulticast() &&
+					!strings.HasPrefix(senderIP.String(), "169.254") {
 					if arp.Operation == layers.ARPRequest || arp.Operation == layers.ARPReply {
 						if len(id.Gateway) == 0 {
 							id.Gateway = senderIP
+							eventLog(fmt.Sprintf("[+] Gateway discovered via ARP: %s", senderIP.String()))
 							return id, nil
 						}
 					}
@@ -315,14 +340,12 @@ func (s *Sniffer) DiscoverGateway(ctx context.Context, ignoreMACStr string, even
 							for _, opt := range dhcp.Options {
 								if opt.Type == layers.DHCPOptRouter && len(opt.Data) >= 4 {
 									id.Gateway = net.IP(opt.Data[:4])
-									if opt.Type == layers.DHCPOptSubnetMask {
-										id.Netmask = net.IPMask(opt.Data)
-									}
 								}
 								if opt.Type == layers.DHCPOptSubnetMask {
 									id.Netmask = net.IPMask(opt.Data)
 								}
 							}
+
 							if id.HasGateway() {
 								return id, nil
 							}
