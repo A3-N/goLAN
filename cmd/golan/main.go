@@ -25,7 +25,7 @@ func main() {
 	// Check for root privileges.
 	if os.Geteuid() != 0 {
 		fmt.Println()
-		fmt.Println("  ⚠  goLAN requires root privileges to manage network bridges.")
+		fmt.Println("  goLAN requires root privileges to manage network bridges.")
 		fmt.Println()
 		fmt.Println("  Run with sudo:")
 		fmt.Println("    sudo golan")

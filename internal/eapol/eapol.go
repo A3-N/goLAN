@@ -285,6 +285,6 @@ func InjectEAPOLStart(iface string, supplicantMAC net.HardwareAddr, logFunc func
 		return fmt.Errorf("injecting EAPOL-Start on %s: %w", iface, err)
 	}
 
-	logFunc(fmt.Sprintf("[802.1X] Injected EAPOL-Start on %s (src: %s)", iface, supplicantMAC))
+	logFunc(fmt.Sprintf("[*][802.1X] Injected EAPOL-Start on %s (src: %s)", iface, supplicantMAC))
 	return nil
 }

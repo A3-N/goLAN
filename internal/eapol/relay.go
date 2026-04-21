@@ -107,7 +107,7 @@ func (r *Relay) Start(ctx context.Context) error {
 	// Some switches won't send EAP-Request/Identity until they see EAPOL-Start.
 	if r.session.SupplicantMAC != nil {
 		if err := InjectEAPOLStart(r.ifaceB, r.session.SupplicantMAC, r.logFunc); err != nil {
-			r.logFunc(fmt.Sprintf("[802.1X] EAPOL-Start injection failed (non-fatal): %v", err))
+			r.logFunc(fmt.Sprintf("[!][802.1X] EAPOL-Start injection failed (non-fatal): %v", err))
 		}
 	}
 
@@ -290,7 +290,7 @@ func (r *Relay) handleEAPFrame(packet gopacket.Packet, eth *layers.Ethernet, lab
 			r.session.mu.Lock()
 			if r.session.Method == MethodUnknown || r.session.Method == MethodIdentity {
 				r.session.Method = method
-				r.logFunc(fmt.Sprintf("[802.1X] EAP method negotiated: %s", method))
+				r.logFunc(fmt.Sprintf("[+][802.1X] EAP method negotiated: %s", method))
 			}
 			r.session.mu.Unlock()
 		} else if method == MethodIdentity {
@@ -302,7 +302,7 @@ func (r *Relay) handleEAPFrame(packet gopacket.Packet, eth *layers.Ethernet, lab
 			if r.session.State == StateAuthenticated {
 				r.session.ReauthCount++
 				r.session.State = StateRelaying
-				r.logFunc(fmt.Sprintf("[802.1X] Re-authentication #%d initiated by authenticator", r.session.ReauthCount))
+				r.logFunc(fmt.Sprintf("[*][802.1X] Re-authentication #%d initiated by authenticator", r.session.ReauthCount))
 			}
 			r.session.mu.Unlock()
 		}

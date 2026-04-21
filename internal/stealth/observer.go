@@ -217,13 +217,9 @@ func (o *Observer) processPacket(
 	if dnsLayer != nil {
 		dns, _ := dnsLayer.(*layers.DNS)
 
-		// We only care about DNS from/to the target device.
-		isFromTarget := macEqual(srcMAC, targetMAC)
-		isToTarget := macEqual(eth.DstMAC, targetMAC)
-
-		if isFromTarget || isToTarget {
-			o.processDNS(dns, isFromTarget, nm, now, eventLog, lastDNSLog, dnsLogCooldown)
-		}
+		// Log ALL observed DNS traffic on the wire for maximum network recon.
+		isQuery := !dns.QR
+		o.processDNS(dns, isQuery, nm, now, eventLog, lastDNSLog, dnsLogCooldown)
 	}
 }
 
@@ -397,7 +393,7 @@ func (o *Observer) processDNS(dns *layers.DNS, isQuery bool, nm *NetworkMap, now
 			}
 			nm.mu.Unlock()
 
-			eventLog(fmt.Sprintf("[*][NET] Target DNS query: %s (%s)", name, qType))
+			eventLog(fmt.Sprintf("[*][NET] DNS query: %s (%s)", name, qType))
 		}
 	}
 
