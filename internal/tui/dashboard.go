@@ -138,20 +138,20 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 			}
 
 		// Action modes — only available when bridge is Ready.
-		case "a", "A":
-			if m.bridge != nil && bState == bridge.BridgeStateReady && m.bridge.GatewayKnown() {
-				logFunc := m.bridgeLogFunc()
-				go m.bridge.RunAutoMode(logFunc)
-			}
 		case "e", "E", "l", "L":
 			if m.bridge != nil && (bState == bridge.BridgeStateReady || bState == bridge.BridgeStateEAPOLListening) {
 				logFunc := m.bridgeLogFunc()
 				go m.bridge.RunListenEAPOL(logFunc)
 			}
 		case "r", "R":
-			if m.bridge != nil && (bState == bridge.BridgeStateReady || bState == bridge.BridgeStateEAPOLDetected) {
-				logFunc := m.bridgeLogFunc()
-				go m.bridge.RunEAPOLRelay(logFunc)
+			if m.bridge != nil {
+				if bState == bridge.BridgeStateEAPOLRelaying || bState == bridge.BridgeStateEAPOLAuthenticated {
+					logFunc := m.bridgeLogFunc()
+					go m.bridge.StopEAPOLRelay(logFunc)
+				} else if bState == bridge.BridgeStateReady || bState == bridge.BridgeStateEAPOLDetected {
+					logFunc := m.bridgeLogFunc()
+					go m.bridge.RunEAPOLRelay(logFunc)
+				}
 			}
 		case "n", "N":
 			if m.bridge != nil {
@@ -264,9 +264,9 @@ func (m DashboardModel) renderHeader(width int) string {
 
 	// Derive status for the header based on bridge state.
 	bridgeUp := bState == bridge.BridgeStateUp ||
-		bState == bridge.BridgeStateStealthActive ||
 		bState == bridge.BridgeStateEAPOLAuthenticated ||
-		bState == bridge.BridgeStateEAPOLRelaying
+		bState == bridge.BridgeStateEAPOLRelaying ||
+		(m.bridge != nil && m.bridge.IsNATActive())
 
 	mediaDisrupt := m.hasStats &&
 		(!m.latestStats.IfaceA.Stats.MediaActive || !m.latestStats.IfaceB.Stats.MediaActive)
@@ -278,6 +278,8 @@ func (m DashboardModel) renderHeader(width int) string {
 		stateStr = lipgloss.NewStyle().Foreground(colorReady).Bold(true).Render("◉ READY")
 	case bridgeUp && mediaDisrupt:
 		stateStr = styleError.Render("⚠ DISRUPT")
+	case m.bridge != nil && m.bridge.IsNATActive():
+		stateStr = lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("PROXY ACTIVE")
 	case bridgeUp:
 		stateStr = styleUp.Render("● ACTIVE")
 	default:
@@ -658,6 +660,7 @@ var (
 	colorBulletBlue   = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
 	colorBulletGreen  = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
 	colorBulletRed    = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	colorBulletOrange = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff9100")).Bold(true)
 	colorBulletPurple = lipgloss.NewStyle().Foreground(color802dot1X).Bold(true)
 	colorBulletCyan   = lipgloss.NewStyle().Foreground(lipgloss.Color("#00CED1")).Bold(true)
 	colorGray         = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
@@ -678,28 +681,50 @@ func formatLogLine(line string) string {
 		return colorBulletGreen.Render("[+]") + colorBulletPurple.Render("[802.1X]") + colorGray.Render(line[11:])
 	} else if strings.HasPrefix(line, "[!][802.1X]") {
 		return colorBulletRed.Render("[!]") + colorBulletPurple.Render("[802.1X]") + colorGray.Render(line[11:])
+	} else if strings.HasPrefix(line, "[W][802.1X]") {
+		return colorBulletOrange.Render("[W]") + colorBulletPurple.Render("[802.1X]") + colorGray.Render(line[11:])
+	} else if strings.HasPrefix(line, "[*][802.1X]") {
+		return colorBulletBlue.Render("[*]") + colorBulletPurple.Render("[802.1X]") + colorGray.Render(line[11:])
 	} else if strings.HasPrefix(line, "[+][MACSEC]") {
 		return colorBulletGreen.Render("[+]") + colorBulletPurple.Render("[MACSEC]") + colorGray.Render(line[11:])
 	} else if strings.HasPrefix(line, "[!][MACSEC]") {
 		return colorBulletRed.Render("[!]") + colorBulletPurple.Render("[MACSEC]") + colorGray.Render(line[11:])
+	} else if strings.HasPrefix(line, "[W][MACSEC]") {
+		return colorBulletOrange.Render("[W]") + colorBulletPurple.Render("[MACSEC]") + colorGray.Render(line[11:])
+	} else if strings.HasPrefix(line, "[*][MACSEC]") {
+		return colorBulletBlue.Render("[*]") + colorBulletPurple.Render("[MACSEC]") + colorGray.Render(line[11:])
 	} else if strings.HasPrefix(line, "[+][RELAY]") {
 		return colorBulletGreen.Render("[+]") + colorBulletPurple.Render("[RELAY]") + colorGray.Render(line[10:])
 	} else if strings.HasPrefix(line, "[!][RELAY]") {
 		return colorBulletRed.Render("[!]") + colorBulletPurple.Render("[RELAY]") + colorGray.Render(line[10:])
+	} else if strings.HasPrefix(line, "[W][RELAY]") {
+		return colorBulletOrange.Render("[W]") + colorBulletPurple.Render("[RELAY]") + colorGray.Render(line[10:])
+	} else if strings.HasPrefix(line, "[*][RELAY]") {
+		return colorBulletBlue.Render("[*]") + colorBulletPurple.Render("[RELAY]") + colorGray.Render(line[10:])
 	} else if strings.HasPrefix(line, "[+][RECON]") {
-		return colorBulletGreen.Render("[+]") + colorBulletCyan.Render("[RECON]") + colorGray.Render(line[10:])
+		return colorBulletGreen.Render("[+]") + colorBulletPurple.Render("[RECON]") + colorGray.Render(line[10:])
 	} else if strings.HasPrefix(line, "[*][RECON]") {
-		return colorBulletBlue.Render("[*]") + colorBulletCyan.Render("[RECON]") + colorGray.Render(line[10:])
+		return colorBulletBlue.Render("[*]") + colorBulletPurple.Render("[RECON]") + colorGray.Render(line[10:])
 	} else if strings.HasPrefix(line, "[!][RECON]") {
-		return colorBulletRed.Render("[!]") + colorBulletCyan.Render("[RECON]") + colorGray.Render(line[10:])
+		return colorBulletRed.Render("[!]") + colorBulletPurple.Render("[RECON]") + colorGray.Render(line[10:])
+	} else if strings.HasPrefix(line, "[W][RECON]") {
+		return colorBulletOrange.Render("[W]") + colorBulletPurple.Render("[RECON]") + colorGray.Render(line[10:])
 	} else if strings.HasPrefix(line, "[+][VLAN]") {
 		return colorBulletGreen.Render("[+]") + colorBulletPurple.Render("[VLAN]") + colorGray.Render(line[9:])
 	} else if strings.HasPrefix(line, "[!][VLAN]") {
 		return colorBulletRed.Render("[!]") + colorBulletPurple.Render("[VLAN]") + colorGray.Render(line[9:])
+	} else if strings.HasPrefix(line, "[W][VLAN]") {
+		return colorBulletOrange.Render("[W]") + colorBulletPurple.Render("[VLAN]") + colorGray.Render(line[9:])
 	} else if strings.HasPrefix(line, "[+][NET]") {
-		return colorBulletGreen.Render("[+]") + colorBulletCyan.Render("[NET]") + colorGray.Render(line[8:])
+		return colorBulletGreen.Render("[+]") + colorBulletPurple.Render("[NET]") + colorGray.Render(line[8:])
+	} else if strings.HasPrefix(line, "[!][NET]") {
+		return colorBulletRed.Render("[!]") + colorBulletPurple.Render("[NET]") + colorGray.Render(line[8:])
+	} else if strings.HasPrefix(line, "[W][NET]") {
+		return colorBulletOrange.Render("[W]") + colorBulletPurple.Render("[NET]") + colorGray.Render(line[8:])
 	} else if strings.HasPrefix(line, "[*][NET]") {
-		return colorBulletBlue.Render("[*]") + colorBulletCyan.Render("[NET]") + colorGray.Render(line[8:])
+		return colorBulletBlue.Render("[*]") + colorBulletPurple.Render("[NET]") + colorGray.Render(line[8:])
+	} else if strings.HasPrefix(line, "[W]") {
+		return colorBulletOrange.Render("[W]") + colorGray.Render(line[3:])
 	} else if strings.HasPrefix(line, "[*]") {
 		return colorBulletBlue.Render("[*]") + colorGray.Render(line[3:])
 	} else if strings.HasPrefix(line, "[+]") {
@@ -713,11 +738,11 @@ func formatLogLine(line string) string {
 	} else if strings.HasPrefix(line, "[MACSEC]") {
 		return colorBulletPurple.Render("[MACSEC]") + colorGray.Render(line[8:])
 	} else if strings.HasPrefix(line, "[RECON]") {
-		return colorBulletCyan.Render("[RECON]") + colorGray.Render(line[7:])
+		return colorBulletPurple.Render("[RECON]") + colorGray.Render(line[7:])
 	} else if strings.HasPrefix(line, "[VLAN]") {
 		return colorBulletPurple.Render("[VLAN]") + colorGray.Render(line[6:])
 	} else if strings.HasPrefix(line, "[NET]") {
-		return colorBulletCyan.Render("[NET]") + colorGray.Render(line[5:])
+		return colorBulletPurple.Render("[NET]") + colorGray.Render(line[5:])
 	} else if strings.HasPrefix(line, "    ") {
 		return "    " + colorGray.Render(line[4:])
 	}
@@ -762,11 +787,14 @@ func (m DashboardModel) renderFooter() string {
 	natActive := hasBridge && m.bridge.IsNATActive()
 
 	// Action shortcuts — always visible, greyed when unavailable.
+	relayStr := "relay"
+	if bState == bridge.BridgeStateEAPOLRelaying || bState == bridge.BridgeStateEAPOLAuthenticated {
+		relayStr = "stop relay"
+	}
 	parts = append(parts,
-		hint(ready && gatewayKnown, "A", "auto"),
 		hint(ready || listening, "E", "802.1X listen"),
 		hint(ready, "S", "802.1X send"),
-		hint(ready || eapolDetected, "R", "relay"),
+		hint(ready || eapolDetected || bState == bridge.BridgeStateEAPOLRelaying || bState == bridge.BridgeStateEAPOLAuthenticated, "R", relayStr),
 		hint((ready || authenticated || natActive) && gatewayKnown, "N", "NAT: "+map[bool]string{true: "ON", false: "OFF"}[natActive]),
 		hint(hasBridge, "M", "MACsec:"+macsecStr),
 	)

@@ -41,9 +41,9 @@ func (d *Detector) Detect(ctx context.Context, timeout time.Duration, logFunc fu
 	result := &DetectResult{}
 
 	if continuous {
-		logFunc(fmt.Sprintf("[802.1X] Passive EAPOL detection on %s (continuous mode)", d.iface))
+		logFunc(fmt.Sprintf("[*][802.1X] Passive EAPOL detection on %s (continuous mode)", d.iface))
 	} else {
-		logFunc(fmt.Sprintf("[802.1X] Passive EAPOL detection on %s (timeout: %s)", d.iface, timeout))
+		logFunc(fmt.Sprintf("[*][802.1X] Passive EAPOL detection on %s (timeout: %s)", d.iface, timeout))
 	}
 
 	handle, err := pcap.OpenLive(d.iface, 65535, true, pcap.BlockForever)
@@ -61,6 +61,9 @@ func (d *Detector) Detect(ctx context.Context, timeout time.Duration, logFunc fu
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+
+	loggedStarts := make(map[string]bool)
+	loggedLogoffs := make(map[string]bool)
 
 	for {
 		select {
@@ -96,7 +99,7 @@ func (d *Detector) Detect(ctx context.Context, timeout time.Duration, logFunc fu
 
 			if len(result.AuthenticatorMAC) == 0 {
 				result.AuthenticatorMAC = eth.SrcMAC
-				logFunc(fmt.Sprintf("[802.1X] Authenticator detected: %s", eth.SrcMAC))
+				logFunc(fmt.Sprintf("[*][802.1X] Authenticator detected: %s", eth.SrcMAC))
 			}
 
 			switch eapol.Type {
@@ -108,24 +111,32 @@ func (d *Detector) Detect(ctx context.Context, timeout time.Duration, logFunc fu
 						method := eapTypeToMethod(uint8(eap.Type))
 						if method != MethodUnknown && method != MethodIdentity {
 							result.EAPMethod = method
-							logFunc(fmt.Sprintf("[802.1X] EAP method detected: %s", method))
+							logFunc(fmt.Sprintf("[*][802.1X] EAP method detected: %s", method))
 						}
 					}
 				}
-				logFunc(fmt.Sprintf("[802.1X] EAPOL-EAP frame from %s (ver:%d, len:%d)", eth.SrcMAC, eapol.Version, eapol.Length))
+				logFunc(fmt.Sprintf("[*][802.1X] EAPOL-EAP frame from %s (ver:%d, len:%d)", eth.SrcMAC, eapol.Version, eapol.Length))
 
 			case layers.EAPOLTypeStart:
-				logFunc(fmt.Sprintf("[802.1X] EAPOL-Start from %s", eth.SrcMAC))
+				macStr := eth.SrcMAC.String()
+				if !loggedStarts[macStr] {
+					loggedStarts[macStr] = true
+					logFunc(fmt.Sprintf("[*][802.1X] EAPOL-Start from %s", eth.SrcMAC))
+				}
 
 			case layers.EAPOLTypeLogOff:
-				logFunc(fmt.Sprintf("[802.1X] EAPOL-Logoff from %s", eth.SrcMAC))
+				macStr := eth.SrcMAC.String()
+				if !loggedLogoffs[macStr] {
+					loggedLogoffs[macStr] = true
+					logFunc(fmt.Sprintf("[*][802.1X] EAPOL-Logoff from %s", eth.SrcMAC))
+				}
 
 			case layers.EAPOLTypeKey, layers.EAPOLType(5):
 				result.MACsecCapable = true
 				logFunc(fmt.Sprintf("[MACSEC] EAPOL Type %d frame detected from %s", eapol.Type, eth.SrcMAC))
 
 			default:
-				logFunc(fmt.Sprintf("[802.1X] Unknown EAPOL type %d from %s", eapol.Type, eth.SrcMAC))
+				logFunc(fmt.Sprintf("[*][802.1X] Unknown EAPOL type %d from %s", eapol.Type, eth.SrcMAC))
 			}
 
 			if !continuous && result.FramesSeen >= 1 {

@@ -91,7 +91,7 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 					if !id.EAPOLDetected {
 						id.EAPOLDetected = true
 						id.AuthenticatorMAC = eth.SrcMAC
-						eventLog(fmt.Sprintf("[802.1X] EAPOL frame detected from %s — 802.1X is active on this port", eth.SrcMAC))
+						eventLog(fmt.Sprintf("[*][802.1X] EAPOL frame detected from %s — 802.1X is active on this port", eth.SrcMAC))
 					}
 					continue // Don't process EAPOL as normal traffic
 				}
