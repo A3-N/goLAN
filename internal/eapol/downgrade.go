@@ -30,13 +30,14 @@ func NewDowngrader() *Downgrader {
 // dropped to effect a MACsec downgrade.
 //
 // We drop:
-//   - EAPOL-Key frames (type 3) — these carry the MKA 4-way handshake
-//     used to establish MACsec Secure Associations (SA).
+//   - EAPOL-MKA frames (type 5) — these carry the MACsec Key Agreement
+//     protocol used to establish MACsec Secure Associations (SA).
 //
 // We pass through:
 //   - EAPOL-EAP frames (type 0) — normal authentication
 //   - EAPOL-Start (type 1) — session initiation
 //   - EAPOL-Logoff (type 2) — session teardown
+//   - EAPOL-Key frames (type 3) — WPA/WPA2 4-way handshake (not MACsec)
 func (d *Downgrader) ShouldDrop(packet gopacket.Packet) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()

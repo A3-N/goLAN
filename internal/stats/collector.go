@@ -3,7 +3,6 @@ package stats
 import (
 	"context"
 	"fmt"
-	"math"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -57,6 +56,7 @@ type Collector struct {
 	prevB    *InterfaceStats
 	prevTime time.Time
 	started  time.Time
+	running  bool // guards against double-start
 }
 
 // NewCollector creates a new stats collector for two bridged interfaces.
@@ -78,12 +78,26 @@ func NewCollector(ifaceA, ifaceB, bridgeIf string, interval time.Duration) *Coll
 
 // Start begins polling and returns a channel of StatsUpdate messages.
 // The channel is closed when the context is cancelled.
+// Safe to call only once per collector; subsequent calls return a nil channel.
 func (c *Collector) Start(ctx context.Context) <-chan StatsUpdate {
+	c.mu.Lock()
+	if c.running {
+		c.mu.Unlock()
+		return nil // Already running — prevent goroutine/channel leak
+	}
+	c.running = true
+	c.mu.Unlock()
+
 	ch := make(chan StatsUpdate, 1)
 	c.started = time.Now()
 
 	go func() {
-		defer close(ch)
+		defer func() {
+			close(ch)
+			c.mu.Lock()
+			c.running = false
+			c.mu.Unlock()
+		}()
 		ticker := time.NewTicker(c.interval)
 		defer ticker.Stop()
 
@@ -133,21 +147,16 @@ func (c *Collector) poll() StatsUpdate {
 	if c.prevA != nil && c.prevB != nil {
 		elapsed := now.Sub(c.prevTime).Seconds()
 		if elapsed > 0 {
-			deltaA.RxBytesPerSec = float64(statsA.RxBytes-c.prevA.RxBytes) / elapsed
-			deltaA.TxBytesPerSec = float64(statsA.TxBytes-c.prevA.TxBytes) / elapsed
-			deltaA.RxPktPerSec = float64(statsA.RxPackets-c.prevA.RxPackets) / elapsed
-			deltaA.TxPktPerSec = float64(statsA.TxPackets-c.prevA.TxPackets) / elapsed
+			// Use safeDelta to prevent uint64 underflow on counter resets/rollovers.
+			deltaA.RxBytesPerSec = float64(safeDelta(statsA.RxBytes, c.prevA.RxBytes)) / elapsed
+			deltaA.TxBytesPerSec = float64(safeDelta(statsA.TxBytes, c.prevA.TxBytes)) / elapsed
+			deltaA.RxPktPerSec = float64(safeDelta(statsA.RxPackets, c.prevA.RxPackets)) / elapsed
+			deltaA.TxPktPerSec = float64(safeDelta(statsA.TxPackets, c.prevA.TxPackets)) / elapsed
 
-			deltaB.RxBytesPerSec = float64(statsB.RxBytes-c.prevB.RxBytes) / elapsed
-			deltaB.TxBytesPerSec = float64(statsB.TxBytes-c.prevB.TxBytes) / elapsed
-			deltaB.RxPktPerSec = float64(statsB.RxPackets-c.prevB.RxPackets) / elapsed
-			deltaB.TxPktPerSec = float64(statsB.TxPackets-c.prevB.TxPackets) / elapsed
-
-			// Clamp negative deltas (counter rollover protection).
-			deltaA.RxBytesPerSec = math.Max(0, deltaA.RxBytesPerSec)
-			deltaA.TxBytesPerSec = math.Max(0, deltaA.TxBytesPerSec)
-			deltaB.RxBytesPerSec = math.Max(0, deltaB.RxBytesPerSec)
-			deltaB.TxBytesPerSec = math.Max(0, deltaB.TxBytesPerSec)
+			deltaB.RxBytesPerSec = float64(safeDelta(statsB.RxBytes, c.prevB.RxBytes)) / elapsed
+			deltaB.TxBytesPerSec = float64(safeDelta(statsB.TxBytes, c.prevB.TxBytes)) / elapsed
+			deltaB.RxPktPerSec = float64(safeDelta(statsB.RxPackets, c.prevB.RxPackets)) / elapsed
+			deltaB.TxPktPerSec = float64(safeDelta(statsB.TxPackets, c.prevB.TxPackets)) / elapsed
 
 			// Append to history.
 			c.appendHistory(c.ifaceA+"_rx", deltaA.RxBytesPerSec)
@@ -323,4 +332,14 @@ func HumanizeDuration(d time.Duration) string {
 func parseUint(s string) uint64 {
 	v, _ := strconv.ParseUint(s, 10, 64)
 	return v
+}
+
+// safeDelta returns (current - prev) if current >= prev, or 0 if the counter
+// has wrapped/reset. This prevents uint64 underflow from producing massive
+// spurious throughput values.
+func safeDelta(current, prev uint64) uint64 {
+	if current >= prev {
+		return current - prev
+	}
+	return 0
 }

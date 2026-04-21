@@ -43,8 +43,10 @@ func EnableNAT(rule PFRule) error {
 		return fmt.Errorf("closing pfctl rules file: %w", err)
 	}
 
-	// pfctl -E enables pf
-	exec.Command("pfctl", "-E").Run()
+	// pfctl -E enables pf — must succeed before loading rules.
+	if out, err := exec.Command("pfctl", "-E").CombinedOutput(); err != nil {
+		return fmt.Errorf("pfctl -E (enable pf) failed: %s", out)
+	}
 
 	// Load the dynamic rule
 	cmd := exec.Command("pfctl", "-a", "com.apple/golan", "-f", "/tmp/golan_pf.conf")

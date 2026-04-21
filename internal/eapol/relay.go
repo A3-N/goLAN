@@ -215,13 +215,8 @@ func (r *Relay) relayDirection(ctx context.Context, src, dst *pcap.Handle, label
 				dg := r.downgrader
 				r.mu.Unlock()
 
-				isDroppedByRule := false
-				if dg != nil && dg.IsEnabled() {
-					if eapol.Type == layers.EAPOLType(5) {
-						dg.RecordDrop()
-						isDroppedByRule = true
-					}
-				}
+				// Use the Downgrader's ShouldDrop to decide, keeping logic in one place.
+				isDroppedByRule := dg != nil && dg.ShouldDrop(packet)
 
 				if isDroppedByRule {
 					r.logFunc(fmt.Sprintf("[!][MACSEC] %s: MACsec (EAPOL Type %d) discovered. DROPPING PACKET to force downgrade", label, eapol.Type))
