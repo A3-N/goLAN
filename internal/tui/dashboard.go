@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mcrn/goLAN/internal/bridge"
 	"github.com/mcrn/goLAN/internal/stats"
+	"github.com/mcrn/goLAN/internal/stealth"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -27,9 +29,9 @@ type DashboardModel struct {
 	latestStats stats.StatsUpdate
 	hasStats    bool
 
-	width  int
-	height int
-	err    error
+	width     int
+	height    int
+	err       error
 	logScroll int
 }
 
@@ -54,9 +56,9 @@ func NewDashboardModel(ifA, ifB bridge.NetInterface) DashboardModel {
 	}
 }
 
-func (m DashboardModel) createBridgeCmd(ifA, ifB string, ignoreMAC string) tea.Cmd {
+func (m DashboardModel) createBridgeCmd(ifA, ifB bridge.NetInterface) tea.Cmd {
 	return func() tea.Msg {
-		br, err := bridge.NewBridge(ifA, ifB, ignoreMAC)
+		br, err := bridge.NewBridge(ifA, ifB)
 		if err != nil {
 			return bridgeErrorMsg{err: err}
 		}
@@ -76,13 +78,7 @@ func waitForStats(ch <-chan stats.StatsUpdate) tea.Cmd {
 }
 
 func (m DashboardModel) Init() tea.Cmd {
-	// Lock down both interfaces explicitly before initiating bridge creation
-	// to prevent OS leaks to the physical wire. This happens synchronously
-	// in the TUI thread.
-	_ = bridge.LockdownInterface(m.ifaceA.Name, m.ifaceA.HardwarePort)
-	_ = bridge.LockdownInterface(m.ifaceB.Name, m.ifaceB.HardwarePort)
-
-	return m.createBridgeCmd(m.ifaceA.Name, m.ifaceB.Name, m.ifaceA.CurrentMAC)
+	return m.createBridgeCmd(m.ifaceA, m.ifaceB)
 }
 
 func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
@@ -121,14 +117,14 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 		case "down", "j":
 			m.logScroll--
 		}
-		
+
 		maxVis := 6
 		logsLen := 0
 		if m.bridge != nil {
 			logsLen = len(m.bridge.Status().ReconLogs)
 		}
-		
-		if m.logScroll > logsLen - maxVis {
+
+		if m.logScroll > logsLen-maxVis {
 			if logsLen > maxVis {
 				m.logScroll = logsLen - maxVis
 			} else {
@@ -202,8 +198,6 @@ func (m DashboardModel) View() string {
 	return sb.String()
 }
 
-
-
 func (m DashboardModel) renderHeader(width int) string {
 	var stateStr string
 	bState := bridge.BridgeStateDown
@@ -212,12 +206,16 @@ func (m DashboardModel) renderHeader(width int) string {
 	}
 
 	switch bState {
-	case bridge.BridgeStateUp:
-		stateStr = styleUp.Render("● ACTIVE")
+	case bridge.BridgeStateL2Active:
+		stateStr = styleUp.Render("● L2 ACTIVE")
+	case bridge.BridgeStateL2Degraded:
+		stateStr = styleWarning.Render("● L2 DEGRADED")
 	case bridge.BridgeStateSniffing:
-		stateStr = styleWarning.Render("○ RECONNAISSANCE: Sniffing Target Identity...")
-	case bridge.BridgeStateStealthActive:
-		stateStr = styleUp.Render("● STEALTH ACTIVE")
+		stateStr = styleWarning.Render("○ PASSIVE L2: Waiting for Target MAC...")
+	case bridge.BridgeStateConfiguring:
+		stateStr = styleWarning.Render("○ CONFIGURING L2 BRIDGE...")
+	case bridge.BridgeStateError:
+		stateStr = styleError.Render("● ERROR")
 	default:
 		stateStr = styleDim.Render("○ CONNECTING")
 	}
@@ -250,6 +248,18 @@ func (m DashboardModel) renderError() string {
 	sb.WriteString("\n")
 	sb.WriteString(styleError.Render("  ✗ Bridge creation failed:") + "\n\n")
 	sb.WriteString(styleError.Render("    "+m.err.Error()) + "\n\n")
+	var setupErr *bridge.SetupError
+	if errors.As(m.err, &setupErr) && len(setupErr.ReconLogs) > 0 {
+		sb.WriteString(styleLabel.Render("  Setup Diagnostics") + "\n")
+		start := len(setupErr.ReconLogs) - 8
+		if start < 0 {
+			start = 0
+		}
+		for _, log := range setupErr.ReconLogs[start:] {
+			sb.WriteString("  " + formatLogLine(log) + "\n")
+		}
+		sb.WriteString("\n")
+	}
 	sb.WriteString(styleDim.Render("  Possible causes:") + "\n")
 	sb.WriteString(styleDim.Render("  • Not running as root (try: sudo golan)") + "\n")
 	sb.WriteString(styleDim.Render("  • Interfaces managed by System Settings") + "\n")
@@ -266,6 +276,15 @@ func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
 	macB := m.ifaceB.CurrentMAC
 	if macB == "" {
 		macB = "N/A"
+	}
+	if m.bridge != nil {
+		status := m.bridge.Status()
+		if live := currentMACFromIfconfig(status.IfaceAInfo); live != "" {
+			macA = live
+		}
+		if live := currentMACFromIfconfig(status.IfaceBInfo); live != "" {
+			macB = live
+		}
 	}
 
 	cardWidth := 30
@@ -288,19 +307,22 @@ func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
 
 	middleContent := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render("● goLAN Engine") + "\n" +
 		styleDim.Render("Middle Man Proxy") + "\n"
-	
+
 	bState := bridge.BridgeStateDown
 	if m.bridge != nil {
 		bState = m.bridge.State()
 	}
 
 	if m.bridge != nil {
-		if bState == bridge.BridgeStateStealthActive {
-			middleContent += styleDim.Render("Bridged (Spoofed)") + "\n" +
-				lipgloss.NewStyle().Foreground(colorGreen).Render("NAT Masqueraded")
+		if bState == bridge.BridgeStateL2Active || bState == bridge.BridgeStateL2Degraded {
+			middleContent += styleDim.Render("Transparent L2") + "\n" +
+				lipgloss.NewStyle().Foreground(colorGreen).Render("Unnumbered Bridge")
 		} else if bState == bridge.BridgeStateSniffing {
-			middleContent += lipgloss.NewStyle().Foreground(colorYellow).Render("Reconnaissance...") + "\n" +
-				styleDim.Render("Air-gapped (Secure)")
+			middleContent += lipgloss.NewStyle().Foreground(colorYellow).Render("Passive Sniffing") + "\n" +
+				styleDim.Render("Switch Port Down")
+		} else if bState == bridge.BridgeStateConfiguring {
+			middleContent += lipgloss.NewStyle().Foreground(colorYellow).Render("Cloning MAC") + "\n" +
+				styleDim.Render("Attaching Members")
 		} else {
 			middleContent += styleDim.Render("Transparent") + "\n" +
 				styleDim.Render("L2 Passthrough")
@@ -318,13 +340,13 @@ func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
 		Render(middleContent)
 
 	// Connection wires — green if bridge is active, red sequence if not.
-	wireActive := bState == bridge.BridgeStateUp || bState == bridge.BridgeStateStealthActive
-	
+	wireActive := bState == bridge.BridgeStateL2Active || bState == bridge.BridgeStateL2Degraded
+
 	wireStrA := " ═══❌═══ "
 	wireStrB := " ═══❌═══ "
 	wireStyleA := lipgloss.NewStyle().Foreground(colorRed).Bold(true)
 	wireStyleB := lipgloss.NewStyle().Foreground(colorRed).Bold(true)
-	
+
 	if wireActive {
 		wireStrA = " ════════ "
 		wireStrB = " ════════ "
@@ -437,27 +459,35 @@ func (m DashboardModel) renderBottomSection(width int) string {
 	graphB := renderSpark(m.ifaceB.Name+" (Switch)", histBRx, histBTx, styleSparkSwitch)
 	graphs := graphA + "\n" + graphB
 
-	// ── Recon Logs ──────────────────────────────────────────────────
+	// ── Recon Logs & Setup Diagnostics ──────────────────────────────
 	var logsPanel string
 	if m.bridge != nil {
 		status := m.bridge.Status()
 		// Only render logs if we have them, or if we are actively sniffing
-		if len(status.ReconLogs) > 0 || status.State == bridge.BridgeStateSniffing || status.State == bridge.BridgeStateStealthActive {
+		if len(status.ReconLogs) > 0 || len(status.CommandLogs) > 0 || status.State == bridge.BridgeStateSniffing ||
+			status.State == bridge.BridgeStateL2Active || status.State == bridge.BridgeStateL2Degraded {
 			var sb strings.Builder
-			sb.WriteString(styleLabel.Render("Reconnaissance Log") + styleDim.Render("  (Use Up/Down or J/K to scroll)") + "\n")
+			sb.WriteString(styleLabel.Render("L2 Diagnostics") + styleDim.Render("  (Use Up/Down or J/K to scroll)") + "\n")
+			if status.TargetID != nil {
+				sb.WriteString(formatLogLine(targetIdentityLine(status.TargetID)) + "\n")
+			}
 			logs := []string{"[*] Waiting for sniffer to initialize..."}
 			if len(status.ReconLogs) > 0 {
 				logs = status.ReconLogs
 			}
-			
+
 			maxVis := 6
 			logsLen := len(logs)
-			
+
 			start := logsLen - maxVis - m.logScroll
-			if start < 0 { start = 0 }
+			if start < 0 {
+				start = 0
+			}
 			end := start + maxVis
-			if end > logsLen { end = logsLen }
-			
+			if end > logsLen {
+				end = logsLen
+			}
+
 			for _, log := range logs[start:end] {
 				sb.WriteString(formatLogLine(log) + "\n")
 			}
@@ -469,7 +499,7 @@ func (m DashboardModel) renderBottomSection(width int) string {
 	// Join both columns horizontally
 	columns := lipgloss.JoinHorizontal(
 		lipgloss.Top,
-		lipgloss.NewStyle().Width(sparkWidth + 10).Render(graphs),
+		lipgloss.NewStyle().Width(sparkWidth+10).Render(graphs),
 		lipgloss.NewStyle().MarginLeft(4).Render(logsPanel),
 	)
 
@@ -483,7 +513,7 @@ var (
 	colorBulletRed   = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 	colorGray        = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	colorBoldWhite   = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true)
-	
+
 	macRegex = regexp.MustCompile(`(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}`)
 	ipRegex  = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
 )
@@ -502,10 +532,43 @@ func formatLogLine(line string) string {
 		return colorBulletGreen.Render("[+]") + colorGray.Render(line[3:])
 	} else if strings.HasPrefix(line, "[!]") {
 		return colorBulletRed.Render("[!]") + colorGray.Render(line[3:])
+	} else if strings.HasPrefix(line, "[$]") {
+		return styleWarning.Render("[$]") + colorGray.Render(line[3:])
 	} else if strings.HasPrefix(line, "    ") {
 		return "    " + colorGray.Render(line[4:])
 	}
 	return colorGray.Render("• " + line)
+}
+
+func targetIdentityLine(id *stealth.TargetIdentity) string {
+	if id == nil || !id.IsLayer2Ready() {
+		return "[*] Target Identity: waiting for MAC"
+	}
+	parts := []string{"MAC " + id.MAC.String()}
+	if len(id.IP) > 0 {
+		parts = append(parts, "IP "+id.IP.String())
+	}
+	if len(id.Netmask) > 0 {
+		parts = append(parts, "Mask "+id.Netmask.String())
+	}
+	if len(id.Gateway) > 0 {
+		parts = append(parts, "GW "+id.Gateway.String())
+	}
+	return "[+] Target Identity: " + strings.Join(parts, " | ")
+}
+
+func currentMACFromIfconfig(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "ether ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			return fields[1]
+		}
+	}
+	return ""
 }
 
 func (m DashboardModel) renderFooter() string {

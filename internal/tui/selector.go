@@ -135,6 +135,9 @@ func (m SelectorModel) handleConfirm() (SelectorModel, tea.Cmd) {
 	if m.cursorA == m.cursorB {
 		return m, nil
 	}
+	if m.interfaces[m.cursorB].IsUp {
+		return m, nil
+	}
 	return m, func() tea.Msg {
 		return SelectorResult{
 			IfaceA: m.interfaces[m.cursorA],
@@ -172,6 +175,10 @@ func (m SelectorModel) View() string {
 
 	// ── Conflict detection ──────────────────────────────────────
 	sameIface := m.cursorA == m.cursorB
+	switchSideActive := false
+	if m.cursorB >= 0 && m.cursorB < len(m.interfaces) {
+		switchSideActive = m.interfaces[m.cursorB].IsUp
+	}
 
 	// ── Split-screen panels ─────────────────────────────────────
 	panelWidth := (m.width - 5) / 2
@@ -192,6 +199,8 @@ func (m SelectorModel) View() string {
 	footerParts = append(footerParts, keyHint("↑↓", "navigate"))
 	if sameIface {
 		footerParts = append(footerParts, styleError.Render("⚠ Same interface selected on both sides"))
+	} else if switchSideActive {
+		footerParts = append(footerParts, styleError.Render("⚠ Switch Port has carrier; unplug it before start"))
 	} else {
 		footerParts = append(footerParts, keyHint("Enter", "create bridge"))
 	}
@@ -211,7 +220,6 @@ func (m SelectorModel) renderPanel(side activeSide, width int, conflict bool) st
 	if side == sideB {
 		cursor = m.cursorB
 	}
-
 
 	// Determine the highlight color for this panel.
 	var highlightColor lipgloss.Color
@@ -349,6 +357,16 @@ func (m SelectorModel) renderPanel(side activeSide, width int, conflict bool) st
 		sb.WriteString("  " + styleLabel.Render(detailLabel) + "\n\n")
 
 		col1 := 16
+
+		if sel.NetworkService != "" {
+			serviceState := "enabled"
+			if !sel.ServiceEnabled {
+				serviceState = "disabled"
+			}
+			sb.WriteString(fmt.Sprintf("  %-*s %s\n", col1, styleKeyDesc.Render("Service:"), styleVal.Render(sel.NetworkService+" ("+serviceState+")")))
+		} else {
+			sb.WriteString(fmt.Sprintf("  %-*s %s\n", col1, styleKeyDesc.Render("Service:"), styleWarning.Render("unmapped")))
+		}
 
 		// IP info.
 		if detail.IPv4 != "" {

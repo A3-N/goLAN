@@ -39,7 +39,7 @@ Example of the current layout of the Ethernet Cables and Adapters.
 
 ### goLAN use
 ![alt text](img/G2.png)
-After choosing the correct adapters, the goLAN should start bridging the two networks. Where it will attempt to capture ARP packets to emulate the Target Device.
+After choosing the correct adapters, goLAN starts in passive Layer 2 discovery mode. The Switch Port must have no physical carrier when starting; if it is already linked, goLAN refuses to continue. It keeps the switch-side adapter down, listens on the device-side adapter, and learns the target MAC from printer-originated evidence. It does not request DHCP, assign an IP address, or require an IP/gateway to continue. Once the bridge is active, EAPOL/LLDP/CDP control frames are relayed explicitly so NAC control traffic is not dependent on macOS bridge behavior.
 
 ### New RJ45 Layout
 ![alt text](img/H2.jpeg)
@@ -47,9 +47,9 @@ After goLAN has completed the steps, its then safe to connect the other Ethernet
 
 ### New goLAN UI
 ![alt text](img/G3.png)
-Should some info be missing, like getting link local address, the script will wait for the DHCP to assign the IP address, should this not be retrievable from the Target Device beforehand. 
+Static-IP targets are supported. IP, gateway, subnet, and DHCP data are displayed only if they are observed passively in target traffic; they are not required for bridge activation.
 
 ### Router Stats
-The router should see the goLAN/macOS as the Target Device, and subsequent network traffic, TCP/UDP will be forwarded onto the bridge from goLAN, spoofing the Target Device.
+The router should see traffic sourced from the target device over the transparent Layer 2 bridge. TCP/UDP forwarding is not performed by macOS routing or NAT; Ethernet frames traverse the bridge directly.
 ![alt text](img/R2.png)
 ![alt text](img/R3.png)

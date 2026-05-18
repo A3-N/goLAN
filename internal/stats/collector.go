@@ -3,7 +3,6 @@ package stats
 import (
 	"context"
 	"fmt"
-	"math"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -13,21 +12,21 @@ import (
 
 // InterfaceStats holds traffic counters for a single interface.
 type InterfaceStats struct {
-	Name       string
-	RxBytes    uint64
-	TxBytes    uint64
-	RxPackets  uint64
-	TxPackets  uint64
-	RxErrors   uint64
-	TxErrors   uint64
-	RxDropped  uint64
-	TxDropped  uint64
+	Name        string
+	RxBytes     uint64
+	TxBytes     uint64
+	RxPackets   uint64
+	TxPackets   uint64
+	RxErrors    uint64
+	TxErrors    uint64
+	RxDropped   uint64
+	TxDropped   uint64
 	MediaActive bool
 }
 
 // InterfaceDelta holds computed deltas and throughput for a single interface.
 type InterfaceDelta struct {
-	Stats        InterfaceStats
+	Stats         InterfaceStats
 	RxBytesPerSec float64
 	TxBytesPerSec float64
 	RxPktPerSec   float64
@@ -133,21 +132,15 @@ func (c *Collector) poll() StatsUpdate {
 	if c.prevA != nil && c.prevB != nil {
 		elapsed := now.Sub(c.prevTime).Seconds()
 		if elapsed > 0 {
-			deltaA.RxBytesPerSec = float64(statsA.RxBytes-c.prevA.RxBytes) / elapsed
-			deltaA.TxBytesPerSec = float64(statsA.TxBytes-c.prevA.TxBytes) / elapsed
-			deltaA.RxPktPerSec = float64(statsA.RxPackets-c.prevA.RxPackets) / elapsed
-			deltaA.TxPktPerSec = float64(statsA.TxPackets-c.prevA.TxPackets) / elapsed
+			deltaA.RxBytesPerSec = float64(counterDelta(statsA.RxBytes, c.prevA.RxBytes)) / elapsed
+			deltaA.TxBytesPerSec = float64(counterDelta(statsA.TxBytes, c.prevA.TxBytes)) / elapsed
+			deltaA.RxPktPerSec = float64(counterDelta(statsA.RxPackets, c.prevA.RxPackets)) / elapsed
+			deltaA.TxPktPerSec = float64(counterDelta(statsA.TxPackets, c.prevA.TxPackets)) / elapsed
 
-			deltaB.RxBytesPerSec = float64(statsB.RxBytes-c.prevB.RxBytes) / elapsed
-			deltaB.TxBytesPerSec = float64(statsB.TxBytes-c.prevB.TxBytes) / elapsed
-			deltaB.RxPktPerSec = float64(statsB.RxPackets-c.prevB.RxPackets) / elapsed
-			deltaB.TxPktPerSec = float64(statsB.TxPackets-c.prevB.TxPackets) / elapsed
-
-			// Clamp negative deltas (counter rollover protection).
-			deltaA.RxBytesPerSec = math.Max(0, deltaA.RxBytesPerSec)
-			deltaA.TxBytesPerSec = math.Max(0, deltaA.TxBytesPerSec)
-			deltaB.RxBytesPerSec = math.Max(0, deltaB.RxBytesPerSec)
-			deltaB.TxBytesPerSec = math.Max(0, deltaB.TxBytesPerSec)
+			deltaB.RxBytesPerSec = float64(counterDelta(statsB.RxBytes, c.prevB.RxBytes)) / elapsed
+			deltaB.TxBytesPerSec = float64(counterDelta(statsB.TxBytes, c.prevB.TxBytes)) / elapsed
+			deltaB.RxPktPerSec = float64(counterDelta(statsB.RxPackets, c.prevB.RxPackets)) / elapsed
+			deltaB.TxPktPerSec = float64(counterDelta(statsB.TxPackets, c.prevB.TxPackets)) / elapsed
 
 			// Append to history.
 			c.appendHistory(c.ifaceA+"_rx", deltaA.RxBytesPerSec)
@@ -323,4 +316,11 @@ func HumanizeDuration(d time.Duration) string {
 func parseUint(s string) uint64 {
 	v, _ := strconv.ParseUint(s, 10, 64)
 	return v
+}
+
+func counterDelta(current, previous uint64) uint64 {
+	if current < previous {
+		return 0
+	}
+	return current - previous
 }

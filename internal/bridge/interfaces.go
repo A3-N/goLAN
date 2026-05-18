@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 )
 
@@ -46,18 +47,20 @@ func (t InterfaceType) ShortType() string {
 
 // NetInterface holds all relevant metadata for a network interface.
 type NetInterface struct {
-	Name         string
-	HardwarePort string        // Human-readable name from networksetup, e.g. "USB 10/100/1000 LAN"
-	Type         InterfaceType
-	HardwareAddr net.HardwareAddr
-	CurrentMAC   string // May differ from permanent if spoofed
-	PermanentMAC string // Factory MAC from networksetup
-	IsUp         bool
-	IsUSB        bool
-	IsSpoofed    bool
-	MTU          int
-	Addrs        []string
-	Flags        net.Flags
+	Name           string
+	HardwarePort   string // Human-readable name from networksetup, e.g. "USB 10/100/1000 LAN"
+	NetworkService string // User-visible network service name from networksetup -listnetworkserviceorder
+	ServiceEnabled bool
+	Type           InterfaceType
+	HardwareAddr   net.HardwareAddr
+	CurrentMAC     string // May differ from permanent if spoofed
+	PermanentMAC   string // Factory MAC from networksetup
+	IsUp           bool
+	IsUSB          bool
+	IsSpoofed      bool
+	MTU            int
+	Addrs          []string
+	Flags          net.Flags
 }
 
 // InterfaceDetail holds live metadata for a network interface's detail panel.
@@ -93,9 +96,19 @@ func DiscoverInterfaces() ([]NetInterface, error) {
 	}
 
 	ifaces := parseHardwarePorts(string(out))
+	serviceByDevice := mapNetworkServicesByDevice()
+	serviceEnabled := mapNetworkServiceEnabledState()
 
 	// Enrich each interface.
 	for i := range ifaces {
+		if svc, ok := serviceByDevice[ifaces[i].Name]; ok {
+			ifaces[i].NetworkService = svc
+			if enabled, ok := serviceEnabled[svc]; ok {
+				ifaces[i].ServiceEnabled = enabled
+			} else {
+				ifaces[i].ServiceEnabled = true
+			}
+		}
 		ifaces[i].CurrentMAC = getCurrentMAC(ifaces[i].Name)
 		// Permanent MAC is now parsed directly from networksetup -listallhardwareports
 		ifaces[i].IsUp = isInterfaceUp(ifaces[i].Name)
@@ -126,37 +139,6 @@ func DiscoverInterfaces() ([]NetInterface, error) {
 	}
 
 	return ifaces, nil
-}
-
-// LockdownInterface forcefully isolates a physical network adapter.
-// It tears down its IPv4 routing, disables IPv6 autoconfiguration, and holds it DOWN
-// to guarantee 0 packets leak to the network before goLAN takes over.
-func LockdownInterface(ifName, hardwarePort string) error {
-	var errs []string
-
-	// 1. Administratively cut power
-	if out, err := exec.Command("ifconfig", ifName, "down").CombinedOutput(); err != nil {
-		errs = append(errs, fmt.Sprintf("down failed: %v (%s)", err, strings.TrimSpace(string(out))))
-	}
-
-	// 2. Strip IPv4 leases natively
-	if out, err := exec.Command("ifconfig", ifName, "0.0.0.0").CombinedOutput(); err != nil {
-		// Ignore metric errors if the interface didn't have an IP anyway
-		if !strings.Contains(string(out), "invalid") && !strings.Contains(string(out), "file exists") {
-			errs = append(errs, fmt.Sprintf("ipv4 strip failed: %v (%s)", err, strings.TrimSpace(string(out))))
-		}
-	}
-
-	// 3. Disable OS tracking explicitly (stops configd from running DHCP or bringing it UP on cable hot-plugs)
-	if hardwarePort != "" {
-		_ = exec.Command("networksetup", "-setnetworkserviceenabled", hardwarePort, "off").Run()
-		_ = exec.Command("networksetup", "-setv6off", hardwarePort).Run()
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("lockdown non-fatal errors on %s: %s", ifName, strings.Join(errs, " | "))
-	}
-	return nil
 }
 
 // GetInterfaceDetail fetches live metadata for a given interface.
@@ -388,6 +370,69 @@ func parseHardwarePorts(output string) []NetInterface {
 	return ifaces
 }
 
+func mapNetworkServicesByDevice() map[string]string {
+	out, err := exec.Command("networksetup", "-listnetworkserviceorder").CombinedOutput()
+	if err != nil {
+		return nil
+	}
+	return parseNetworkServiceOrder(string(out))
+}
+
+func mapNetworkServiceEnabledState() map[string]bool {
+	out, err := exec.Command("networksetup", "-listallnetworkservices").CombinedOutput()
+	if err != nil {
+		return nil
+	}
+	return parseNetworkServiceEnabled(string(out))
+}
+
+func parseNetworkServiceOrder(output string) map[string]string {
+	result := make(map[string]string)
+	serviceRe := regexp.MustCompile(`^\(\d+\)\s+(.+)$`)
+	deviceRe := regexp.MustCompile(`Device:\s*([^)]+)`)
+	currentService := ""
+
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if m := serviceRe.FindStringSubmatch(line); len(m) == 2 {
+			currentService = strings.TrimPrefix(strings.TrimSpace(m[1]), "*")
+			currentService = strings.TrimSpace(currentService)
+			continue
+		}
+		if currentService == "" || !strings.Contains(line, "Device:") {
+			continue
+		}
+		if m := deviceRe.FindStringSubmatch(line); len(m) == 2 {
+			device := strings.TrimSpace(m[1])
+			result[device] = currentService
+		}
+	}
+
+	return result
+}
+
+func parseNetworkServiceEnabled(output string) map[string]bool {
+	result := make(map[string]bool)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "An asterisk") {
+			continue
+		}
+		enabled := true
+		if strings.HasPrefix(line, "*") {
+			enabled = false
+			line = strings.TrimSpace(strings.TrimPrefix(line, "*"))
+		}
+		if line != "" {
+			result[line] = enabled
+		}
+	}
+	return result
+}
+
 // classifyType maps a hardware port name to a normalized InterfaceType.
 func classifyType(hardwarePort string) InterfaceType {
 	hp := strings.ToLower(hardwarePort)
@@ -426,8 +471,6 @@ func getCurrentMAC(device string) string {
 	}
 	return ""
 }
-
-
 
 // isInterfaceUp checks ifconfig status flags for active status.
 func isInterfaceUp(device string) bool {
