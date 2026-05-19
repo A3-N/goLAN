@@ -27,6 +27,8 @@ go build -o .
 
 [802.1X Scenario Walkthrough](SCENARIOS.md)
 
+[Layer 2-first NAC Flow](NAC_FLOW.md)
+
 ## License
 
 See [LICENSE](LICENSE) for details.

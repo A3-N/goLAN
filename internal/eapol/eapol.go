@@ -20,7 +20,7 @@ import (
 var PAEGroupAddr = net.HardwareAddr{0x01, 0x80, 0xc2, 0x00, 0x00, 0x03}
 
 // BPFFilter captures all EAPOL frames on a raw interface.
-const BPFFilter = "ether proto 0x888e"
+const BPFFilter = "(ether proto 0x888e) or (vlan and ether proto 0x888e)"
 
 // ─── State Machine ─────────────────────────────────────────────────────────
 
@@ -28,13 +28,13 @@ const BPFFilter = "ether proto 0x888e"
 type State int
 
 const (
-	StateIdle            State = iota // No 802.1X activity detected
-	StateDetecting                    // Listening for EAPOL frames
-	StateRelaying                     // Actively relaying EAPOL between supplicant and authenticator
-	StateAuthenticated                // EAP-Success received, port is open
-	StateFailed                       // EAP-Failure received
-	StateMACsecDetected               // MACsec negotiation detected
-	StateDowngrading                  // Attempting MACsec downgrade
+	StateIdle           State = iota // No 802.1X activity detected
+	StateDetecting                   // Listening for EAPOL frames
+	StateRelaying                    // Actively relaying EAPOL between supplicant and authenticator
+	StateAuthenticated               // EAP-Success received, port is open
+	StateFailed                      // EAP-Failure received
+	StateMACsecDetected              // MACsec negotiation detected
+	StateDowngrading                 // Attempting MACsec downgrade
 )
 
 func (s State) String() string {
@@ -64,14 +64,14 @@ func (s State) String() string {
 type EAPMethod string
 
 const (
-	MethodUnknown EAPMethod = "Unknown"
+	MethodUnknown  EAPMethod = "Unknown"
 	MethodIdentity EAPMethod = "Identity"
-	MethodMD5     EAPMethod = "EAP-MD5"
-	MethodTLS     EAPMethod = "EAP-TLS"
-	MethodPEAP    EAPMethod = "PEAP"
-	MethodTTLS    EAPMethod = "EAP-TTLS"
-	MethodFAST    EAPMethod = "EAP-FAST"
-	MethodLEAP    EAPMethod = "LEAP"
+	MethodMD5      EAPMethod = "EAP-MD5"
+	MethodTLS      EAPMethod = "EAP-TLS"
+	MethodPEAP     EAPMethod = "PEAP"
+	MethodTTLS     EAPMethod = "EAP-TTLS"
+	MethodFAST     EAPMethod = "EAP-FAST"
+	MethodLEAP     EAPMethod = "LEAP"
 	MethodMSCHAPv2 EAPMethod = "MSCHAPv2"
 )
 
@@ -109,18 +109,19 @@ type AuthSession struct {
 	State            State
 	SupplicantMAC    net.HardwareAddr // MAC of the real device (supplicant)
 	AuthenticatorMAC net.HardwareAddr // MAC of the switch (authenticator)
+	VLANID           uint16           // Optional VLAN context for tagged EAPOL
 	Method           EAPMethod        // Detected EAP method
 	MACsecDetected   bool             // Whether MACsec key negotiation was seen
 
 	// Counters
-	FramesRelayed  int // Total EAPOL frames forwarded
-	FramesDropped  int // Frames dropped (e.g. MACsec downgrade)
-	ReauthCount    int // Number of re-authentications handled
-	LastEAPID      uint8
-	LastActivity   time.Time
+	FramesRelayed int // Total EAPOL frames forwarded
+	FramesDropped int // Frames dropped (e.g. MACsec downgrade)
+	ReauthCount   int // Number of re-authentications handled
+	LastEAPID     uint8
+	LastActivity  time.Time
 
 	// Timing
-	StartedAt      time.Time
+	StartedAt       time.Time
 	AuthenticatedAt time.Time
 }
 
@@ -191,6 +192,7 @@ func (s *AuthSession) Snapshot() AuthSessionSnapshot {
 		State:            s.State,
 		SupplicantMAC:    s.SupplicantMAC,
 		AuthenticatorMAC: s.AuthenticatorMAC,
+		VLANID:           s.VLANID,
 		Method:           s.Method,
 		MACsecDetected:   s.MACsecDetected,
 		FramesRelayed:    s.FramesRelayed,
@@ -206,6 +208,7 @@ type AuthSessionSnapshot struct {
 	State            State
 	SupplicantMAC    net.HardwareAddr
 	AuthenticatorMAC net.HardwareAddr
+	VLANID           uint16
 	Method           EAPMethod
 	MACsecDetected   bool
 	FramesRelayed    int
@@ -251,6 +254,12 @@ func (r AuthResult) String() string {
 //	EAPOL Type: 1 (Start)
 //	EAPOL Length: 0
 func InjectEAPOLStart(iface string, supplicantMAC net.HardwareAddr, logFunc func(string)) error {
+	return InjectEAPOLStartWithVLAN(iface, supplicantMAC, 0, logFunc)
+}
+
+// InjectEAPOLStartWithVLAN crafts and injects an EAPOL-Start frame. If vlanID
+// is non-zero, the Ethernet frame includes an 802.1Q tag.
+func InjectEAPOLStartWithVLAN(iface string, supplicantMAC net.HardwareAddr, vlanID uint16, logFunc func(string)) error {
 	if logFunc == nil {
 		logFunc = func(string) {}
 	}
@@ -261,30 +270,40 @@ func InjectEAPOLStart(iface string, supplicantMAC net.HardwareAddr, logFunc func
 	}
 	defer handle.Close()
 
-	// Build the raw Ethernet + EAPOL-Start frame.
-	// Ethernet header: 14 bytes (dst[6] + src[6] + type[2])
-	// EAPOL header: 4 bytes (version[1] + type[1] + length[2])
-	frame := make([]byte, 18)
+	frameLen := 18
+	if vlanID != 0 {
+		frameLen = 22
+	}
+	frame := make([]byte, frameLen)
 
-	// Destination: PAE group multicast address
 	copy(frame[0:6], PAEGroupAddr)
-	// Source: supplicant MAC
 	copy(frame[6:12], supplicantMAC)
-	// EtherType: 0x888E (EAPOL)
-	frame[12] = 0x88
-	frame[13] = 0x8E
-	// EAPOL Version: 2
-	frame[14] = 0x02
-	// EAPOL Type: 1 (Start)
-	frame[15] = 0x01
-	// EAPOL Length: 0 (no body)
-	frame[16] = 0x00
-	frame[17] = 0x00
+
+	offset := 12
+	if vlanID != 0 {
+		frame[12] = 0x81
+		frame[13] = 0x00
+		tci := vlanID & 0x0fff
+		frame[14] = byte(tci >> 8)
+		frame[15] = byte(tci)
+		offset = 16
+	}
+
+	frame[offset] = 0x88
+	frame[offset+1] = 0x8E
+	frame[offset+2] = 0x02
+	frame[offset+3] = 0x01
+	frame[offset+4] = 0x00
+	frame[offset+5] = 0x00
 
 	if err := handle.WritePacketData(frame); err != nil {
 		return fmt.Errorf("injecting EAPOL-Start on %s: %w", iface, err)
 	}
 
-	logFunc(fmt.Sprintf("[*][802.1X] Injected EAPOL-Start on %s (src: %s)", iface, supplicantMAC))
+	if vlanID != 0 {
+		logFunc(fmt.Sprintf("[*][802.1X] Injected VLAN %d EAPOL-Start on %s (src: %s)", vlanID, iface, supplicantMAC))
+	} else {
+		logFunc(fmt.Sprintf("[*][802.1X] Injected EAPOL-Start on %s (src: %s)", iface, supplicantMAC))
+	}
 	return nil
 }

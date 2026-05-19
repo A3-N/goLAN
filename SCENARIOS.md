@@ -1,6 +1,12 @@
 # 802.1X Scenario Walkthrough
 
-Every possible runtime scenario traced through the goLAN bridge code, verifying correct handling at each decision point.
+> [!NOTE]
+> This file is a scenario catalog. The current canonical runtime flow is tracked in
+> [NAC_FLOW.md](NAC_FLOW.md), which defines the Layer 2-first checks, stops, and go points.
+> Some scenarios below still describe the pre-L2-first probe/relay/NAT sequence and are
+> retained only as historical review notes until they are rewritten.
+
+Historical runtime scenarios traced through earlier goLAN bridge code.
 
 ---
 

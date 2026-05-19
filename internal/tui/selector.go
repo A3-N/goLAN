@@ -212,7 +212,6 @@ func (m SelectorModel) renderPanel(side activeSide, width int, conflict bool) st
 		cursor = m.cursorB
 	}
 
-
 	// Determine the highlight color for this panel.
 	var highlightColor lipgloss.Color
 	if conflict {
@@ -447,8 +446,14 @@ func (m SelectorModel) renderPanel(side activeSide, width int, conflict bool) st
 
 // trunc truncates a string to a given length.
 func trunc(s string, length int) string {
+	if length <= 0 {
+		return ""
+	}
 	runes := []rune(s)
 	if len(runes) > length {
+		if length == 1 {
+			return "…"
+		}
 		return string(runes[:length-1]) + "…"
 	}
 	return s

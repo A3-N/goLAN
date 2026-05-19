@@ -1,11 +1,13 @@
 package bridge
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // InterfaceType represents the kind of network interface.
@@ -47,7 +49,7 @@ func (t InterfaceType) ShortType() string {
 // NetInterface holds all relevant metadata for a network interface.
 type NetInterface struct {
 	Name         string
-	HardwarePort string        // Human-readable name from networksetup, e.g. "USB 10/100/1000 LAN"
+	HardwarePort string // Human-readable name from networksetup, e.g. "USB 10/100/1000 LAN"
 	Type         InterfaceType
 	HardwareAddr net.HardwareAddr
 	CurrentMAC   string // May differ from permanent if spoofed
@@ -82,6 +84,14 @@ type InterfaceDetail struct {
 	Colls       string
 	Dot1XStatus string // "active", "configured", "none"
 	Dot1XMethod string // EAP method if available
+}
+
+// InterfaceRestoreState captures host-side settings goLAN may change during lockdown.
+type InterfaceRestoreState struct {
+	IfName            string
+	HardwarePort      string
+	ServiceStateKnown bool
+	ServiceEnabled    bool
 }
 
 // DiscoverInterfaces returns ALL network interfaces with enriched metadata.
@@ -157,6 +167,58 @@ func LockdownInterface(ifName, hardwarePort string) error {
 		return fmt.Errorf("lockdown non-fatal errors on %s: %s", ifName, strings.Join(errs, " | "))
 	}
 	return nil
+}
+
+// CaptureInterfaceRestoreState snapshots settings that LockdownInterface mutates.
+func CaptureInterfaceRestoreState(ifName, hardwarePort string) InterfaceRestoreState {
+	state := InterfaceRestoreState{
+		IfName:       ifName,
+		HardwarePort: hardwarePort,
+	}
+	if hardwarePort == "" {
+		return state
+	}
+
+	out, err := exec.Command("networksetup", "-getnetworkserviceenabled", hardwarePort).CombinedOutput()
+	if err != nil {
+		return state
+	}
+	value := strings.TrimSpace(strings.ToLower(string(out)))
+	if value == "enabled" || value == "disabled" {
+		state.ServiceStateKnown = true
+		state.ServiceEnabled = value == "enabled"
+	}
+	return state
+}
+
+// RestoreInterfaceState restores host-side settings captured before lockdown.
+func RestoreInterfaceState(state InterfaceRestoreState) error {
+	var errs []string
+	if state.ServiceStateKnown && state.HardwarePort != "" {
+		desired := "off"
+		if state.ServiceEnabled {
+			desired = "on"
+		}
+		out, err := runInterfaceCommand(5*time.Second, "networksetup", "-setnetworkserviceenabled", state.HardwarePort, desired)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("service restore failed: %v (%s)", err, strings.TrimSpace(string(out))))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("restore errors on %s: %s", state.IfName, strings.Join(errs, " | "))
+	}
+	return nil
+}
+
+func runInterfaceCommand(timeout time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return string(out), fmt.Errorf("%s %s timed out after %s", name, strings.Join(args, " "), timeout)
+	}
+	return string(out), err
 }
 
 // GetInterfaceDetail fetches live metadata for a given interface.
@@ -426,8 +488,6 @@ func getCurrentMAC(device string) string {
 	}
 	return ""
 }
-
-
 
 // isInterfaceUp checks ifconfig status flags for active status.
 func isInterfaceUp(device string) bool {

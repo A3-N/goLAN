@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"time"
+
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -8,7 +10,7 @@ import (
 type viewState int
 
 const (
-	viewSelector  viewState = iota
+	viewSelector viewState = iota
 	viewDashboard
 )
 
@@ -37,6 +39,24 @@ func (m Model) Init() tea.Cmd {
 type teardownDoneMsg struct{}
 type returnToSelectorMsg struct{}
 
+const dashboardShutdownTimeout = 20 * time.Second
+
+func dashboardShutdownCmd(dashboard DashboardModel, next tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		done := make(chan struct{})
+		go func() {
+			_ = dashboard.Shutdown()
+			close(done)
+		}()
+		select {
+		case <-done:
+			return next
+		case <-time.After(dashboardShutdownTimeout):
+			return next
+		}
+	}
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case teardownDoneMsg:
@@ -58,10 +78,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.quitting = true
 			if m.view == viewDashboard {
-				return m, func() tea.Msg {
-					_ = m.dashboard.Shutdown()
-					return teardownDoneMsg{}
-				}
+				return m, dashboardShutdownCmd(m.dashboard, teardownDoneMsg{})
 			}
 			return m, tea.Quit
 		case "esc":
@@ -75,10 +92,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.view == viewDashboard {
 				// Esc on dashboard = tear down bridge asynchronously, then go back to selector.
 				m.quitting = true // Show "shutting down" while teardown runs
-				return m, func() tea.Msg {
-					_ = m.dashboard.Shutdown()
-					return returnToSelectorMsg{}
-				}
+				return m, dashboardShutdownCmd(m.dashboard, returnToSelectorMsg{})
 			}
 		}
 
