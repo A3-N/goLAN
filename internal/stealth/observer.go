@@ -304,8 +304,8 @@ func (nm *NetworkMap) Snapshot() NetworkMapSnapshot {
 		})
 	}
 	sort.Slice(hosts, func(i, j int) bool { return hosts[i].PktCount > hosts[j].PktCount })
-	if len(hosts) > 8 {
-		hosts = hosts[:8]
+	if len(hosts) > 64 {
+		hosts = hosts[:64]
 	}
 
 	conversations := make([]ConversationSummary, 0, len(nm.Conversations))
@@ -330,8 +330,8 @@ func (nm *NetworkMap) Snapshot() NetworkMapSnapshot {
 		}
 		return conversations[i].LastSeen.After(conversations[j].LastSeen)
 	})
-	if len(conversations) > 12 {
-		conversations = conversations[:12]
+	if len(conversations) > 80 {
+		conversations = conversations[:80]
 	}
 
 	credentialExposures := make([]CredentialExposureSummary, 0, len(nm.CredentialFindings))
@@ -359,8 +359,8 @@ func (nm *NetworkMap) Snapshot() NetworkMapSnapshot {
 		dnsLog[i] = query
 		dnsLog[i].Response = append([]string(nil), query.Response...)
 	}
-	if len(dnsLog) > 8 {
-		dnsLog = dnsLog[len(dnsLog)-8:]
+	if len(dnsLog) > 64 {
+		dnsLog = dnsLog[len(dnsLog)-64:]
 	}
 
 	events := make([]NACEvent, len(nm.RecentEvents))
@@ -372,8 +372,8 @@ func (nm *NetworkMap) Snapshot() NetworkMapSnapshot {
 		events[i].SrcIP = copyIP(event.SrcIP)
 		events[i].DstIP = copyIP(event.DstIP)
 	}
-	if len(events) > 10 {
-		events = events[len(events)-10:]
+	if len(events) > 64 {
+		events = events[len(events)-64:]
 	}
 
 	gateway := nm.Gateway

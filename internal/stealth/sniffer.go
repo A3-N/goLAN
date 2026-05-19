@@ -16,6 +16,7 @@ type TargetIdentity struct {
 	MAC              net.HardwareAddr
 	IP               net.IP
 	Netmask          net.IPMask
+	NetmaskObserved  bool
 	Gateway          net.IP
 	EAPOLDetected    bool             // 802.1X frames seen on the wire
 	AuthenticatorMAC net.HardwareAddr // Switch-side MAC sending EAPOL
@@ -260,6 +261,7 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 								for _, opt := range dhcp.Options {
 									if opt.Type == layers.DHCPOptSubnetMask {
 										id.Netmask = net.IPMask(opt.Data)
+										id.NetmaskObserved = true
 										eventLog(fmt.Sprintf("[+] DHCP ACK revealed Subnet Mask: %s", id.Netmask.String()))
 									} else if opt.Type == layers.DHCPOptRouter {
 										if len(opt.Data) >= 4 {
@@ -435,6 +437,7 @@ func (s *Sniffer) ObserveIdentity(ctx context.Context, targetMAC net.HardwareAdd
 								case layers.DHCPOptSubnetMask:
 									if len(opt.Data) == 4 && string(id.Netmask) != string(net.IPMask(opt.Data)) {
 										id.Netmask = net.IPMask(copyIP(net.IP(opt.Data)))
+										id.NetmaskObserved = true
 										changed = true
 									}
 								case layers.DHCPOptRouter:

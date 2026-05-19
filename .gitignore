@@ -29,6 +29,31 @@ go.work.sum
 
 # env file
 .env
+.env.*
+!.env.example
+
+# Runtime sessions, captures, and local telemetry
+.golan-session.json
+.config/goLAN/
+goLAN-sessions/
+sessions/
+pcaps/
+captures/
+logs/
+*.pcap
+*.pcapng
+*.cap
+*.log
+*.log.*
+*.jsonl
+*.ndjson
+
+# Local secrets and lab credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*.kdbx
 
 # Editor/IDE
 # .idea/

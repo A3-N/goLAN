@@ -28,14 +28,30 @@ type Model struct {
 
 	shutdownFrame  int
 	shutdownPhrase int
+	session        *SessionStore
 }
 
 // NewModel creates the root application model.
-func NewModel() Model {
+func NewModel(sessionPath string) Model {
 	return Model{
 		view:     viewSelector,
 		selector: NewSelectorModel(),
+		session:  NewSessionStore(sessionPath),
 	}
+}
+
+func (m Model) SessionID() string {
+	if m.session == nil {
+		return ""
+	}
+	return m.session.SessionID()
+}
+
+func (m Model) SessionPath() string {
+	if m.session == nil {
+		return ""
+	}
+	return m.session.SessionPath()
 }
 
 func (m Model) Init() tea.Cmd {
@@ -162,7 +178,7 @@ func (m Model) updateSelector(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Check if selector produced a result — transition to dashboard.
 	if result, ok := msg.(SelectorResult); ok {
 		m.view = viewDashboard
-		m.dashboard = NewDashboardModel(result.IfaceA, result.IfaceB)
+		m.dashboard = NewDashboardModel(result.IfaceA, result.IfaceB, m.session)
 		// Seed the dashboard with the current window size so it doesn't render blank.
 		m.dashboard.width = m.width
 		m.dashboard.height = m.height

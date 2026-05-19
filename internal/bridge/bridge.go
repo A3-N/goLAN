@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os/exec"
@@ -89,6 +90,9 @@ type Bridge struct {
 
 	// NAT proxy state
 	natHiddenIP       string // The orthogonal IP assigned to bridge0 for NAT (empty = no NAT)
+	natHiddenNetmask  string // Netmask used for the NAT anchor IP.
+	natAnchorMode     string // same-subnet or orthogonal fallback.
+	natAnchorEvidence string // Why the current NAT anchor was selected.
 	natRouteNetwork   string // Target network route installed for NAT mode
 	natRouteNetmask   string // Target network netmask installed for NAT mode
 	natRouteInstalled bool
@@ -105,6 +109,8 @@ type Bridge struct {
 	cancelListen   context.CancelFunc
 	observerIfaces map[string]bool
 	captureIfaces  map[string]bool
+	capturePaths   []string
+	captureDir     string
 }
 
 // BridgeStatus is a snapshot of the bridge state for the TUI.
@@ -123,11 +129,21 @@ type BridgeStatus struct {
 	EAPMethod          string
 	EAPOLFramesRelayed int
 	MACsecDetected     bool
+	CaptureFiles       []string
+
+	// NAT/operator access fields
+	NATActive         bool
+	NATHiddenIP       string
+	NATHiddenNetmask  string
+	NATAnchorMode     string
+	NATAnchorEvidence string
+	NATRouteNetwork   string
+	NATRouteNetmask   string
 }
 
 // NewBridge creates a macOS kernel bridge between two interfaces.
 // This requires root privileges.
-func NewBridge(ifaceA, ifaceB string, ignoreMAC string, localMACStrs ...string) (*Bridge, error) {
+func NewBridge(ifaceA, ifaceB string, ignoreMAC string, captureDir string, localMACStrs ...string) (*Bridge, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Bridge{
 		ifaceA:          ifaceA,
@@ -139,6 +155,7 @@ func NewBridge(ifaceA, ifaceB string, ignoreMAC string, localMACStrs ...string) 
 		cancelCtx:       cancel,
 		observerIfaces:  make(map[string]bool),
 		captureIfaces:   make(map[string]bool),
+		captureDir:      captureDir,
 	}
 
 	localMACStrs = append(localMACStrs, ignoreMAC, getCurrentMAC(ifaceA), getCurrentMAC(ifaceB))
@@ -367,7 +384,11 @@ func (b *Bridge) observeIdentityUpdates(ctx context.Context, ignoreMAC string, l
 		}
 		if len(update.Netmask) > 0 && string(update.Netmask) != string(b.targetID.Netmask) {
 			b.targetID.Netmask = append(net.IPMask(nil), update.Netmask...)
+			b.targetID.NetmaskObserved = update.NetmaskObserved
 			logs = append(logs, "[+][RECON] Target netmask observed: "+net.IP(b.targetID.Netmask).String())
+		}
+		if update.NetmaskObserved && !b.targetID.NetmaskObserved {
+			b.targetID.NetmaskObserved = true
 		}
 		if len(update.Gateway) > 0 && !update.Gateway.Equal(b.targetID.Gateway) {
 			b.targetID.Gateway = append(net.IP(nil), update.Gateway...)
@@ -491,13 +512,14 @@ func (b *Bridge) startPacketCaptures(ctx context.Context, logFunc func(string), 
 	b.mu.Unlock()
 
 	for _, iface := range start {
-		path, err := stealth.StartPacketCapture(ctx, iface, stealth.CaptureOptions{}, logFunc)
+		path, err := stealth.StartPacketCapture(ctx, iface, stealth.CaptureOptions{Dir: b.captureDir}, logFunc)
 		if err != nil {
 			logFunc(fmt.Sprintf("[W][PCAP] Capture unavailable on %s: %v", iface, err))
 			continue
 		}
 		b.mu.Lock()
 		b.captureIfaces[iface] = true
+		b.capturePaths = append(b.capturePaths, path)
 		b.mu.Unlock()
 		logFunc(fmt.Sprintf("[+][PCAP] Passive capture active on %s: %s", iface, path))
 	}
@@ -536,6 +558,7 @@ func (b *Bridge) mergeTargetIdentityLocked(id *stealth.TargetIdentity) {
 		}
 		if len(id.Netmask) > 0 {
 			b.targetID.Netmask = append(net.IPMask(nil), id.Netmask...)
+			b.targetID.NetmaskObserved = id.NetmaskObserved
 		}
 		if len(id.Gateway) > 0 {
 			b.targetID.Gateway = append(net.IP(nil), id.Gateway...)
@@ -668,6 +691,9 @@ func (b *Bridge) DisableNATProxy(logFunc func(string)) error {
 	b.mu.Lock()
 	b.isNATActive = false
 	b.natHiddenIP = ""
+	b.natHiddenNetmask = ""
+	b.natAnchorMode = ""
+	b.natAnchorEvidence = ""
 	b.natRouteNetwork = ""
 	b.natRouteNetmask = ""
 	b.natRouteInstalled = false
@@ -1035,25 +1061,23 @@ func (b *Bridge) setupNATProxy(id *stealth.TargetIdentity, logFunc func(string))
 		return
 	}
 
-	// Generate an orthogonal hidden IP to anchor the NAT proxy without colliding
-	// with the host OS routing table for the Target's assigned DHCP subnet.
-	targetStr := id.IP.String()
-	hiddenIP := "192.168.254.10" // Default anchor
-	if strings.HasPrefix(targetStr, "192.168.") {
-		hiddenIP = "10.254.254.10"
-	} else if strings.HasPrefix(targetStr, "10.") {
-		hiddenIP = "172.16.254.10"
-	} else if isRFC1918_172(targetStr) {
-		hiddenIP = "192.168.254.10"
+	anchor, err := chooseNATAnchor(id)
+	if err != nil {
+		logFunc(fmt.Sprintf("[!] Cannot setup NAT: %v", err))
+		return
 	}
 
-	logFunc(fmt.Sprintf("[*] Anchoring orthogonal Stealth Proxy IP: %s", hiddenIP))
-	runCmd("ifconfig", b.name, hiddenIP, "netmask", "255.255.255.0", "up")
+	if anchor.SameSubnet {
+		logFunc(fmt.Sprintf("[*] Anchoring operator IP on learned subnet: %s/%s (%s)", anchor.IP, anchor.Netmask, anchor.Evidence))
+	} else {
+		logFunc(fmt.Sprintf("[*] Anchoring orthogonal Stealth Proxy IP: %s/%s (%s)", anchor.IP, anchor.Netmask, anchor.Evidence))
+	}
+	runCmd("ifconfig", b.name, anchor.IP, "netmask", anchor.Netmask, "up")
 
 	if out, err := runCmd("sysctl", "-w", "net.inet.ip.forwarding=1"); err != nil {
 		logFunc(fmt.Sprintf("[!] IPv4 forwarding sysctl failed; NAT may not route correctly: %v (%s)", err, strings.TrimSpace(out)))
-		if _, delErr := runCmd("ifconfig", b.name, "delete", hiddenIP); delErr != nil {
-			logFunc(fmt.Sprintf("[!] Failed to remove failed NAT anchor IP %s: %v", hiddenIP, delErr))
+		if _, delErr := runCmd("ifconfig", b.name, "delete", anchor.IP); delErr != nil {
+			logFunc(fmt.Sprintf("[!] Failed to remove failed NAT anchor IP %s: %v", anchor.IP, delErr))
 		}
 		return
 	}
@@ -1061,18 +1085,21 @@ func (b *Bridge) setupNATProxy(id *stealth.TargetIdentity, logFunc func(string))
 	logFunc("[*] Activating Stealth NAT proxy on bridge...")
 	rule := stealth.PFRule{
 		Interface: b.name,
-		HiddenIP:  hiddenIP,
+		HiddenIP:  anchor.IP,
 		TargetIP:  id.IP.String(),
 	}
-	err := stealth.EnableNAT(rule)
+	err = stealth.EnableNAT(rule)
 	if err != nil {
 		logFunc(fmt.Sprintf("[!] ERROR injecting NAT: %v", err))
-		if _, delErr := runCmd("ifconfig", b.name, "delete", hiddenIP); delErr != nil {
-			logFunc(fmt.Sprintf("[!] Failed to remove failed NAT anchor IP %s: %v", hiddenIP, delErr))
+		if _, delErr := runCmd("ifconfig", b.name, "delete", anchor.IP); delErr != nil {
+			logFunc(fmt.Sprintf("[!] Failed to remove failed NAT anchor IP %s: %v", anchor.IP, delErr))
 		}
 		b.restoreIPv4Forwarding(logFunc)
 		b.mu.Lock()
 		b.natHiddenIP = ""
+		b.natHiddenNetmask = ""
+		b.natAnchorMode = ""
+		b.natAnchorEvidence = ""
 		b.isNATActive = false
 		b.mu.Unlock()
 		return
@@ -1087,7 +1114,10 @@ func (b *Bridge) setupNATProxy(id *stealth.TargetIdentity, logFunc func(string))
 	}
 
 	b.mu.Lock()
-	b.natHiddenIP = hiddenIP
+	b.natHiddenIP = anchor.IP
+	b.natHiddenNetmask = anchor.Netmask
+	b.natAnchorMode = anchor.Mode
+	b.natAnchorEvidence = anchor.Evidence
 	b.isNATActive = true
 	b.mu.Unlock()
 
@@ -1178,13 +1208,21 @@ func (b *Bridge) Status() BridgeStatus {
 	name := b.name
 	session := b.eapolSession
 	status := BridgeStatus{
-		Name:             name,
-		IfaceA:           b.ifaceA,
-		IfaceB:           b.ifaceB,
-		State:            b.state,
-		TargetID:         cloneTargetIdentity(b.targetID),
-		ReconLogs:        append([]string(nil), b.reconLogs...), // copy so UI slice is safe
-		EAPOLPassthrough: b.eapolPassthrough,
+		Name:              name,
+		IfaceA:            b.ifaceA,
+		IfaceB:            b.ifaceB,
+		State:             b.state,
+		TargetID:          cloneTargetIdentity(b.targetID),
+		ReconLogs:         append([]string(nil), b.reconLogs...), // copy so UI slice is safe
+		EAPOLPassthrough:  b.eapolPassthrough,
+		CaptureFiles:      append([]string(nil), b.capturePaths...),
+		NATActive:         b.isNATActive,
+		NATHiddenIP:       b.natHiddenIP,
+		NATHiddenNetmask:  b.natHiddenNetmask,
+		NATAnchorMode:     b.natAnchorMode,
+		NATAnchorEvidence: b.natAnchorEvidence,
+		NATRouteNetwork:   b.natRouteNetwork,
+		NATRouteNetmask:   b.natRouteNetmask,
 	}
 	b.mu.Unlock()
 
@@ -1324,6 +1362,181 @@ func isRFC1918_172(ipStr string) bool {
 	}
 	_, cidr, _ := net.ParseCIDR("172.16.0.0/12")
 	return cidr != nil && cidr.Contains(ip)
+}
+
+type natAnchorChoice struct {
+	IP       string
+	Netmask  string
+	Mode     string
+	Evidence string
+
+	SameSubnet bool
+}
+
+func chooseNATAnchor(id *stealth.TargetIdentity) (natAnchorChoice, error) {
+	if id == nil || id.IP.To4() == nil {
+		return natAnchorChoice{}, fmt.Errorf("target IPv4 is unknown")
+	}
+
+	targetIP := id.IP.To4()
+	mask, maskEvidence := observedNATMask(id)
+	if len(mask) == net.IPv4len {
+		if candidate := selectSameSubnetAnchor(targetIP, mask, observedNATAvoidList(id)); candidate != nil {
+			return natAnchorChoice{
+				IP:         candidate.String(),
+				Netmask:    net.IP(mask).String(),
+				Mode:       "same-subnet",
+				Evidence:   fmt.Sprintf("%s %s/%s", maskEvidence, targetIP.Mask(mask), net.IP(mask)),
+				SameSubnet: true,
+			}, nil
+		}
+	}
+
+	hiddenIP := orthogonalNATAnchor(targetIP)
+	evidence := "no observed subnet mask; using off-subnet anchor"
+	if len(mask) == net.IPv4len {
+		evidence = "observed subnet had no free passive candidate; using off-subnet anchor"
+	}
+	return natAnchorChoice{
+		IP:       hiddenIP,
+		Netmask:  "255.255.255.0",
+		Mode:     "orthogonal",
+		Evidence: evidence,
+	}, nil
+}
+
+func observedNATMask(id *stealth.TargetIdentity) (net.IPMask, string) {
+	if id == nil {
+		return nil, ""
+	}
+	if id.NetmaskObserved {
+		if mask := normalizeIPv4Mask(id.Netmask, nil); len(mask) == net.IPv4len {
+			return mask, "target DHCP mask"
+		}
+	}
+	if id.NetworkMap != nil {
+		snap := id.NetworkMap.Snapshot()
+		if mask := normalizeIPv4Mask(snap.DHCP.Netmask, nil); len(mask) == net.IPv4len {
+			return mask, "observed DHCP mask"
+		}
+	}
+	return nil, ""
+}
+
+func orthogonalNATAnchor(targetIP net.IP) string {
+	targetStr := targetIP.String()
+	switch {
+	case strings.HasPrefix(targetStr, "192.168."):
+		return "10.254.254.10"
+	case strings.HasPrefix(targetStr, "10."):
+		return "172.16.254.10"
+	case isRFC1918_172(targetStr):
+		return "192.168.254.10"
+	default:
+		return "192.168.254.10"
+	}
+}
+
+func observedNATAvoidList(id *stealth.TargetIdentity) map[uint32]bool {
+	avoid := make(map[uint32]bool)
+	add := func(ip net.IP) {
+		ip4 := ip.To4()
+		if ip4 == nil {
+			return
+		}
+		avoid[binary.BigEndian.Uint32(ip4)] = true
+	}
+
+	add(id.IP)
+	add(id.Gateway)
+
+	if id.NetworkMap == nil {
+		return avoid
+	}
+
+	snap := id.NetworkMap.Snapshot()
+	add(snap.Gateway.IP)
+	add(snap.DHCP.OfferedIP)
+	add(snap.DHCP.ACKIP)
+	add(snap.DHCP.ServerIP)
+	add(snap.DHCP.RouterIP)
+	add(snap.RADIUS.ClientIP)
+	add(snap.RADIUS.ServerIP)
+	add(snap.RADIUS.NASIPAddress)
+	for _, host := range snap.Hosts {
+		for _, ip := range host.IPs {
+			add(ip)
+		}
+	}
+	for _, conv := range snap.Conversations {
+		add(conv.SrcIP)
+		add(conv.DstIP)
+	}
+	return avoid
+}
+
+func selectSameSubnetAnchor(targetIP net.IP, mask net.IPMask, avoid map[uint32]bool) net.IP {
+	target4 := targetIP.To4()
+	if target4 == nil || len(mask) != net.IPv4len {
+		return nil
+	}
+
+	target := binary.BigEndian.Uint32(target4)
+	mask32 := binary.BigEndian.Uint32([]byte(mask))
+	network := target & mask32
+	broadcast := network | ^mask32
+	if broadcast <= network+1 {
+		return nil
+	}
+
+	if avoid == nil {
+		avoid = make(map[uint32]bool)
+	}
+	avoid[network] = true
+	avoid[broadcast] = true
+
+	start := network + 1
+	end := broadcast - 1
+	candidates := make([]uint32, 0, 128)
+
+	for offset := uint32(10); offset < 512; offset++ {
+		if end < offset {
+			break
+		}
+		candidate := end - offset + 1
+		if candidate < start {
+			break
+		}
+		candidates = append(candidates, candidate)
+	}
+
+	for delta := uint32(1); delta <= 64; delta++ {
+		if target+delta <= end {
+			candidates = append(candidates, target+delta)
+		}
+		if target >= start+delta {
+			candidates = append(candidates, target-delta)
+		}
+	}
+
+	span := end - start + 1
+	for _, divisor := range []uint32{2, 3, 4, 5, 8, 13, 21, 34, 55, 89} {
+		candidates = append(candidates, start+span/divisor)
+	}
+
+	for _, candidate := range candidates {
+		if candidate < start || candidate > end || avoid[candidate] {
+			continue
+		}
+		return uint32ToIP(candidate)
+	}
+	return nil
+}
+
+func uint32ToIP(value uint32) net.IP {
+	ip := make(net.IP, net.IPv4len)
+	binary.BigEndian.PutUint32(ip, value)
+	return ip
 }
 
 func parseProtectedMACs(values ...string) []net.HardwareAddr {

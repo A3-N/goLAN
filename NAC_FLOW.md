@@ -152,7 +152,15 @@ CHECK:
   - recent IP conversations by endpoint, protocol, port, VLAN, age, and packet count
   - control-plane state for EAPOL, DHCP, and RADIUS
   - recent control-plane events
+- Dashboard page 4 renders a selectable network layout:
+  - goLAN and the switch are first-class selectable nodes
+  - observed MAC/IP hosts, DNS names, gateway, DHCP, RADIUS, external IPs, and service endpoints are linked into the switch view
+  - recent conversations render as directed protocol edges so SNMP, DNS, DHCP, RADIUS, and other traffic show who talks to whom
+  - L selects LAN/internal conversations and W selects WAN/internet conversations; the modes are mutually exclusive to keep the map readable
+  - Enter opens a node detail page with MAC, IPs, DNS names, notes, inbound edges, and outbound edges
+  - N on the node detail page edits a personal note saved in the session file
 - Dashboard body content must fit between the header and footer. Pages 2 and 3 can clip and scroll inside that budget instead of growing beyond the terminal height.
+- Sessions are written under `~/.config/goLAN/sessions/<session-id>/` by default and can be reopened with a positional session ID or `--session <path-or-id>`. Session data accumulates hosts, DNS names, conversations, notes, and pcap file paths.
 
 STOP:
 - Do not assume RADIUS is visible just because a server exists. In a normal access-port topology, switch-to-RADIUS traffic is usually outside the inline bridge path.
@@ -174,15 +182,18 @@ GO:
 CHECK:
 - Target IP is known.
 - Gateway candidate is known.
+- A target subnet mask is observed before using a same-subnet operator anchor. DHCP option 1 is preferred.
 - pf rules load successfully.
 
 STOP:
 - Do not mark NAT active if target IP is missing.
 - Do not mark NAT active if pf rule loading fails.
 - Remove the hidden anchor IP if NAT setup fails.
+- Do not invent a LAN range from only a MAC address or a static IPv4 source. Without a real subnet mask, use the off-subnet NAT anchor and keep learning passively.
 
 GO:
-- Hidden orthogonal IP is added to the bridge.
+- If a real subnet mask is known, choose an unused-looking operator IP from the learned subnet while avoiding the target, gateway, DHCP/RADIUS endpoints, observed hosts, and recent conversation endpoints.
+- If the subnet mask is unknown or no passive candidate is available, add the hidden orthogonal IP to the bridge as a fallback.
 - IPv4 forwarding is enabled only for NAT/operator-access mode.
 - pf anchor is loaded.
 - A route for the learned target subnet is installed through the bridge so operator traffic selects the NAT path.
@@ -191,6 +202,7 @@ GO:
 Note:
 - NAT is an operator-access feature, not a bridge-readiness feature.
 - The target device's Layer 2 passthrough should keep working without NAT.
+- There is no reliable Ethernet packet that asks "what IPv4 address belongs to this MAC". ARP maps IP to MAC, so active discovery requires probing candidate IPs from a known range; passive ARP/DHCP/IPv4 evidence remains the default.
 
 ## Phase 6: Teardown
 
@@ -217,7 +229,7 @@ GO:
 - Confirm that bridge EAPOL suppression does not block pcap-injected passthrough frames on the selected macOS release and adapter driver.
 - ARP can reveal a gateway candidate, but DHCP router option is stronger evidence.
 - MACsec downgrade remains a user-controlled behavior and should be treated as an active modification, not passive inspection.
-- Pcap files are written under `/tmp/golan-pcaps`; rotate/delete them outside the tool as needed for long lab sessions.
+- Pcap files are written under the active session directory. Use `--nuke` to purge saved sessions and pcaps from the goLAN config tree.
 - NAT depends on macOS route selection. Confirm with `route -n get <host>` and bridge pcap/tcpdump when scans do not appear on the wire.
 - Cleartext exposure detection is packet-scoped for now. Full stream reassembly is needed for split HTTP headers/forms or fragmented line-protocol authentication.
 

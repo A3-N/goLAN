@@ -116,3 +116,55 @@ func TestOversizedFramedBodyScrollsInsteadOfSectionError(t *testing.T) {
 	}
 	assertCompleteCardFrame(t, fit, 80)
 }
+
+func TestNetworkGraphContentUsesTopologyLanWanModes(t *testing.T) {
+	graph := networkGraph{
+		Nodes: []networkNode{
+			{Key: "local:golan", Kind: "local", Label: "goLAN", IPs: []string{"192.168.1.200"}, MAC: "aa:bb:cc:dd:ee:ff"},
+			{Key: "switch:en11", Kind: "switch", Label: "Observed network"},
+			{Key: "ip:192.168.1.10", Kind: "target", Label: "PC", IPs: []string{"192.168.1.10"}},
+			{Key: "ip:192.168.1.20", Kind: "host", Label: "printer", IPs: []string{"192.168.1.20"}},
+			{Key: "ip:8.8.8.8", Kind: "external", Label: "dns", IPs: []string{"8.8.8.8"}},
+		},
+		Edges: []networkEdge{
+			{SrcKey: "local:golan", DstKey: "switch:en11", Protocol: "inline"},
+			{SrcKey: "switch:en11", DstKey: "ip:192.168.1.10", Protocol: "L2"},
+			{SrcKey: "switch:en11", DstKey: "ip:192.168.1.20", Protocol: "L2"},
+			{SrcKey: "switch:en11", DstKey: "ip:8.8.8.8", Protocol: "L2"},
+			{SrcKey: "ip:192.168.1.10", DstKey: "ip:192.168.1.20", Protocol: "SNMP", DstPort: 161, Packets: 2},
+			{SrcKey: "ip:192.168.1.10", DstKey: "ip:8.8.8.8", Protocol: "DNS", DstPort: 53, Packets: 3},
+		},
+		Filters:  networkGraphFilters{ShowLAN: true},
+		Selected: 2,
+	}
+
+	content, _ := DashboardModel{}.networkGraphContent(filterNetworkGraph(graph), 100)
+	plain := stripANSI(content)
+	for _, want := range []string{"Network Layout", "==inline==", "==L2==", "SNMP:161", ">(192.168.1.20)"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("LAN topology missing %q:\n%s", want, plain)
+		}
+	}
+	if strings.Contains(plain, "> (") {
+		t.Fatalf("LAN topology should not include a space between arrow and peer:\n%s", plain)
+	}
+	if strings.Contains(plain, "links:") {
+		t.Fatalf("LAN topology should not render links label:\n%s", plain)
+	}
+	if strings.Contains(plain, ">>") {
+		t.Fatalf("selected topology line changed indentation with marker:\n%s", plain)
+	}
+	if strings.Contains(plain, "WAN DNS:53") {
+		t.Fatalf("LAN topology included WAN edge:\n%s", plain)
+	}
+
+	graph.Filters = networkGraphFilters{ShowWAN: true}
+	content, _ = DashboardModel{}.networkGraphContent(filterNetworkGraph(graph), 100)
+	plain = stripANSI(content)
+	if !strings.Contains(plain, "DNS:53") || !strings.Contains(plain, ">(8.8.8.8)") {
+		t.Fatalf("WAN topology missing WAN edge:\n%s", plain)
+	}
+	if strings.Contains(plain, "LAN SNMP:161") {
+		t.Fatalf("WAN topology included LAN edge:\n%s", plain)
+	}
+}

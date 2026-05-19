@@ -24,8 +24,11 @@ const (
 	pageOverview dashboardPage = iota
 	pageTopology
 	pageIntel
-	pageCount
+	pageNetwork
+	pageNodeDetail
 )
+
+const pageCount = 4
 
 // DashboardModel is the main bridge monitoring dashboard.
 type DashboardModel struct {
@@ -48,6 +51,15 @@ type DashboardModel struct {
 	logScroll  int
 	pageScroll int
 	page       dashboardPage
+
+	session         *SessionStore
+	lastSessionSave time.Time
+	selectedNodeKey string
+	noteEditing     bool
+	noteBuffer      string
+
+	networkShowLAN bool
+	networkShowWAN bool
 }
 
 // statsMsg wraps a stats update for the Bubbletea update loop.
@@ -64,18 +76,24 @@ type bridgeErrorMsg struct {
 }
 
 // NewDashboardModel creates the dashboard for monitoring an active bridge.
-func NewDashboardModel(ifA, ifB bridge.NetInterface) DashboardModel {
+func NewDashboardModel(ifA, ifB bridge.NetInterface, session *SessionStore) DashboardModel {
 	return DashboardModel{
-		ifaceA:   ifA, // Device port
-		ifaceB:   ifB, // Switch port
-		restoreA: bridge.CaptureInterfaceRestoreState(ifA.Name, ifA.HardwarePort),
-		restoreB: bridge.CaptureInterfaceRestoreState(ifB.Name, ifB.HardwarePort),
+		ifaceA:         ifA, // Device port
+		ifaceB:         ifB, // Switch port
+		restoreA:       bridge.CaptureInterfaceRestoreState(ifA.Name, ifA.HardwarePort),
+		restoreB:       bridge.CaptureInterfaceRestoreState(ifB.Name, ifB.HardwarePort),
+		session:        session,
+		networkShowLAN: true,
 	}
 }
 
 func (m DashboardModel) createBridgeCmd(ifA, ifB string, ignoreMAC string) tea.Cmd {
 	return func() tea.Msg {
-		br, err := bridge.NewBridge(ifA, ifB, ignoreMAC,
+		captureDir := ""
+		if m.session != nil {
+			captureDir = m.session.PcapDir()
+		}
+		br, err := bridge.NewBridge(ifA, ifB, ignoreMAC, captureDir,
 			m.ifaceA.CurrentMAC,
 			m.ifaceA.PermanentMAC,
 			m.ifaceB.CurrentMAC,
@@ -140,9 +158,14 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 	case statsMsg:
 		m.latestStats = stats.StatsUpdate(msg)
 		m.hasStats = true
+		m.persistSessionSnapshot(false)
 		return m, waitForStats(m.statsCh)
 
 	case tea.KeyMsg:
+		if m.noteEditing {
+			return m.handleNoteEditKey(msg), nil
+		}
+
 		bState := bridge.BridgeStateDown
 		if m.bridge != nil {
 			bState = m.bridge.State()
@@ -150,7 +173,11 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 
 		switch msg.String() {
 		case "tab":
-			m.page = (m.page + 1) % pageCount
+			if m.page == pageNodeDetail {
+				m.page = pageNetwork
+			} else {
+				m.page = (m.page + 1) % pageCount
+			}
 			m.pageScroll = 0
 		case "1":
 			m.page = pageOverview
@@ -161,20 +188,56 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 		case "3":
 			m.page = pageIntel
 			m.pageScroll = 0
+		case "4":
+			m.page = pageNetwork
+			m.pageScroll = 0
+		case "w", "W":
+			if m.page == pageNetwork {
+				m.setNetworkTrafficMode("wan")
+			}
+		case "l", "L":
+			if m.page == pageNetwork {
+				m.setNetworkTrafficMode("lan")
+			} else if m.bridge != nil && (bState == bridge.BridgeStateReady || bState == bridge.BridgeStateEAPOLListening) {
+				logFunc := m.bridgeLogFunc()
+				go m.bridge.RunListenEAPOL(logFunc)
+			}
 
 		case "up", "k":
-			if m.page == pageTopology || m.page == pageIntel {
+			if m.page == pageNetwork {
+				m.moveNetworkSelection(-1)
+			} else if m.page == pageTopology || m.page == pageIntel || m.page == pageNodeDetail {
 				m.pageScroll--
 			} else {
 				m.logScroll++
 			}
 		case "down", "j":
-			if m.page == pageTopology || m.page == pageIntel {
+			if m.page == pageNetwork {
+				m.moveNetworkSelection(1)
+			} else if m.page == pageTopology || m.page == pageIntel || m.page == pageNodeDetail {
 				m.pageScroll++
 			} else {
 				m.logScroll--
 			}
-
+		case "left", "h":
+			if m.page == pageNetwork {
+				m.moveNetworkSelection(-5)
+			}
+		case "right":
+			if m.page == pageNetwork {
+				m.moveNetworkSelection(5)
+			}
+		case "enter":
+			if m.page == pageNetwork {
+				m.ensureNetworkSelection()
+				m.page = pageNodeDetail
+				m.pageScroll = 0
+			}
+		case "b", "B", "backspace":
+			if m.page == pageNodeDetail {
+				m.page = pageNetwork
+				m.pageScroll = 0
+			}
 		// Continue from paused state.
 		case "c", "C":
 			if m.bridge != nil && bState == bridge.BridgeStatePaused {
@@ -182,7 +245,7 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 			}
 
 		// Optional action modes for the active Layer 2 bridge.
-		case "e", "E", "l", "L":
+		case "e", "E":
 			if m.bridge != nil && (bState == bridge.BridgeStateReady || bState == bridge.BridgeStateEAPOLListening) {
 				logFunc := m.bridgeLogFunc()
 				go m.bridge.RunListenEAPOL(logFunc)
@@ -198,7 +261,11 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 				}
 			}
 		case "n", "N":
-			if m.bridge != nil {
+			if m.page == pageNodeDetail {
+				m.ensureNetworkSelection()
+				m.noteBuffer = m.currentNodeNote()
+				m.noteEditing = true
+			} else if m.bridge != nil {
 				// If NAT is already active, hitting N acts as Disable (toggle off).
 				if m.bridge.IsNATActive() {
 					logFunc := m.bridgeLogFunc()
@@ -256,6 +323,7 @@ func (m *DashboardModel) Shutdown() error {
 	if m.cancel != nil {
 		m.cancel()
 	}
+	m.persistSessionSnapshot(true)
 	var errs []string
 	runStep := func(name string, timeout time.Duration, fn func() error) {
 		done := make(chan error, 1)
@@ -316,12 +384,16 @@ func (m DashboardModel) View() string {
 		body = m.renderTopologyPageContent(contentWidth, bodyBudget)
 	case pageIntel:
 		body = m.renderIntelPageContent(contentWidth, bodyBudget)
+	case pageNetwork:
+		body = m.renderNetworkPageContent(contentWidth, bodyBudget)
+	case pageNodeDetail:
+		body = m.renderNodeDetailPageContent(contentWidth, bodyBudget)
 	default:
 		body = m.renderOverviewPageContent(contentWidth, bodyBudget)
 	}
 
 	scroll := 0
-	if m.page == pageTopology || m.page == pageIntel {
+	if m.page == pageTopology || m.page == pageIntel || m.page == pageNodeDetail {
 		scroll = m.pageScroll
 	}
 	body = m.fitBodyHeight(body, bodyBudget, scroll)
@@ -783,7 +855,7 @@ func (m DashboardModel) renderError() string {
 }
 
 func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
-	const wireToken = " ==L2= "
+	const wireToken = " ==L2== "
 	wireWidth := lipgloss.Width(wireToken)
 	cardWidth := (contentWidth - (wireWidth * 2)) / 3
 	if cardWidth > 30 {
@@ -904,7 +976,7 @@ func (m DashboardModel) renderBridgeDiagram(contentWidth int) string {
 	isAuth := bState == bridge.BridgeStateEAPOLAuthenticated || status.EAPOLAuthenticated
 
 	if isNAT && isAuth {
-		wireStr = " ==OK= "
+		wireStr = " ==OK== "
 		wireColor = colorGreen
 	} else if isNAT {
 		wireStr = " ==N== "
@@ -1172,6 +1244,112 @@ func (m DashboardModel) authSnapshot() (bridge.BridgeStatus, stealth.NetworkMapS
 	return status, status.TargetID.NetworkMap.Snapshot(), true
 }
 
+func (m *DashboardModel) persistSessionSnapshot(force bool) {
+	if m == nil || m.session == nil || m.bridge == nil {
+		return
+	}
+	if !force && !m.lastSessionSave.IsZero() && time.Since(m.lastSessionSave) < 5*time.Second {
+		return
+	}
+	status, snap, ok := m.authSnapshot()
+	if !ok {
+		return
+	}
+	m.session.Merge(status, snap)
+	_ = m.session.Save()
+	m.lastSessionSave = time.Now()
+}
+
+func (m DashboardModel) handleNoteEditKey(msg tea.KeyMsg) DashboardModel {
+	switch msg.String() {
+	case "enter":
+		if m.session != nil && strings.TrimSpace(m.selectedNodeKey) != "" {
+			m.session.SetNote(m.selectedNodeKey, m.noteBuffer)
+			_ = m.session.Save()
+		}
+		m.noteEditing = false
+	case "backspace", "ctrl+h":
+		runes := []rune(m.noteBuffer)
+		if len(runes) > 0 {
+			m.noteBuffer = string(runes[:len(runes)-1])
+		}
+	case "ctrl+u":
+		m.noteBuffer = ""
+	default:
+		if msg.Type == tea.KeyRunes {
+			m.noteBuffer += string(msg.Runes)
+		} else if msg.String() == " " || msg.String() == "space" {
+			m.noteBuffer += " "
+		}
+	}
+	return m
+}
+
+func (m *DashboardModel) ensureNetworkSelection() {
+	if m == nil {
+		return
+	}
+	status, snap, ok := m.authSnapshot()
+	if !ok {
+		return
+	}
+	graph := m.buildNetworkGraph(status, snap)
+	if len(graph.Nodes) == 0 {
+		return
+	}
+	for _, node := range graph.Nodes {
+		if node.Key == m.selectedNodeKey {
+			return
+		}
+	}
+	m.selectedNodeKey = graph.Nodes[graph.Selected].Key
+}
+
+func (m *DashboardModel) moveNetworkSelection(delta int) {
+	if m == nil {
+		return
+	}
+	status, snap, ok := m.authSnapshot()
+	if !ok {
+		return
+	}
+	graph := m.buildNetworkGraph(status, snap)
+	if len(graph.Nodes) == 0 {
+		return
+	}
+	next := graph.Selected + delta
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(graph.Nodes) {
+		next = len(graph.Nodes) - 1
+	}
+	m.selectedNodeKey = graph.Nodes[next].Key
+}
+
+func (m *DashboardModel) setNetworkTrafficMode(mode string) {
+	if m == nil {
+		return
+	}
+	switch mode {
+	case "wan":
+		m.networkShowLAN = false
+		m.networkShowWAN = true
+	default:
+		m.networkShowLAN = true
+		m.networkShowWAN = false
+	}
+	m.pageScroll = 0
+	m.ensureNetworkSelection()
+}
+
+func (m DashboardModel) currentNodeNote() string {
+	if m.session == nil || strings.TrimSpace(m.selectedNodeKey) == "" {
+		return ""
+	}
+	return m.session.Note(m.selectedNodeKey)
+}
+
 func (m DashboardModel) renderTopologyBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
 	return renderCard(width, m.topologyBoxContent(status, snap, width))
 }
@@ -1273,6 +1451,17 @@ func (m DashboardModel) layer3DetailContent(status bridge.BridgeStatus, snap ste
 	if snap.RADIUS.Seen {
 		radius = fmt.Sprintf("%s -> %s", formatIP(snap.RADIUS.ClientIP), formatIP(snap.RADIUS.ServerIP))
 	}
+	natSource := "off"
+	if status.NATActive && status.NATHiddenIP != "" {
+		natSource = status.NATHiddenIP
+		if status.NATHiddenNetmask != "" {
+			natSource += "/" + status.NATHiddenNetmask
+		}
+	}
+	natRange := "unknown"
+	if status.NATRouteNetwork != "" {
+		natRange = status.NATRouteNetwork + "/" + status.NATRouteNetmask
+	}
 
 	var sb strings.Builder
 	sb.WriteString(styleLabel.Render("Layer 3 Detail") + "\n")
@@ -1283,6 +1472,9 @@ func (m DashboardModel) layer3DetailContent(status bridge.BridgeStatus, snap ste
 	sb.WriteString(renderKeyValue("DHCP Server", trunc(formatIP(snap.DHCP.ServerIP), width-18)) + "\n")
 	sb.WriteString(renderKeyValue("Gateway", trunc(gateway, width-18)) + "\n")
 	sb.WriteString(renderKeyValue("RADIUS", trunc(radius, width-18)) + "\n")
+	sb.WriteString(renderKeyValue("NAT Source", trunc(natSource, width-18)) + "\n")
+	sb.WriteString(renderKeyValue("NAT Mode", trunc(firstString(status.NATAnchorMode, "off"), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("NAT Range", trunc(natRange, width-18)) + "\n")
 	sb.WriteString(renderKeyValue("DNS seen", fmt.Sprintf("%d recent", len(snap.DNSLog))) + "\n")
 	return sb.String()
 }
@@ -2197,9 +2389,31 @@ func (m DashboardModel) renderFooter() string {
 
 	// Navigation first (left side), then actions (right side).
 	parts := []string{
-		styleKey.Render("[Tab/1/2/3]"),
+		styleKey.Render("[Tab/1/2/3/4]"),
 		keyHint("Esc", "back"),
 		keyHint("q", "quit"),
+	}
+
+	switch {
+	case m.noteEditing:
+		parts = append(parts,
+			keyHint("Enter", "save note"),
+			keyHint("Backspace", "delete"),
+			keyHint("Ctrl+U", "clear"),
+		)
+	case m.page == pageNetwork:
+		parts = append(parts,
+			keyHint("↑↓", "select node"),
+			keyHint("←→", "jump"),
+			keyHint("Enter", "node detail"),
+			keyHint("L", "LAN:"+onOff(m.networkShowLAN)),
+			keyHint("W", "WAN:"+onOff(m.networkShowWAN)),
+		)
+	case m.page == pageNodeDetail:
+		parts = append(parts,
+			keyHint("B", "map"),
+			keyHint("N", "edit note"),
+		)
 	}
 
 	natActive := hasBridge && m.bridge.IsNATActive()
@@ -2212,13 +2426,15 @@ func (m DashboardModel) renderFooter() string {
 			relayStr = "stop eapol"
 		}
 	}
-	parts = append(parts,
-		hint(ready || listening, "E", "802.1X listen"),
-		hint(ready, "S", "802.1X send"),
-		hint(ready || eapolDetected || bState == bridge.BridgeStateEAPOLRelaying || bState == bridge.BridgeStateEAPOLAuthenticated, "R", relayStr),
-		hint((ready || eapolDetected || listening || bState == bridge.BridgeStateEAPOLRelaying || authenticated || natActive) && gatewayKnown, "N", "NAT: "+map[bool]string{true: "ON", false: "OFF"}[natActive]),
-		hint(hasBridge, "M", "MACsec:"+macsecStr),
-	)
+	if !m.noteEditing && m.page != pageNodeDetail {
+		parts = append(parts,
+			hint(ready || listening, "E", "802.1X listen"),
+			hint(ready, "S", "802.1X send"),
+			hint(ready || eapolDetected || bState == bridge.BridgeStateEAPOLRelaying || bState == bridge.BridgeStateEAPOLAuthenticated, "R", relayStr),
+			hint((ready || eapolDetected || listening || bState == bridge.BridgeStateEAPOLRelaying || authenticated || natActive) && gatewayKnown, "N", "NAT: "+map[bool]string{true: "ON", false: "OFF"}[natActive]),
+			hint(hasBridge, "M", "MACsec:"+macsecStr),
+		)
+	}
 
 	footerWidth := m.width
 	if footerWidth < 1 {

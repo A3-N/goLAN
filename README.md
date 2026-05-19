@@ -21,6 +21,16 @@ make install
 go build -o .
 ```
 
+## Sessions
+
+goLAN writes each session under `~/.config/goLAN/sessions/<session-id>/` with the session JSON and pcaps together. On exit it prints the session ID. Resume or append to it with:
+
+```bash
+sudo golan <session-id>
+```
+
+`--session <path-or-id>` is also supported for explicit paths or IDs. `--nuke` purges goLAN sessions and pcaps from the config directory.
+
 # Example usage
 
 [Guide of non 802.1x Setup](EXAMPLE.md)
