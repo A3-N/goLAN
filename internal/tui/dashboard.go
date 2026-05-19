@@ -22,7 +22,9 @@ type dashboardPage int
 
 const (
 	pageOverview dashboardPage = iota
-	pageAuthMap
+	pageTopology
+	pageIntel
+	pageCount
 )
 
 // DashboardModel is the main bridge monitoring dashboard.
@@ -40,11 +42,12 @@ type DashboardModel struct {
 	latestStats stats.StatsUpdate
 	hasStats    bool
 
-	width     int
-	height    int
-	err       error
-	logScroll int
-	page      dashboardPage
+	width      int
+	height     int
+	err        error
+	logScroll  int
+	pageScroll int
+	page       dashboardPage
 }
 
 // statsMsg wraps a stats update for the Bubbletea update loop.
@@ -147,20 +150,30 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 
 		switch msg.String() {
 		case "tab":
-			if m.page == pageOverview {
-				m.page = pageAuthMap
-			} else {
-				m.page = pageOverview
-			}
+			m.page = (m.page + 1) % pageCount
+			m.pageScroll = 0
 		case "1":
 			m.page = pageOverview
+			m.pageScroll = 0
 		case "2":
-			m.page = pageAuthMap
+			m.page = pageTopology
+			m.pageScroll = 0
+		case "3":
+			m.page = pageIntel
+			m.pageScroll = 0
 
 		case "up", "k":
-			m.logScroll++
+			if m.page == pageTopology || m.page == pageIntel {
+				m.pageScroll--
+			} else {
+				m.logScroll++
+			}
 		case "down", "j":
-			m.logScroll--
+			if m.page == pageTopology || m.page == pageIntel {
+				m.pageScroll++
+			} else {
+				m.logScroll--
+			}
 
 		// Continue from paused state.
 		case "c", "C":
@@ -230,6 +243,9 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 		if m.logScroll < 0 {
 			m.logScroll = 0
 		}
+		if m.pageScroll < 0 {
+			m.pageScroll = 0
+		}
 	}
 
 	return m, nil
@@ -271,45 +287,46 @@ func (m DashboardModel) View() string {
 		return ""
 	}
 
-	var sb strings.Builder
 	contentWidth := m.width
 	if contentWidth < 1 {
 		contentWidth = 1
 	}
 
 	// ── Header with Status ──────────────────────────────────────
-	sb.WriteString(m.renderHeader(contentWidth))
-	sb.WriteString("\n")
+	header := m.renderHeader(contentWidth)
+	footer := m.renderFooter()
+	bodyBudget := m.bodyHeightBudget(header, footer)
 
 	// ── Error State ─────────────────────────────────────────────
 	if m.err != nil {
-		sb.WriteString(m.renderError())
-		return m.fitViewport(sb.String())
+		body := m.fitBodyHeight(m.renderError(), bodyBudget, 0)
+		return m.renderFrame(header, body, footer)
 	}
 
 	// ── Loading State ───────────────────────────────────────────
 	if m.bridge == nil {
-		sb.WriteString("\n")
-		sb.WriteString(styleDim.Render("  ⟳ Creating bridge between " + m.ifaceA.Name + " and " + m.ifaceB.Name + "..."))
-		return m.fitViewport(sb.String())
+		body := "\n" + styleDim.Render("  ⟳ Creating bridge between "+m.ifaceA.Name+" and "+m.ifaceB.Name+"...")
+		body = m.fitBodyHeight(body, bodyBudget, 0)
+		return m.renderFrame(header, body, footer)
 	}
 
-	if m.page == pageAuthMap {
-		sb.WriteString(m.renderAuthMapContent(contentWidth))
-	} else {
-		// ── Bridge Diagram ──────────────────────────────────────────
-		sb.WriteString(m.renderBridgeDiagram(contentWidth))
-		sb.WriteString("\n")
-
-		// ── Two-Column Layout: Left (Traffic + Throughput) | Right (Recon) ──
-		sb.WriteString(m.renderMainContent(contentWidth))
+	var body string
+	switch m.page {
+	case pageTopology:
+		body = m.renderTopologyPageContent(contentWidth, bodyBudget)
+	case pageIntel:
+		body = m.renderIntelPageContent(contentWidth, bodyBudget)
+	default:
+		body = m.renderOverviewPageContent(contentWidth, bodyBudget)
 	}
-	sb.WriteString("\n")
 
-	// ── Footer ──────────────────────────────────────────────────
-	sb.WriteString(m.renderFooter())
+	scroll := 0
+	if m.page == pageTopology || m.page == pageIntel {
+		scroll = m.pageScroll
+	}
+	body = m.fitBodyHeight(body, bodyBudget, scroll)
 
-	return m.fitViewport(sb.String())
+	return m.renderFrame(header, body, footer)
 }
 
 func (m DashboardModel) fitViewport(content string) string {
@@ -322,6 +339,207 @@ func (m DashboardModel) fitViewport(content string) string {
 		MaxWidth(m.width).
 		MaxHeight(m.height).
 		Render(content)
+}
+
+func (m DashboardModel) renderFrame(header, body, footer string) string {
+	if m.width <= 0 || m.height <= 0 {
+		return strings.TrimRight(header+"\n"+body+"\n"+footer, "\n")
+	}
+
+	header = strings.TrimRight(header, "\n")
+	body = strings.TrimRight(body, "\n")
+	footer = strings.TrimRight(footer, "\n")
+
+	headerHeight := lipgloss.Height(header)
+	footerHeight := lipgloss.Height(footer)
+	bodyHeight := m.height - headerHeight - footerHeight
+	if bodyHeight < 0 {
+		bodyHeight = 0
+	}
+
+	bodyBlock := lipgloss.NewStyle().
+		Width(m.width).
+		Height(bodyHeight).
+		MaxWidth(m.width).
+		MaxHeight(bodyHeight).
+		Render(body)
+
+	parts := make([]string, 0, 3)
+	if header != "" {
+		parts = append(parts, header)
+	}
+	if bodyHeight > 0 {
+		parts = append(parts, bodyBlock)
+	}
+	if footer != "" {
+		parts = append(parts, footer)
+	}
+
+	return m.fitViewport(strings.Join(parts, "\n"))
+}
+
+func (m DashboardModel) bodyHeightBudget(header, footer string) int {
+	if m.height <= 0 {
+		return 0
+	}
+	budget := m.height - lipgloss.Height(header)
+	if footer != "" {
+		budget -= lipgloss.Height(footer)
+	}
+	if budget < 0 {
+		return 0
+	}
+	return budget
+}
+
+func (m DashboardModel) fitBodyHeight(content string, maxHeight int, scroll int) string {
+	if maxHeight <= 0 {
+		return ""
+	}
+	content = strings.TrimRight(content, "\n")
+	if content == "" || lipgloss.Height(content) <= maxHeight {
+		return content
+	}
+
+	blocks := splitBodyBlocks(content)
+	if len(blocks) > 1 || isFramedContent(content) {
+		return m.fitBodyBlocks(blocks, maxHeight, scroll)
+	}
+
+	return m.fitBodyLines(content, maxHeight, scroll)
+}
+
+func (m DashboardModel) fitBodyLines(content string, maxHeight int, scroll int) string {
+	content = strings.TrimRight(content, "\n")
+	if maxHeight <= 0 || content == "" {
+		return ""
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) <= maxHeight {
+		return content
+	}
+	if maxHeight == 1 {
+		return styleDim.Render(trunc("content clipped; resize terminal", safeWidth(m.width)-4))
+	}
+
+	visibleHeight := maxHeight - 1
+	maxScroll := len(lines) - visibleHeight
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+	if scroll > maxScroll {
+		scroll = maxScroll
+	}
+	end := scroll + visibleHeight
+	if end > len(lines) {
+		end = len(lines)
+	}
+
+	visible := append([]string(nil), lines[scroll:end]...)
+	marker := fmt.Sprintf("showing %d-%d/%d  ↑↓ scroll", scroll+1, end, len(lines))
+	visible = append(visible, styleDim.Render(trunc(marker, safeWidth(m.width)-4)))
+	return strings.Join(visible, "\n")
+}
+
+func (m DashboardModel) fitBodyBlocks(blocks []string, maxHeight int, scroll int) string {
+	if maxHeight <= 0 {
+		return ""
+	}
+	if len(blocks) == 0 {
+		return ""
+	}
+	if maxHeight == 1 {
+		return styleDim.Render(trunc("content clipped; resize terminal", safeWidth(m.width)-4))
+	}
+
+	visibleHeight := maxHeight - 1
+	if scroll < 0 {
+		scroll = 0
+	}
+	if scroll >= len(blocks) {
+		scroll = len(blocks) - 1
+	}
+
+	selected := make([]string, 0, len(blocks))
+	used := 0
+	firstTooTall := false
+	for i := scroll; i < len(blocks); i++ {
+		block := blocks[i]
+		blockHeight := lipgloss.Height(block)
+		needed := blockHeight
+		if len(selected) > 0 {
+			needed++
+		}
+		if used+needed > visibleHeight {
+			if len(selected) == 0 {
+				firstTooTall = true
+			}
+			break
+		}
+		if len(selected) > 0 {
+			used++
+		}
+		selected = append(selected, block)
+		used += blockHeight
+	}
+
+	if firstTooTall {
+		if isFramedContent(blocks[scroll]) {
+			return clipFramedBlock(blocks[scroll], maxHeight)
+		}
+		return m.fitBodyLines(blocks[scroll], maxHeight, 0)
+	}
+	if len(selected) == 0 {
+		selected = append(selected, blocks[scroll])
+	}
+
+	endIndex := scroll + len(selected)
+	visible := strings.Join(selected, "\n\n")
+	marker := fmt.Sprintf("sections %d-%d/%d  ↑↓ scroll", scroll+1, endIndex, len(blocks))
+	return visible + "\n" + styleDim.Render(trunc(marker, safeWidth(m.width)-4))
+}
+
+func splitBodyBlocks(content string) []string {
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	blocks := make([]string, 0, 4)
+	current := make([]string, 0, 8)
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			if len(current) > 0 {
+				blocks = append(blocks, strings.Join(current, "\n"))
+				current = current[:0]
+			}
+			continue
+		}
+		current = append(current, line)
+	}
+	if len(current) > 0 {
+		blocks = append(blocks, strings.Join(current, "\n"))
+	}
+	return blocks
+}
+
+func isFramedContent(content string) bool {
+	return strings.Contains(content, "╭") && strings.Contains(content, "╰")
+}
+
+func clipFramedBlock(content string, maxHeight int) string {
+	if maxHeight <= 0 {
+		return ""
+	}
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	if len(lines) <= maxHeight {
+		return strings.Join(lines, "\n")
+	}
+	if maxHeight == 1 {
+		return styleDim.Render("...")
+	}
+	visible := append([]string(nil), lines[:maxHeight]...)
+	visible[maxHeight-1] = lines[len(lines)-1]
+	return strings.Join(visible, "\n")
 }
 
 func safeWidth(width int) int {
@@ -344,9 +562,145 @@ func pageContentArea(width int) (int, int) {
 	return inner, margin
 }
 
+func cardContentWidth(width int) int {
+	inner := safeWidth(width) - 2 // left/right border
+	if inner < 1 {
+		return 1
+	}
+	return inner
+}
+
 func renderCard(width int, content string) string {
-	w := safeWidth(width)
-	return styleStatsBox.Width(w).MaxWidth(w).Render(content)
+	outer := safeWidth(width)
+	inner := cardContentWidth(width)
+	return styleStatsBox.Width(inner).MaxWidth(outer).Render(content)
+}
+
+func renderFixedCard(width int, height int, content string) string {
+	if height <= 0 {
+		return ""
+	}
+	if height < 3 {
+		return lipgloss.NewStyle().
+			Width(safeWidth(width)).
+			MaxWidth(safeWidth(width)).
+			Height(height).
+			MaxHeight(height).
+			Render(styleDim.Render(trunc("resize terminal", safeWidth(width)-2)))
+	}
+
+	contentLines := height - 2 // leave room for top/bottom border
+	content = clipCardContent(content, contentLines)
+	outer := safeWidth(width)
+	inner := cardContentWidth(width)
+	return styleStatsBox.
+		Width(inner).
+		MaxWidth(outer).
+		Height(contentLines).
+		MaxHeight(height).
+		Render(content)
+}
+
+func clipCardContent(content string, maxLines int) string {
+	if maxLines <= 0 {
+		return ""
+	}
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	if len(lines) <= maxLines {
+		return strings.Join(lines, "\n")
+	}
+	lines = lines[:maxLines]
+	lines[maxLines-1] = styleDim.Render("... clipped; resize terminal")
+	return strings.Join(lines, "\n")
+}
+
+func renderFixedCardStack(width int, maxHeight int, contents []string) string {
+	if maxHeight <= 0 || len(contents) == 0 {
+		return ""
+	}
+	if len(contents) == 1 {
+		return renderFixedCard(width, maxHeight, contents[0])
+	}
+
+	gapCount := len(contents) - 1
+	available := maxHeight - gapCount
+	if available < 3 {
+		return renderFixedCard(width, maxHeight, contents[0])
+	}
+
+	minHeight := 4
+	if available < minHeight*len(contents) {
+		minHeight = 3
+	}
+	if available < minHeight*len(contents) {
+		return renderFixedCard(width, maxHeight, contents[0])
+	}
+
+	heights := make([]int, len(contents))
+	total := 0
+	for i, content := range contents {
+		desired := lipgloss.Height(renderCard(width, content))
+		if desired < minHeight {
+			desired = minHeight
+		}
+		heights[i] = desired
+		total += desired
+	}
+
+	for total > available {
+		idx := -1
+		tallest := minHeight
+		for i, height := range heights {
+			if height > tallest {
+				tallest = height
+				idx = i
+			}
+		}
+		if idx == -1 {
+			break
+		}
+		heights[idx]--
+		total--
+	}
+
+	if total < available {
+		heights[len(heights)-1] += available - total
+	}
+
+	parts := make([]string, 0, len(contents))
+	for i, content := range contents {
+		parts = append(parts, renderFixedCard(width, heights[i], content))
+	}
+	rendered := strings.Join(parts, "\n")
+	if short := maxHeight - lipgloss.Height(rendered); short > 0 {
+		heights[len(heights)-1] += short
+		parts[len(parts)-1] = renderFixedCard(width, heights[len(heights)-1], contents[len(contents)-1])
+		rendered = strings.Join(parts, "\n")
+	}
+	return rendered
+}
+
+func renderScrollableCardStack(width int, maxHeight int, contents []string) string {
+	if len(contents) == 0 {
+		return ""
+	}
+	maxCardHeight := maxHeight - 1 // fitBodyBlocks adds a one-line scroll marker.
+	if maxCardHeight < 3 {
+		maxCardHeight = 3
+	}
+
+	parts := make([]string, 0, len(contents))
+	for _, content := range contents {
+		height := lipgloss.Height(renderCard(width, content))
+		if height > maxCardHeight {
+			height = maxCardHeight
+		}
+		if height < 3 {
+			height = 3
+		}
+		parts = append(parts, renderFixedCard(width, height, content))
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 func (m DashboardModel) renderHeader(width int) string {
@@ -641,20 +995,52 @@ func (m DashboardModel) reconMaxVis() int {
 	return maxVis
 }
 
+func (m DashboardModel) renderOverviewPageContent(width int, maxHeight int) string {
+	if maxHeight <= 0 {
+		return ""
+	}
+
+	mainMinHeight := 8
+	spacingHeight := 2
+	diagram := m.renderBridgeDiagram(width)
+	if lipgloss.Height(diagram)+spacingHeight+mainMinHeight > maxHeight {
+		diagram = m.renderBridgeDiagramCompact(width)
+	}
+
+	diagramHeight := lipgloss.Height(diagram)
+	remaining := maxHeight - diagramHeight - spacingHeight
+	if remaining < mainMinHeight {
+		return m.renderMainContentFit(width, maxHeight)
+	}
+
+	main := m.renderMainContentFit(width, remaining)
+	if strings.TrimSpace(main) == "" {
+		return diagram
+	}
+	return diagram + "\n\n" + main
+}
+
 // renderMainContent renders the two-column layout below the bridge diagram:
 // Left column = Traffic Statistics + Throughput sparklines
 // Right column = Reconnaissance Log (fills the full height)
 func (m DashboardModel) renderMainContent(width int) string {
+	return m.renderMainContentFit(width, 0)
+}
+
+func (m DashboardModel) renderMainContentFit(width int, maxHeight int) string {
 	usable, margin := pageContentArea(width)
 	if usable < 90 {
-		leftColumn := m.renderLeftColumn(usable)
-		reconHeight := m.height - lipgloss.Height(leftColumn) - 10
-		if reconHeight < 8 {
-			reconHeight = 8
-		}
-		recon := m.renderReconPanel(usable, reconHeight)
+		leftColumn := m.renderLeftColumnFit(usable, maxHeight)
 		content := leftColumn
-		if recon != "" {
+		reconHeight := m.height - lipgloss.Height(leftColumn) - 10
+		if maxHeight > 0 {
+			reconHeight = maxHeight - lipgloss.Height(leftColumn) - 1
+		}
+		if reconHeight >= 6 || maxHeight <= 0 {
+			if reconHeight < 8 {
+				reconHeight = 8
+			}
+			recon := m.renderReconPanel(usable, reconHeight)
 			content += "\n" + recon
 		}
 		return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(content)
@@ -665,10 +1051,16 @@ func (m DashboardModel) renderMainContent(width int) string {
 	rightWidth := usable - leftWidth - gap
 
 	// ── Left Column: Traffic Stats + Throughput Sparklines ──────
-	leftColumn := m.renderLeftColumn(leftWidth)
+	leftColumn := m.renderLeftColumnFit(leftWidth, maxHeight)
+	if maxHeight > 0 && maxHeight < 6 {
+		return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(leftColumn)
+	}
 
 	// ── Right Column: Reconnaissance Log ────────────────────────
 	leftHeight := lipgloss.Height(leftColumn)
+	if maxHeight > 0 && leftHeight > maxHeight {
+		leftHeight = maxHeight
+	}
 	rightColumn := m.renderReconPanel(rightWidth, leftHeight)
 
 	return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(
@@ -676,50 +1068,96 @@ func (m DashboardModel) renderMainContent(width int) string {
 	)
 }
 
-func (m DashboardModel) renderAuthMapContent(width int) string {
+func (m DashboardModel) renderTopologyPageContent(width int, maxHeight int) string {
 	status, snap, ok := m.authSnapshot()
 	usable, margin := pageContentArea(width)
 	if !ok {
-		content := styleDim.Render("Passive topology map waiting for bridge observer...")
+		content := styleDim.Render("Topology waiting for bridge observer...")
 		return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(
 			renderCard(usable, content),
 		)
 	}
 
-	if usable < 96 {
-		sections := []string{
-			m.renderTopologyBox(status, snap, usable),
-			m.renderVisibilityBox(status, snap, usable),
-			m.renderCredentialExposureBox(status, snap, usable),
-			m.renderConversationsBox(status, snap, usable),
-			m.renderSignalsBox(snap, usable),
-			m.renderRecentEventsBox(snap, usable),
+	if usable >= 96 && maxHeight >= 10 {
+		gap := 2
+		leftWidth := (usable - gap) / 2
+		rightWidth := usable - leftWidth - gap
+		rightGap := 1
+		layer2Height := (maxHeight - rightGap) / 2
+		layer3Height := maxHeight - rightGap - layer2Height
+
+		if layer2Height >= 4 && layer3Height >= 4 {
+			left := renderFixedCard(leftWidth, maxHeight, m.topologyBoxContent(status, snap, leftWidth))
+			right := renderFixedCard(rightWidth, layer2Height, m.layer2DetailContent(status, snap, rightWidth)) +
+				"\n" +
+				renderFixedCard(rightWidth, layer3Height, m.layer3DetailContent(status, snap, rightWidth))
+
+			return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(
+				lipgloss.JoinHorizontal(lipgloss.Top, left, strings.Repeat(" ", gap), right),
+			)
 		}
-		return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(strings.Join(sections, "\n"))
+	}
+
+	sections := []string{
+		m.renderTopologyBox(status, snap, usable),
+		m.renderLayer2DetailBox(status, snap, usable),
+		m.renderLayer3DetailBox(status, snap, usable),
+	}
+	return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(strings.Join(sections, "\n\n"))
+}
+
+func (m DashboardModel) renderIntelPageContent(width int, maxHeight int) string {
+	status, snap, ok := m.authSnapshot()
+	usable, margin := pageContentArea(width)
+	if !ok {
+		content := styleDim.Render("Passive intelligence waiting for bridge observer...")
+		return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(
+			renderCard(usable, content),
+		)
+	}
+
+	allContents := []string{
+		m.credentialExposureContent(status, snap, usable),
+		m.conversationsContent(status, snap, usable),
+		m.signalsContent(snap, usable),
+		m.eapolContent(snap, usable),
+		m.dhcpContent(snap, usable),
+		m.radiusContent(snap, usable),
+		m.recentEventsContent(snap, usable),
+	}
+
+	if usable < 96 {
+		return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(
+			renderScrollableCardStack(usable, maxHeight, allContents),
+		)
 	}
 
 	gap := 2
 	leftWidth := (usable - gap) / 2
 	rightWidth := usable - leftWidth - gap
+	rightMinHeight := (4 * 3) + 3 // four cards, three one-line gaps.
+	if maxHeight < rightMinHeight {
+		return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(
+			renderScrollableCardStack(usable, maxHeight, allContents),
+		)
+	}
 
-	left := strings.Builder{}
-	left.WriteString(m.renderTopologyBox(status, snap, leftWidth))
-	left.WriteString("\n")
-	left.WriteString(m.renderConversationsBox(status, snap, leftWidth))
-	left.WriteString("\n")
-	left.WriteString(m.renderHostsBox(snap, leftWidth))
-
-	right := strings.Builder{}
-	right.WriteString(m.renderVisibilityBox(status, snap, rightWidth))
-	right.WriteString("\n")
-	right.WriteString(m.renderCredentialExposureBox(status, snap, rightWidth))
-	right.WriteString("\n")
-	right.WriteString(m.renderSignalsBox(snap, rightWidth))
-	right.WriteString("\n")
-	right.WriteString(m.renderRecentEventsBox(snap, rightWidth))
+	leftContents := []string{
+		m.credentialExposureContent(status, snap, leftWidth),
+		m.conversationsContent(status, snap, leftWidth),
+		m.recentEventsContent(snap, leftWidth),
+	}
+	rightContents := []string{
+		m.signalsContent(snap, rightWidth),
+		m.eapolContent(snap, rightWidth),
+		m.dhcpContent(snap, rightWidth),
+		m.radiusContent(snap, rightWidth),
+	}
+	left := renderFixedCardStack(leftWidth, maxHeight, leftContents)
+	right := renderFixedCardStack(rightWidth, maxHeight, rightContents)
 
 	return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(
-		lipgloss.JoinHorizontal(lipgloss.Top, left.String(), "  ", right.String()),
+		lipgloss.JoinHorizontal(lipgloss.Top, left, strings.Repeat(" ", gap), right),
 	)
 }
 
@@ -729,12 +1167,16 @@ func (m DashboardModel) authSnapshot() (bridge.BridgeStatus, stealth.NetworkMapS
 	}
 	status := m.bridge.Status()
 	if status.TargetID == nil || status.TargetID.NetworkMap == nil {
-		return status, stealth.NetworkMapSnapshot{}, false
+		return status, stealth.NetworkMapSnapshot{}, true
 	}
 	return status, status.TargetID.NetworkMap.Snapshot(), true
 }
 
 func (m DashboardModel) renderTopologyBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
+	return renderCard(width, m.topologyBoxContent(status, snap, width))
+}
+
+func (m DashboardModel) topologyBoxContent(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
 	targetMAC := "unknown"
 	targetIP := "unknown"
 	if status.TargetID != nil {
@@ -760,9 +1202,89 @@ func (m DashboardModel) renderTopologyBox(status bridge.BridgeStatus, snap steal
 	sb.WriteString(styleSuccess.Render(trunc("goLAN inline bridge  "+bridgeName, width-4)) + "\n")
 	sb.WriteString(styleDim.Render(trunc("        | "+status.IfaceB+" switch-side", width-4)) + "\n")
 	sb.WriteString(styleIfaceNameSwitch.Render(trunc("Switch / network", width-4)) + "\n")
+	sb.WriteString(styleIfaceNameDevice.Render(trunc(status.IfaceA+" adapter", width-4)) + "\n")
+	sb.WriteString(renderKeyValue("Hardware", trunc(emptyText(m.ifaceA.HardwarePort), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Adapter MAC", trunc(emptyText(m.ifaceA.CurrentMAC), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Factory MAC", trunc(emptyText(m.ifaceA.PermanentMAC), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("MTU/Addrs", trunc(fmt.Sprintf("%d  %s", m.ifaceA.MTU, formatStrings(m.ifaceA.Addrs)), width-18)) + "\n")
+	sb.WriteString(styleIfaceNameSwitch.Render(trunc(status.IfaceB+" adapter", width-4)) + "\n")
+	sb.WriteString(renderKeyValue("Hardware", trunc(emptyText(m.ifaceB.HardwarePort), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Adapter MAC", trunc(emptyText(m.ifaceB.CurrentMAC), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Factory MAC", trunc(emptyText(m.ifaceB.PermanentMAC), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("MTU/Addrs", trunc(fmt.Sprintf("%d  %s", m.ifaceB.MTU, formatStrings(m.ifaceB.Addrs)), width-18)) + "\n")
+	sb.WriteString(styleSuccess.Render("Target MAC use") + "\n")
+	sb.WriteString(renderKeyValue("Found", trunc(targetMAC, width-18)) + "\n")
+	sb.WriteString(renderKeyValue("PC -> Mac", trunc(targetMAC+" observed on "+status.IfaceA, width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Bridge", trunc(bridgeName+" mirrors "+targetMAC, width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Switch side", trunc(status.IfaceB+" mirrors "+targetMAC+" when supported", width-18)) + "\n")
 	sb.WriteString(renderKeyValue("Port", port) + "\n")
 	sb.WriteString(renderKeyValue("Evidence", evidence) + "\n")
-	return renderCard(width, sb.String())
+	return sb.String()
+}
+
+func (m DashboardModel) renderLayer2DetailBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
+	return renderCard(width, m.layer2DetailContent(status, snap, width))
+}
+
+func (m DashboardModel) layer2DetailContent(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
+	targetMAC := "unknown"
+	if status.TargetID != nil {
+		targetMAC = formatMAC(status.TargetID.MAC)
+	}
+	eap := snap.EAPOL
+	eapolLast := "unknown"
+	if eap.Detected {
+		eapolLast = strings.TrimSpace(firstString(eap.LastCode, "EAPOL") + " " + eap.LastMethod + " " + ageString(eap.LastSeen))
+	}
+	supplicant := formatMAC(eap.SupplicantMAC)
+	if supplicant == "unknown" {
+		supplicant = targetMAC
+	}
+
+	var sb strings.Builder
+	sb.WriteString(styleLabel.Render("Layer 2 Detail") + "\n")
+	sb.WriteString(renderKeyValue("Bridge", trunc(emptyText(status.Name), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("State", trunc(status.State.String(), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Target MAC", trunc(targetMAC, width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Supplicant", trunc(supplicant, width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Authenticator", trunc(formatMAC(eap.AuthenticatorMAC), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("EAPOL", trunc(eapolLast, width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Passthrough", boolText(status.EAPOLPassthrough)) + "\n")
+	sb.WriteString(renderKeyValue("Port", formatPortState(snap.Port)) + "\n")
+	sb.WriteString(renderKeyValue("Evidence", trunc(emptyText(firstString(snap.Port.Evidence, snap.Port.Reason)), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("VLANs", trunc(formatVLANs(snap.VLANIDs, snap.RADIUS.AssignedVLAN), width-18)) + "\n")
+	return sb.String()
+}
+
+func (m DashboardModel) renderLayer3DetailBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
+	return renderCard(width, m.layer3DetailContent(status, snap, width))
+}
+
+func (m DashboardModel) layer3DetailContent(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
+	targetIPs := targetIPList(status, snap)
+	gateway := "unknown"
+	if snap.Gateway.Confirmed {
+		gateway = formatIP(snap.Gateway.IP) + "  " + formatMAC(snap.Gateway.MAC)
+	} else if len(snap.DHCP.RouterIP) > 0 {
+		gateway = formatIP(snap.DHCP.RouterIP) + "  DHCP router"
+	}
+
+	radius := "not visible"
+	if snap.RADIUS.Seen {
+		radius = fmt.Sprintf("%s -> %s", formatIP(snap.RADIUS.ClientIP), formatIP(snap.RADIUS.ServerIP))
+	}
+
+	var sb strings.Builder
+	sb.WriteString(styleLabel.Render("Layer 3 Detail") + "\n")
+	sb.WriteString(renderKeyValue("Target IPs", trunc(targetIPs, width-18)) + "\n")
+	sb.WriteString(renderKeyValue("DHCP Offer", trunc(formatIP(snap.DHCP.OfferedIP), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("DHCP ACK", trunc(formatIP(snap.DHCP.ACKIP), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Netmask", trunc(formatMask(snap.DHCP.Netmask), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("DHCP Server", trunc(formatIP(snap.DHCP.ServerIP), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Gateway", trunc(gateway, width-18)) + "\n")
+	sb.WriteString(renderKeyValue("RADIUS", trunc(radius, width-18)) + "\n")
+	sb.WriteString(renderKeyValue("DNS seen", fmt.Sprintf("%d recent", len(snap.DNSLog))) + "\n")
+	return sb.String()
 }
 
 func (m DashboardModel) renderVisibilityBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
@@ -807,11 +1329,15 @@ func (m DashboardModel) renderVisibilityBox(status bridge.BridgeStatus, snap ste
 }
 
 func (m DashboardModel) renderCredentialExposureBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
+	return renderCard(width, m.credentialExposureContent(status, snap, width))
+}
+
+func (m DashboardModel) credentialExposureContent(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
 	var sb strings.Builder
 	sb.WriteString(styleWarning.Render("Cleartext Exposure") + "\n")
 	if len(snap.CredentialExposures) == 0 {
 		sb.WriteString(styleDim.Render("No cleartext credential patterns observed.") + "\n")
-		return renderCard(width, sb.String())
+		return sb.String()
 	}
 
 	limit := 6
@@ -824,7 +1350,7 @@ func (m DashboardModel) renderCredentialExposureBox(status bridge.BridgeStatus, 
 		}
 		sb.WriteString(m.renderCredentialExposureLine(status, snap, finding, width))
 	}
-	return renderCard(width, sb.String())
+	return sb.String()
 }
 
 func (m DashboardModel) renderCredentialExposureLine(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, finding stealth.CredentialExposureSummary, width int) string {
@@ -852,6 +1378,10 @@ func (m DashboardModel) renderCredentialExposureLine(status bridge.BridgeStatus,
 }
 
 func (m DashboardModel) renderSignalsBox(snap stealth.NetworkMapSnapshot, width int) string {
+	return renderCard(width, m.signalsContent(snap, width))
+}
+
+func (m DashboardModel) signalsContent(snap stealth.NetworkMapSnapshot, width int) string {
 	e := snap.EAPOL
 	eapLast := "not observed"
 	if e.Detected {
@@ -883,15 +1413,19 @@ func (m DashboardModel) renderSignalsBox(snap stealth.NetworkMapSnapshot, width 
 	sb.WriteString(renderKeyValue("DHCP", trunc(dhcpLast, width-18)) + "\n")
 	sb.WriteString(renderKeyValue("RADIUS", trunc(radiusLast, width-18)) + "\n")
 	sb.WriteString(renderKeyValue("Req/Resp", fmt.Sprintf("%d/%d", snap.RADIUS.AccessRequests, snap.RADIUS.AccessAccepts+snap.RADIUS.AccessRejects+snap.RADIUS.AccessChallenges)) + "\n")
-	return renderCard(width, sb.String())
+	return sb.String()
 }
 
 func (m DashboardModel) renderConversationsBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
+	return renderCard(width, m.conversationsContent(status, snap, width))
+}
+
+func (m DashboardModel) conversationsContent(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
 	var sb strings.Builder
 	sb.WriteString(styleLabel.Render("Visible Conversations") + "\n")
 	if len(snap.Conversations) == 0 {
 		sb.WriteString(styleDim.Render("No IP conversations observed yet.") + "\n")
-		return renderCard(width, sb.String())
+		return sb.String()
 	}
 	limit := 10
 	if width < 64 {
@@ -903,7 +1437,7 @@ func (m DashboardModel) renderConversationsBox(status bridge.BridgeStatus, snap 
 		}
 		sb.WriteString(m.renderConversationLine(status, snap, conv, width))
 	}
-	return renderCard(width, sb.String())
+	return sb.String()
 }
 
 func (m DashboardModel) renderConversationLine(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, conv stealth.ConversationSummary, width int) string {
@@ -984,6 +1518,10 @@ func (m DashboardModel) renderAuthFlowBox(status bridge.BridgeStatus, snap steal
 }
 
 func (m DashboardModel) renderEAPOLBox(snap stealth.NetworkMapSnapshot, width int) string {
+	return renderCard(width, m.eapolContent(snap, width))
+}
+
+func (m DashboardModel) eapolContent(snap stealth.NetworkMapSnapshot, width int) string {
 	e := snap.EAPOL
 	method := e.LastMethod
 	if method == "" {
@@ -1003,10 +1541,14 @@ func (m DashboardModel) renderEAPOLBox(snap stealth.NetworkMapSnapshot, width in
 	sb.WriteString(renderKeyValue("Success/Fail", fmt.Sprintf("%d / %d", e.Successes, e.Failures)) + "\n")
 	sb.WriteString(renderKeyValue("Start/Logoff", fmt.Sprintf("%d / %d", e.Starts, e.Logoffs)) + "\n")
 	sb.WriteString(renderKeyValue("MKA/Key", fmt.Sprintf("%d / %d", e.MKAFrames, e.KeyFrames)) + "\n")
-	return renderCard(width, sb.String())
+	return sb.String()
 }
 
 func (m DashboardModel) renderDHCPBox(snap stealth.NetworkMapSnapshot, width int) string {
+	return renderCard(width, m.dhcpContent(snap, width))
+}
+
+func (m DashboardModel) dhcpContent(snap stealth.NetworkMapSnapshot, width int) string {
 	d := snap.DHCP
 	last := "never"
 	if !d.LastSeen.IsZero() {
@@ -1027,10 +1569,14 @@ func (m DashboardModel) renderDHCPBox(snap stealth.NetworkMapSnapshot, width int
 	sb.WriteString(renderKeyValue("Router", formatIP(d.RouterIP)) + "\n")
 	sb.WriteString(renderKeyValue("Hostname", emptyText(d.Hostname)) + "\n")
 	sb.WriteString(renderKeyValue("Lease", lease) + "\n")
-	return renderCard(width, sb.String())
+	return sb.String()
 }
 
 func (m DashboardModel) renderRADIUSBox(snap stealth.NetworkMapSnapshot, width int) string {
+	return renderCard(width, m.radiusContent(snap, width))
+}
+
+func (m DashboardModel) radiusContent(snap stealth.NetworkMapSnapshot, width int) string {
 	r := snap.RADIUS
 	last := "never"
 	if !r.LastSeen.IsZero() {
@@ -1041,7 +1587,7 @@ func (m DashboardModel) renderRADIUSBox(snap stealth.NetworkMapSnapshot, width i
 	sb.WriteString(styleLabel.Render("RADIUS") + "\n")
 	if !r.Seen {
 		sb.WriteString(styleDim.Render("RADIUS traffic is not visible on this inline path unless it traverses the bridge or a mirror feed.") + "\n")
-		return renderCard(width, sb.String())
+		return sb.String()
 	}
 	sb.WriteString(renderKeyValue("Server", formatIP(r.ServerIP)) + "\n")
 	sb.WriteString(renderKeyValue("NAS", formatIP(r.NASIPAddress)) + "\n")
@@ -1060,15 +1606,19 @@ func (m DashboardModel) renderRADIUSBox(snap stealth.NetworkMapSnapshot, width i
 	sb.WriteString(renderKeyValue("Called", emptyText(r.CalledStationID)) + "\n")
 	sb.WriteString(renderKeyValue("Policy", emptyText(firstString(r.FilterID, r.ReplyMessage))) + "\n")
 	sb.WriteString(renderKeyValue("VLAN", emptyText(r.AssignedVLAN)) + "\n")
-	return renderCard(width, sb.String())
+	return sb.String()
 }
 
 func (m DashboardModel) renderRecentEventsBox(snap stealth.NetworkMapSnapshot, width int) string {
+	return renderCard(width, m.recentEventsContent(snap, width))
+}
+
+func (m DashboardModel) recentEventsContent(snap stealth.NetworkMapSnapshot, width int) string {
 	var sb strings.Builder
 	sb.WriteString(styleLabel.Render("Auth Events") + "\n")
 	if len(snap.RecentEvents) == 0 {
 		sb.WriteString(styleDim.Render("No control-plane events observed yet.") + "\n")
-		return renderCard(width, sb.String())
+		return sb.String()
 	}
 	start := 0
 	if len(snap.RecentEvents) > 8 {
@@ -1086,7 +1636,7 @@ func (m DashboardModel) renderRecentEventsBox(snap stealth.NetworkMapSnapshot, w
 			styleKey.Render(prefix) + " " +
 			styleVal.Render(trunc(ev.Summary, width-18)) + "\n")
 	}
-	return renderCard(width, sb.String())
+	return sb.String()
 }
 
 func (m DashboardModel) renderHostsBox(snap stealth.NetworkMapSnapshot, width int) string {
@@ -1111,6 +1661,10 @@ func (m DashboardModel) renderHostsBox(snap stealth.NetworkMapSnapshot, width in
 
 // renderLeftColumn renders Traffic Statistics (stacked) and Throughput sparklines.
 func (m DashboardModel) renderLeftColumn(width int) string {
+	return m.renderLeftColumnFit(width, 0)
+}
+
+func (m DashboardModel) renderLeftColumnFit(width int, maxHeight int) string {
 	var sb strings.Builder
 
 	// Traffic Statistics.
@@ -1122,7 +1676,24 @@ func (m DashboardModel) renderLeftColumn(width int) string {
 		sb.WriteString(m.renderThroughput(width))
 	}
 
-	return sb.String()
+	full := sb.String()
+	if maxHeight <= 0 || lipgloss.Height(full) <= maxHeight {
+		return full
+	}
+
+	traffic := m.renderTrafficStats(width)
+	if lipgloss.Height(traffic) <= maxHeight {
+		return traffic
+	}
+
+	compact := m.renderTrafficStatsCompact(width)
+	if m.collector != nil {
+		throughput := m.renderThroughput(width)
+		if lipgloss.Height(compact)+1+lipgloss.Height(throughput) <= maxHeight {
+			return compact + "\n" + throughput
+		}
+	}
+	return compact
 }
 
 func (m DashboardModel) renderTrafficStats(width int) string {
@@ -1168,6 +1739,30 @@ func (m DashboardModel) renderTrafficStats(width int) string {
 	return boxA + "\n" + boxB
 }
 
+func (m DashboardModel) renderTrafficStatsCompact(width int) string {
+	var s stats.StatsUpdate
+	if m.hasStats {
+		s = m.latestStats
+	}
+
+	renderIface := func(label string, d stats.InterfaceDelta, nameStyle lipgloss.Style) string {
+		raw := fmt.Sprintf("%s  RX %s  TX %s  err %d/%d",
+			label,
+			stats.HumanizeThroughput(d.RxBytesPerSec),
+			stats.HumanizeThroughput(d.TxBytesPerSec),
+			d.Stats.RxErrors,
+			d.Stats.TxErrors,
+		)
+		return nameStyle.Render(trunc(raw, width-4))
+	}
+
+	var sb strings.Builder
+	sb.WriteString(styleLabel.Render("Traffic Statistics") + "\n")
+	sb.WriteString(renderIface(m.ifaceA.Name+" device", s.IfaceA, styleIfaceNameDevice) + "\n")
+	sb.WriteString(renderIface(m.ifaceB.Name+" switch", s.IfaceB, styleIfaceNameSwitch) + "\n")
+	return renderCard(width, sb.String())
+}
+
 // renderThroughput renders sparkline graphs for both interfaces.
 func (m DashboardModel) renderThroughput(width int) string {
 	sparkWidth := width - 8
@@ -1205,10 +1800,6 @@ func (m DashboardModel) renderReconPanel(width int, targetHeight int) string {
 	}
 
 	status := m.bridge.Status()
-	// Only render if we have logs or are actively sniffing.
-	if len(status.ReconLogs) == 0 && status.State != bridge.BridgeStateSniffing && status.State != bridge.BridgeStateStealthActive {
-		return ""
-	}
 
 	outerWidth := safeWidth(width)
 	innerWidth := outerWidth - 4 // border + left/right padding
@@ -1262,9 +1853,9 @@ func (m DashboardModel) renderReconPanel(width int, targetHeight int) string {
 		BorderForeground(colorBorder).
 		Padding(0, 1).
 		Width(innerWidth).
-		MaxWidth(innerWidth).
+		MaxWidth(outerWidth).
 		Height(contentHeight).
-		MaxHeight(contentHeight).
+		MaxHeight(outerHeight).
 		Render(sb.String())
 }
 
@@ -1399,6 +1990,59 @@ func formatIPs(ips []net.IP) string {
 		return "unknown"
 	}
 	return strings.Join(parts, ", ")
+}
+
+func formatStrings(values []string) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			parts = append(parts, value)
+		}
+	}
+	if len(parts) == 0 {
+		return "unknown"
+	}
+	return strings.Join(parts, ", ")
+}
+
+func targetIPList(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot) string {
+	var targetMAC net.HardwareAddr
+	if status.TargetID != nil {
+		targetMAC = status.TargetID.MAC
+	}
+	seen := make(map[string]bool)
+	ips := make([]net.IP, 0, 4)
+	add := func(ip net.IP) {
+		if len(ip) == 0 {
+			return
+		}
+		key := ip.String()
+		if key == "" || key == "<nil>" || seen[key] {
+			return
+		}
+		seen[key] = true
+		ips = append(ips, ip)
+	}
+	if status.TargetID != nil {
+		add(status.TargetID.IP)
+	}
+	add(snap.DHCP.ACKIP)
+	add(snap.DHCP.OfferedIP)
+	for _, host := range snap.Hosts {
+		if len(targetMAC) > 0 && macEqualUI(host.MAC, targetMAC) {
+			for _, ip := range host.IPs {
+				add(ip)
+			}
+		}
+	}
+	return formatIPs(ips)
+}
+
+func formatMask(mask net.IPMask) string {
+	if len(mask) == 0 {
+		return "unknown"
+	}
+	return net.IP(mask).String()
 }
 
 func formatVLANs(vlans []uint16, radiusVLAN string) string {
@@ -1553,8 +2197,7 @@ func (m DashboardModel) renderFooter() string {
 
 	// Navigation first (left side), then actions (right side).
 	parts := []string{
-		keyHint("Tab", map[bool]string{true: "overview", false: "auth map"}[m.page == pageAuthMap]),
-		keyHint("1/2", "pages"),
+		styleKey.Render("[Tab/1/2/3]"),
 		keyHint("Esc", "back"),
 		keyHint("q", "quit"),
 	}
@@ -1577,7 +2220,7 @@ func (m DashboardModel) renderFooter() string {
 		hint(hasBridge, "M", "MACsec:"+macsecStr),
 	)
 
-	footerWidth := m.width - 2
+	footerWidth := m.width
 	if footerWidth < 1 {
 		footerWidth = 1
 	}

@@ -122,7 +122,7 @@ STOP:
 - Drop frames that do not match the learned supplicant/authenticator direction.
 - Transparent passthrough forwards EAPOL-Logoff; manual relay modes may suppress it only when explicitly used to preserve an authorized session.
 - If native bridge EAPOL suppression fails, warn that duplicate native forwarding may occur.
-- Do not actively interfere with authentication while the passive auth map is being used.
+- Do not actively interfere with authentication while the passive topology/intelligence pages are being used.
 - Do not auto-start intrusive auth actions such as EAPOL-Start injection or MACsec downgrade just because EAPOL was observed.
 - MACsec downgrade defaults off and must be operator-enabled before manual relay uses it.
 
@@ -135,19 +135,24 @@ GO:
 - Normal non-EAPOL frames continue through the kernel bridge.
 - VLAN-tagged EAPOL-Start is used only for explicit operator-triggered start injection when a VLAN context is known.
 
-## Phase 4.5: Passive Topology Map
+## Phase 4.5: Passive Topology And Intelligence Pages
 
 CHECK:
-- Dashboard page 2 renders a human topology view rather than raw protocol boxes:
+- Dashboard page 2 renders a human topology/identity view rather than raw protocol boxes:
+  - wide terminals use a single-page split: Where We Are consumes the left 2/4 of the page, while Layer 2 Detail and Layer 3 Detail stack on the right at 1/4 each
   - where goLAN sits: PC/supplicant -> device-side interface -> inline bridge -> switch-side interface -> switch/network
+  - the verbose Where We Are card includes device-side and switch-side adapter names, hardware ports, adapter MACs, factory MACs, MTU, and local addresses captured at selection time
+  - target MAC discovered from the PC side and where goLAN uses that identity: PC -> Mac, bridge interface, and switch-side adapter when the driver allows it
+  - bridge name and current bridge state
   - current target identity from MAC lock plus any DHCP/static-IP evidence
   - switchport state with the evidence that moved it forward
-  - visible VLAN tags and assigned VLAN hints when passively observed
-  - gateway, DHCP, and RADIUS visibility
+  - Layer 2 and Layer 3 detail cards carry VLAN, gateway, DHCP, RADIUS, and other visibility fields
+- Dashboard page 3 renders the remaining passive intelligence and activity:
   - cleartext credential exposure findings associated with service IP/port and protocol
   - recent IP conversations by endpoint, protocol, port, VLAN, age, and packet count
   - control-plane state for EAPOL, DHCP, and RADIUS
-  - observed hosts and recent control-plane events
+  - recent control-plane events
+- Dashboard body content must fit between the header and footer. Pages 2 and 3 can clip and scroll inside that budget instead of growing beyond the terminal height.
 
 STOP:
 - Do not assume RADIUS is visible just because a server exists. In a normal access-port topology, switch-to-RADIUS traffic is usually outside the inline bridge path.
@@ -160,7 +165,7 @@ GO:
 - In the lab, watch all passive capture points (`bridgeN`, `en12`, `en11`) because the RADIUS server is bridged on the Mac and packets may surface on a member interface rather than only on the bridge interface.
 - If RADIUS Access-Requests are visible but no Access-Accept/Reject/Challenge returns to the switch, treat it as a RADIUS reachability or return-path problem, not as successful authentication.
 - If `192.168.1.157` RADIUS packets traverse any watched capture point, parse RADIUS Access-Accept/Reject/Challenge, NAS, calling station, called station, filter, reply message, and Tunnel-Private-Group-ID.
-- Never display password, CHAP, or raw EAP-Message payloads as credentials.
+- Do not display RADIUS CHAP or raw EAP-Message payloads as cleartext credentials.
 - Flag cleartext HTTP, FTP, SMTP, IMAP, POP3, LDAP simple bind, IRC, and SNMP community exposure when it appears naturally on the bridged path.
 - Use the topology map as the main lab truth source before building real-world takeover logic.
 

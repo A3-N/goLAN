@@ -1,9 +1,12 @@
 package tui
 
 import (
+	"math/rand"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // viewState tracks which view is currently active.
@@ -22,6 +25,9 @@ type Model struct {
 	width     int
 	height    int
 	quitting  bool
+
+	shutdownFrame  int
+	shutdownPhrase int
 }
 
 // NewModel creates the root application model.
@@ -38,8 +44,25 @@ func (m Model) Init() tea.Cmd {
 
 type teardownDoneMsg struct{}
 type returnToSelectorMsg struct{}
+type shutdownTickMsg struct {
+	phrase int
+}
 
-const dashboardShutdownTimeout = 20 * time.Second
+const (
+	dashboardShutdownTimeout = 20 * time.Second
+	shutdownTickInterval     = 120 * time.Millisecond
+)
+
+var (
+	shutdownFrames  = []string{"|", "/", "-", "\\"}
+	shutdownPhrases = []string{
+		"Restoring interface state",
+		"Removing bridge members",
+		"Flushing NAT and bridge rules",
+		"Waiting for cleanup hooks",
+		"Returning adapters to baseline",
+	}
+)
 
 func dashboardShutdownCmd(dashboard DashboardModel, next tea.Msg) tea.Cmd {
 	return func() tea.Msg {
@@ -57,6 +80,18 @@ func dashboardShutdownCmd(dashboard DashboardModel, next tea.Msg) tea.Cmd {
 	}
 }
 
+func shutdownTickCmd() tea.Cmd {
+	return tea.Tick(shutdownTickInterval, func(time.Time) tea.Msg {
+		return shutdownTickMsg{
+			phrase: rand.Intn(len(shutdownPhrases)),
+		}
+	})
+}
+
+func shutdownCmd(dashboard DashboardModel, next tea.Msg) tea.Cmd {
+	return tea.Batch(dashboardShutdownCmd(dashboard, next), shutdownTickCmd())
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case teardownDoneMsg:
@@ -68,7 +103,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.selector.width = m.width
 		m.selector.height = m.height
 		m.quitting = false
+		m.shutdownFrame = 0
+		m.shutdownPhrase = 0
 		return m, m.selector.Init()
+
+	case shutdownTickMsg:
+		if !m.quitting {
+			return m, nil
+		}
+		m.shutdownFrame++
+		m.shutdownPhrase = msg.phrase
+		return m, shutdownTickCmd()
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -78,7 +123,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.quitting = true
 			if m.view == viewDashboard {
-				return m, dashboardShutdownCmd(m.dashboard, teardownDoneMsg{})
+				return m, shutdownCmd(m.dashboard, teardownDoneMsg{})
 			}
 			return m, tea.Quit
 		case "esc":
@@ -92,7 +137,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.view == viewDashboard {
 				// Esc on dashboard = tear down bridge asynchronously, then go back to selector.
 				m.quitting = true // Show "shutting down" while teardown runs
-				return m, dashboardShutdownCmd(m.dashboard, returnToSelectorMsg{})
+				return m, shutdownCmd(m.dashboard, returnToSelectorMsg{})
 			}
 		}
 
@@ -136,7 +181,7 @@ func (m Model) updateDashboard(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) View() string {
 	if m.quitting {
-		return styleDim.Render("\n  Shutting down bridge and restoring settings...\n\n")
+		return m.renderShutdownView()
 	}
 
 	switch m.view {
@@ -147,4 +192,49 @@ func (m Model) View() string {
 	default:
 		return ""
 	}
+}
+
+func (m Model) renderShutdownView() string {
+	frame := shutdownFrames[m.shutdownFrame%len(shutdownFrames)]
+	phrase := shutdownPhrases[m.shutdownPhrase%len(shutdownPhrases)]
+	dots := shutdownDots(m.shutdownFrame)
+
+	line := styleWarning.Render(frame) + " " +
+		styleVal.Render("Shutting down bridge and restoring settings") +
+		styleDim.Render(dots)
+	detail := styleDim.Render(phrase + "...")
+
+	body := line + "\n" + detail
+	if m.width <= 0 || m.height <= 0 {
+		return "\n  " + body + "\n\n"
+	}
+
+	boxWidth := m.width - 4
+	if boxWidth > 64 {
+		boxWidth = 64
+	}
+	if boxWidth < 36 {
+		boxWidth = m.width
+	}
+	if boxWidth < 1 {
+		boxWidth = 1
+	}
+	contentWidth := boxWidth - 2
+	if contentWidth < 1 {
+		contentWidth = 1
+	}
+
+	panel := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorBorder).
+		Padding(0, 1).
+		Width(contentWidth).
+		MaxWidth(boxWidth).
+		Render(body)
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
+}
+
+func shutdownDots(frame int) string {
+	return strings.Repeat(".", (frame+1)%4)
 }

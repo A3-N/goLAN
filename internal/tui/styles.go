@@ -17,8 +17,8 @@ var (
 	colorSelected  = lipgloss.Color("#12293d")
 
 	// Port identity colors — NOT blue/green/red (those are reserved).
-	colorDevice = lipgloss.Color("#ff9100") // Orange — Device port
-	colorSwitch = lipgloss.Color("#e040fb") // Magenta — Switch port
+	colorDevice   = lipgloss.Color("#ff9100") // Orange — Device port
+	colorSwitch   = lipgloss.Color("#e040fb") // Magenta — Switch port
 	colorConflict = lipgloss.Color("#ff1744") // Red — both on same row
 	color802dot1X = lipgloss.Color("#7c4dff") // Purple — 802.1X indicators
 	colorReady    = lipgloss.Color("#ffab40") // Amber — ready for action
@@ -164,10 +164,10 @@ var (
 			Padding(0, 1)
 
 	styleSparkDevice = lipgloss.NewStyle().
-			Foreground(colorDevice)
+				Foreground(colorDevice)
 
 	styleSparkSwitch = lipgloss.NewStyle().
-			Foreground(colorSwitch)
+				Foreground(colorSwitch)
 
 	styleBridgeWire = lipgloss.NewStyle().
 			Foreground(colorAccent).
@@ -178,8 +178,8 @@ var (
 				Bold(true)
 
 	styleBridgeLabel = lipgloss.NewStyle().
-			Foreground(colorDim).
-			Italic(true)
+				Foreground(colorDim).
+				Italic(true)
 
 	styleLabelCol = lipgloss.NewStyle().
 			Foreground(colorDim).
@@ -194,10 +194,9 @@ var (
 
 var (
 	styleFooter = lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder(), true, false, false, false).
-			BorderForeground(colorBorder).
-			Padding(0, 1).
-			MarginTop(1)
+		Border(lipgloss.NormalBorder(), true, false, false, false).
+		BorderForeground(colorBorder).
+		Padding(0, 1)
 )
 
 // keyHint renders a key hint like "[R] Random".
