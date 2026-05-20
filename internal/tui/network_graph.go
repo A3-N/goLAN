@@ -31,7 +31,7 @@ type networkNode struct {
 	MAC       string
 	IPs       []string
 	Names     []string
-	Note      string
+	Tags      []string
 	PktCount  uint64
 	FirstSeen time.Time
 	LastSeen  time.Time
@@ -46,6 +46,7 @@ type networkEdge struct {
 	VLANID   uint16
 	Packets  uint64
 	LastSeen time.Time
+	Creds    []string
 }
 
 const topologyLinkPrefix = "──"
@@ -85,10 +86,6 @@ func (m DashboardModel) renderNodeDetailPageContent(width, maxHeight int) string
 func (m DashboardModel) buildNetworkGraph(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot) networkGraph {
 	nodes := make(map[string]networkNode)
 	edges := make(map[string]networkEdge)
-	session := SessionData{}
-	if m.session != nil {
-		session = m.session.Snapshot()
-	}
 
 	addNode := func(node networkNode) {
 		if strings.TrimSpace(node.Key) == "" {
@@ -103,14 +100,12 @@ func (m DashboardModel) buildNetworkGraph(status bridge.BridgeStatus, snap steal
 			existing.MAC = firstNonUnknown(existing.MAC, node.MAC)
 			existing.IPs = appendUniqueStrings(existing.IPs, node.IPs...)
 			existing.Names = appendUniqueStrings(existing.Names, node.Names...)
+			existing.Tags = appendUniqueStrings(existing.Tags, node.Tags...)
 			if node.PktCount > existing.PktCount {
 				existing.PktCount = node.PktCount
 			}
 			existing.FirstSeen = minTime(existing.FirstSeen, node.FirstSeen)
 			existing.LastSeen = maxTime(existing.LastSeen, node.LastSeen)
-		}
-		if note := session.Notes[node.Key]; note != "" {
-			existing.Note = note
 		}
 		nodes[node.Key] = existing
 	}
@@ -127,6 +122,7 @@ func (m DashboardModel) buildNetworkGraph(status bridge.BridgeStatus, snap steal
 				existing.Packets = edge.Packets
 			}
 			existing.LastSeen = maxTime(existing.LastSeen, edge.LastSeen)
+			existing.Creds = appendUniqueStrings(existing.Creds, edge.Creds...)
 		}
 		edges[key] = existing
 	}
@@ -137,55 +133,38 @@ func (m DashboardModel) buildNetworkGraph(status bridge.BridgeStatus, snap steal
 		switchKey = hostKey(formatMAC(snap.EAPOL.AuthenticatorMAC), "")
 	}
 	localIPs := nonUnknownStrings(status.NATHiddenIP)
-	localNames := []string{"operator"}
+	localNames := []string{"operator access"}
+	localTags := []string{"mitm", "operator"}
 	if status.NATActive && status.NATAnchorMode != "" {
-		localNames = append(localNames, status.NATAnchorMode+" NAT")
+		localNames = append(localNames, status.NATAnchorMode+" NAT anchor")
+		localTags = append(localTags, "nat:"+status.NATAnchorMode)
+		if status.NATAnchorEvidence != "" {
+			localTags = append(localTags, status.NATAnchorEvidence)
+		}
+	} else {
+		localNames = append(localNames, "operator IP not assigned")
 	}
-	localMAC := ""
 	if status.TargetID != nil && len(status.TargetID.MAC) > 0 {
-		localMAC = formatMAC(status.TargetID.MAC)
+		localNames = append(localNames, "switch-side MAC "+formatMAC(status.TargetID.MAC))
 	}
-	addNode(networkNode{Key: localKey, Kind: "local", Label: "goLAN", MAC: localMAC, IPs: localIPs, Names: localNames})
+	addNode(networkNode{Key: localKey, Kind: "local", Label: "goLAN", IPs: localIPs, Names: localNames, Tags: localTags})
 	addNode(networkNode{Key: switchKey, Kind: "switch", Label: "Observed network", MAC: formatMAC(snap.EAPOL.AuthenticatorMAC), Names: nonUnknownStrings(status.IfaceB)})
 	addEdge(networkEdge{SrcKey: localKey, DstKey: switchKey, Protocol: "inline"})
 
 	targetKey := ""
 	if status.TargetID != nil {
-		targetKey = hostKey(formatMAC(status.TargetID.MAC), formatIP(status.TargetID.IP))
+		targetIPs := ipStringCandidates(targetIPCandidates(status, snap))
+		targetKey = hostKey(formatMAC(status.TargetID.MAC), firstNonEmpty(targetIPs...))
 		addNode(networkNode{
 			Key:   targetKey,
 			Kind:  "target",
 			Label: "PC / supplicant",
 			MAC:   formatMAC(status.TargetID.MAC),
-			IPs:   nonUnknownStrings(formatIP(firstIP(status.TargetID.IP, snap.DHCP.ACKIP, snap.DHCP.OfferedIP))),
+			IPs:   targetIPs,
+			Names: []string{"downstream supplicant"},
+			Tags:  []string{"pc-ip", "target-identity"},
 		})
 		addEdge(networkEdge{SrcKey: targetKey, DstKey: switchKey, Protocol: "L2"})
-	}
-
-	for _, host := range session.Hosts {
-		addNode(networkNode{
-			Key:       host.Key,
-			Kind:      host.Kind,
-			Label:     host.Label,
-			MAC:       host.MAC,
-			IPs:       host.IPs,
-			Names:     host.Names,
-			PktCount:  host.PktCount,
-			FirstSeen: host.FirstSeen,
-			LastSeen:  host.LastSeen,
-		})
-	}
-	for _, edge := range session.Edges {
-		addEdge(networkEdge{
-			SrcKey:   edge.SrcKey,
-			DstKey:   edge.DstKey,
-			Protocol: edge.Protocol,
-			SrcPort:  edge.SrcPort,
-			DstPort:  edge.DstPort,
-			VLANID:   edge.VLANID,
-			Packets:  edge.Packets,
-			LastSeen: edge.LastSeen,
-		})
 	}
 
 	for _, host := range snap.Hosts {
@@ -204,6 +183,48 @@ func (m DashboardModel) buildNetworkGraph(status bridge.BridgeStatus, snap steal
 		addEdge(networkEdge{SrcKey: switchKey, DstKey: key, Protocol: "L2", Packets: host.PktCount, LastSeen: host.LastSeen})
 	}
 
+	for _, signal := range snap.HostSignals {
+		ips := nonUnknownStrings(formatIP(signal.IP))
+		key := hostKey(formatMAC(signal.MAC), firstNonEmpty(ips...))
+		if key == "" {
+			continue
+		}
+		tags := signalNodeTags(signal)
+		addNode(networkNode{
+			Key:      key,
+			Kind:     classifyHostKind(ips),
+			Label:    classifyHostKind(ips),
+			MAC:      formatMAC(signal.MAC),
+			IPs:      ips,
+			Names:    signalNodeNames(signal),
+			Tags:     tags,
+			PktCount: signal.Count,
+			LastSeen: signal.LastSeen,
+		})
+		addEdge(networkEdge{SrcKey: switchKey, DstKey: key, Protocol: "L2", Packets: signal.Count, LastSeen: signal.LastSeen})
+	}
+
+	for _, event := range snap.RecentEvents {
+		if event.Kind != "LLDP" && event.Kind != "CDP" {
+			continue
+		}
+		key := hostKey(formatMAC(event.SrcMAC), formatIP(event.SrcIP))
+		if key == "" {
+			continue
+		}
+		addNode(networkNode{
+			Key:      key,
+			Kind:     "network",
+			Label:    "network device",
+			MAC:      formatMAC(event.SrcMAC),
+			IPs:      nonUnknownStrings(formatIP(event.SrcIP)),
+			Names:    nonUnknownStrings(event.Summary),
+			Tags:     []string{strings.ToLower(event.Kind), "l2-discovery"},
+			LastSeen: event.Timestamp,
+		})
+		addEdge(networkEdge{SrcKey: switchKey, DstKey: key, Protocol: event.Kind, VLANID: event.VLANID, LastSeen: event.Timestamp})
+	}
+
 	for _, dns := range snap.DNSLog {
 		for _, response := range dns.Response {
 			key := hostKey("", response)
@@ -212,23 +233,59 @@ func (m DashboardModel) buildNetworkGraph(status bridge.BridgeStatus, snap steal
 	}
 	if len(snap.Gateway.IP) > 0 || len(snap.Gateway.MAC) > 0 {
 		key := hostKey(formatMAC(snap.Gateway.MAC), formatIP(snap.Gateway.IP))
-		addNode(networkNode{Key: key, Kind: "gateway", Label: "gateway", MAC: formatMAC(snap.Gateway.MAC), IPs: nonUnknownStrings(formatIP(snap.Gateway.IP)), PktCount: snap.Gateway.PktCount})
+		addNode(networkNode{Key: key, Kind: "gateway", Label: "gateway/router", MAC: formatMAC(snap.Gateway.MAC), IPs: nonUnknownStrings(formatIP(snap.Gateway.IP)), Tags: []string{"default-gateway", "router", "arp-heavy"}, PktCount: snap.Gateway.PktCount})
 		addEdge(networkEdge{SrcKey: switchKey, DstKey: key, Protocol: "L2", Packets: snap.Gateway.PktCount})
 	}
+	if len(snap.DHCP.RouterIP) > 0 {
+		key := hostKey("", formatIP(snap.DHCP.RouterIP))
+		addNode(networkNode{Key: key, Kind: "gateway", Label: "gateway/router", IPs: []string{formatIP(snap.DHCP.RouterIP)}, Tags: []string{"default-gateway", "dhcp-router"}, LastSeen: snap.DHCP.LastSeen})
+		addEdge(networkEdge{SrcKey: switchKey, DstKey: key, Protocol: "DHCP-ROUTER", LastSeen: snap.DHCP.LastSeen})
+	}
+	dhcpServerKey := ""
 	if len(snap.DHCP.ServerIP) > 0 {
-		key := hostKey("", formatIP(snap.DHCP.ServerIP))
-		addNode(networkNode{Key: key, Kind: "dhcp", Label: "DHCP", IPs: []string{formatIP(snap.DHCP.ServerIP)}, LastSeen: snap.DHCP.LastSeen})
+		dhcpServerKey = hostKey("", formatIP(snap.DHCP.ServerIP))
+		addNode(networkNode{Key: dhcpServerKey, Kind: "dhcp", Label: "DHCP server", IPs: []string{formatIP(snap.DHCP.ServerIP)}, Tags: []string{"dhcp-server", "udp/67", "offers/acks", "lease/router/netmask"}, LastSeen: snap.DHCP.LastSeen})
+		addEdge(networkEdge{SrcKey: switchKey, DstKey: dhcpServerKey, Protocol: "DHCP-SERVER", LastSeen: snap.DHCP.LastSeen})
 		if targetKey != "" {
-			addEdge(networkEdge{SrcKey: key, DstKey: targetKey, Protocol: "DHCP", SrcPort: 67, DstPort: 68, LastSeen: snap.DHCP.LastSeen})
+			addEdge(networkEdge{SrcKey: dhcpServerKey, DstKey: targetKey, Protocol: "DHCP", SrcPort: 67, DstPort: 68, LastSeen: snap.DHCP.LastSeen})
+		}
+	}
+	for _, leaseIP := range ipStringCandidates([]net.IP{snap.DHCP.ACKIP, snap.DHCP.OfferedIP}) {
+		key := hostKey("", leaseIP)
+		addNode(networkNode{Key: key, Kind: "host", Label: "DHCP lease", IPs: []string{leaseIP}, Tags: []string{"dhcp-lease"}, LastSeen: snap.DHCP.LastSeen})
+		if dhcpServerKey != "" {
+			addEdge(networkEdge{SrcKey: dhcpServerKey, DstKey: key, Protocol: "DHCP", SrcPort: 67, DstPort: 68, LastSeen: snap.DHCP.LastSeen})
+		} else {
+			addEdge(networkEdge{SrcKey: switchKey, DstKey: key, Protocol: "DHCP-LEASE", LastSeen: snap.DHCP.LastSeen})
+		}
+	}
+	dnsEvidence := dnsServerEvidence(snap)
+	for _, dnsIP := range dnsServerCandidates(snap) {
+		ip := formatIP(dnsIP)
+		key := hostKey("", ip)
+		tags := appendUniqueStrings([]string{"dns-server", "name-resolution"}, dnsEvidence[ip]...)
+		lastSeen := dnsServerLastSeen(snap, dnsIP)
+		addNode(networkNode{Key: key, Kind: "dns", Label: "DNS server", IPs: []string{ip}, Tags: tags, LastSeen: lastSeen})
+		tagMap := tagSet(tags)
+		if tagMap["dhcp-option-6"] {
+			addEdge(networkEdge{SrcKey: switchKey, DstKey: key, Protocol: "DHCP-DNS", DstPort: 53, LastSeen: maxTime(snap.DHCP.LastSeen, lastSeen)})
+		}
+		if tagMap["dns-conversation"] || tagMap["dns-query-dst"] || tagMap["dns-response-src"] {
+			addEdge(networkEdge{SrcKey: switchKey, DstKey: key, Protocol: "DNS-EVIDENCE", DstPort: 53, LastSeen: lastSeen})
 		}
 	}
 	if len(snap.RADIUS.ServerIP) > 0 {
 		server := hostKey("", formatIP(snap.RADIUS.ServerIP))
 		client := hostKey("", formatIP(snap.RADIUS.ClientIP))
-		addNode(networkNode{Key: server, Kind: "radius", Label: "RADIUS", IPs: []string{formatIP(snap.RADIUS.ServerIP)}, LastSeen: snap.RADIUS.LastSeen})
+		addNode(networkNode{Key: server, Kind: "radius", Label: "RADIUS server", IPs: []string{formatIP(snap.RADIUS.ServerIP)}, Tags: []string{"radius-server", "udp/1812", "aaa", "nac-control-plane"}, LastSeen: snap.RADIUS.LastSeen})
 		if client != "" {
-			addNode(networkNode{Key: client, Kind: "nas", Label: "NAS", IPs: []string{formatIP(snap.RADIUS.ClientIP)}, LastSeen: snap.RADIUS.LastSeen})
+			addNode(networkNode{Key: client, Kind: "nas", Label: "NAS / RADIUS client", IPs: []string{formatIP(snap.RADIUS.ClientIP)}, Tags: []string{"radius-client", "nas", "switch-control-plane"}, LastSeen: snap.RADIUS.LastSeen})
 			addEdge(networkEdge{SrcKey: client, DstKey: server, Protocol: "RADIUS", DstPort: 1812, LastSeen: snap.RADIUS.LastSeen})
+		}
+		if len(snap.RADIUS.NASIPAddress) > 0 {
+			nas := hostKey("", formatIP(snap.RADIUS.NASIPAddress))
+			addNode(networkNode{Key: nas, Kind: "nas", Label: "NAS / RADIUS client", IPs: []string{formatIP(snap.RADIUS.NASIPAddress)}, Tags: []string{"radius-client", "nas", "switch-control-plane"}, LastSeen: snap.RADIUS.LastSeen})
+			addEdge(networkEdge{SrcKey: nas, DstKey: server, Protocol: "RADIUS", DstPort: 1812, LastSeen: snap.RADIUS.LastSeen})
 		}
 	}
 
@@ -244,14 +301,22 @@ func (m DashboardModel) buildNetworkGraph(status bridge.BridgeStatus, snap steal
 		dst := hostKey("", formatIP(finding.ServiceIP))
 		addNode(networkNode{Key: src, Kind: classifyHostKind([]string{formatIP(finding.SrcIP)}), Label: "client", IPs: nonUnknownStrings(formatIP(finding.SrcIP)), LastSeen: finding.LastSeen})
 		addNode(networkNode{Key: dst, Kind: "service", Label: finding.Service, IPs: nonUnknownStrings(formatIP(finding.ServiceIP)), Names: nonUnknownStrings(finding.Host), LastSeen: finding.LastSeen})
-		addEdge(networkEdge{SrcKey: src, DstKey: dst, Protocol: finding.Service, DstPort: finding.ServicePort, VLANID: finding.VLANID, Packets: uint64(finding.Count), LastSeen: finding.LastSeen})
+		addEdge(networkEdge{SrcKey: src, DstKey: dst, Protocol: finding.Service, DstPort: finding.ServicePort, VLANID: finding.VLANID, Packets: uint64(finding.Count), LastSeen: finding.LastSeen, Creds: []string{credentialEdgeLabel(finding)}})
 	}
 
 	list := make([]networkNode, 0, len(nodes))
 	for _, node := range nodes {
-		node.Note = firstNonEmpty(node.Note, session.Notes[node.Key])
 		list = append(list, node)
 	}
+	list = tagNetworkNodesByIPScope(list)
+	edgeList := make([]networkEdge, 0, len(edges))
+	for _, edge := range edges {
+		edgeList = append(edgeList, edge)
+	}
+	aliasByKey := map[string]string{}
+	list, edgeList, aliasByKey = canonicalizeNetworkGraphAliases(list, edgeList)
+	edgeList = annotateCredentialEdges(edgeList, list, snap.CredentialExposures)
+	list = inferNetworkNodeRoles(list, edgeList, status, snap)
 	sort.Slice(list, func(i, j int) bool {
 		ri, rj := nodeRank(list[i].Kind), nodeRank(list[j].Kind)
 		if ri != rj {
@@ -259,10 +324,6 @@ func (m DashboardModel) buildNetworkGraph(status bridge.BridgeStatus, snap steal
 		}
 		return nodeTitle(list[i]) < nodeTitle(list[j])
 	})
-	edgeList := make([]networkEdge, 0, len(edges))
-	for _, edge := range edges {
-		edgeList = append(edgeList, edge)
-	}
 	sort.Slice(edgeList, func(i, j int) bool {
 		if edgeList[i].LastSeen.Equal(edgeList[j].LastSeen) {
 			return edgeList[i].Packets > edgeList[j].Packets
@@ -271,8 +332,9 @@ func (m DashboardModel) buildNetworkGraph(status bridge.BridgeStatus, snap steal
 	})
 
 	selected := 0
+	selectedKey := firstNonEmpty(aliasByKey[m.selectedNodeKey], m.selectedNodeKey)
 	for i, node := range list {
-		if node.Key == m.selectedNodeKey {
+		if node.Key == selectedKey {
 			selected = i
 			break
 		}
@@ -287,6 +349,235 @@ func (m DashboardModel) buildNetworkGraph(status bridge.BridgeStatus, snap steal
 		},
 	}
 	return filterNetworkGraph(graph)
+}
+
+func canonicalizeNetworkGraphAliases(nodes []networkNode, edges []networkEdge) ([]networkNode, []networkEdge, map[string]string) {
+	parent := make(map[string]string, len(nodes))
+	byIP := make(map[string]string)
+	byMAC := make(map[string]string)
+
+	find := func(key string) string {
+		if key == "" {
+			return ""
+		}
+		if parent[key] == "" {
+			parent[key] = key
+			return key
+		}
+		root := key
+		for parent[root] != root {
+			root = parent[root]
+		}
+		for parent[key] != key {
+			next := parent[key]
+			parent[key] = root
+			key = next
+		}
+		return root
+	}
+	union := func(a, b string) {
+		ra, rb := find(a), find(b)
+		if ra == "" || rb == "" || ra == rb {
+			return
+		}
+		parent[rb] = ra
+	}
+
+	for _, node := range nodes {
+		if !nodeAliasMergeEligible(node) {
+			continue
+		}
+		find(node.Key)
+		for _, ip := range node.IPs {
+			if parsed := net.ParseIP(ip); parsed != nil {
+				key := parsed.String()
+				if existing := byIP[key]; existing != "" {
+					union(existing, node.Key)
+				} else {
+					byIP[key] = node.Key
+				}
+			}
+		}
+		if node.MAC != "" && node.MAC != "unknown" {
+			key := strings.ToLower(node.MAC)
+			if existing := byMAC[key]; existing != "" {
+				union(existing, node.Key)
+			} else {
+				byMAC[key] = node.Key
+			}
+		}
+	}
+
+	groups := make(map[string][]networkNode)
+	aliasByKey := make(map[string]string, len(nodes))
+	for _, node := range nodes {
+		root := node.Key
+		if nodeAliasMergeEligible(node) {
+			root = find(node.Key)
+		}
+		groups[root] = append(groups[root], node)
+	}
+
+	mergedByRoot := make(map[string]networkNode, len(groups))
+	for root, group := range groups {
+		canonicalKey := preferredCanonicalNodeKey(group)
+		merged := networkNode{Key: canonicalKey}
+		for _, node := range group {
+			aliasByKey[node.Key] = canonicalKey
+			merged = mergeNetworkNode(merged, node)
+		}
+		merged.Key = canonicalKey
+		mergedByRoot[root] = merged
+	}
+
+	outNodes := make([]networkNode, 0, len(mergedByRoot))
+	for _, node := range mergedByRoot {
+		outNodes = append(outNodes, node)
+	}
+
+	edgeMap := make(map[string]networkEdge, len(edges))
+	for _, edge := range edges {
+		edge.SrcKey = firstNonEmpty(aliasByKey[edge.SrcKey], edge.SrcKey)
+		edge.DstKey = firstNonEmpty(aliasByKey[edge.DstKey], edge.DstKey)
+		if edge.SrcKey == "" || edge.DstKey == "" || edge.SrcKey == edge.DstKey {
+			continue
+		}
+		key := edgeKey(edge.SrcKey, edge.DstKey, edge.Protocol, edge.SrcPort, edge.DstPort, edge.VLANID)
+		existing := edgeMap[key]
+		if existing.SrcKey == "" {
+			edge.Creds = appendUniqueStrings(nil, edge.Creds...)
+			edgeMap[key] = edge
+			continue
+		}
+		if edge.Packets > existing.Packets {
+			existing.Packets = edge.Packets
+		}
+		existing.LastSeen = maxTime(existing.LastSeen, edge.LastSeen)
+		existing.Creds = appendUniqueStrings(existing.Creds, edge.Creds...)
+		edgeMap[key] = existing
+	}
+	outEdges := make([]networkEdge, 0, len(edgeMap))
+	for _, edge := range edgeMap {
+		outEdges = append(outEdges, edge)
+	}
+
+	return outNodes, outEdges, aliasByKey
+}
+
+func signalNodeTags(signal stealth.HostSignalSummary) []string {
+	tags := appendUniqueStrings([]string{"signal:" + strings.ToLower(strings.TrimSpace(signal.Kind))}, signal.Tags...)
+	value := strings.ToLower(strings.TrimSpace(signal.Value))
+	switch signal.Kind {
+	case "oui":
+		if value != "" {
+			tags = appendUniqueString(tags, "oui")
+		}
+	case "cdp", "lldp":
+		tags = appendUniqueStrings(tags, strings.ToLower(signal.Kind), "l2-discovery", "network-discovery")
+	case "ssh-banner":
+		tags = appendUniqueStrings(tags, "ssh", "server-banner")
+	case "http-host", "http-server":
+		tags = appendUniqueStrings(tags, "http", "web")
+	case "tls-sni":
+		tags = appendUniqueStrings(tags, "tls", "sni", "web")
+	case "ssdp-server", "ssdp-type":
+		tags = appendUniqueStrings(tags, "ssdp", "upnp")
+	case "ws-discovery":
+		tags = appendUniqueStrings(tags, "ws-discovery", "windows")
+	case "llmnr", "netbios":
+		tags = appendUniqueStrings(tags, "windows-name-resolution", "windows")
+	case "dns-name", "dhcp-hostname":
+		tags = appendUniqueString(tags, "name-evidence")
+	}
+	return tags
+}
+
+func signalNodeNames(signal stealth.HostSignalSummary) []string {
+	value := strings.TrimSpace(signal.Value)
+	if value == "" {
+		return nil
+	}
+	switch signal.Kind {
+	case "dns-name", "dhcp-hostname", "http-host", "tls-sni":
+		return []string{value}
+	case "cdp", "lldp":
+		return nonUnknownStrings(l2SignalField(value, "sys"))
+	default:
+		return nil
+	}
+}
+
+func l2SignalField(value string, field string) string {
+	value = strings.TrimSpace(value)
+	field = strings.TrimSpace(field)
+	if value == "" || field == "" {
+		return ""
+	}
+	prefix := field + "="
+	idx := strings.Index(value, prefix)
+	if idx < 0 {
+		return ""
+	}
+	start := idx + len(prefix)
+	end := len(value)
+	for _, marker := range []string{" sys=", " port=", " mgmt=", " caps=", " desc=", " platform=", " version=", " native-vlan="} {
+		if markerIdx := strings.Index(value[start:], marker); markerIdx >= 0 && start+markerIdx < end {
+			end = start + markerIdx
+		}
+	}
+	return strings.TrimSpace(value[start:end])
+}
+
+func nodeAliasMergeEligible(node networkNode) bool {
+	if node.Key == "" || strings.HasPrefix(node.Key, "local:") {
+		return false
+	}
+	return true
+}
+
+func preferredCanonicalNodeKey(nodes []networkNode) string {
+	best := ""
+	bestRank := -1
+	for _, node := range nodes {
+		rank := 0
+		switch {
+		case node.Kind == "target":
+			rank = 100
+		case node.Kind == "switch":
+			rank = 90
+		case strings.HasPrefix(node.Key, "mac:"):
+			rank = 80
+		case node.Kind == "gateway" || node.Kind == "dhcp" || node.Kind == "radius" || node.Kind == "nas":
+			rank = 70
+		case strings.HasPrefix(node.Key, "ip:"):
+			rank = 60
+		default:
+			rank = 10
+		}
+		if rank > bestRank || (rank == bestRank && (best == "" || node.Key < best)) {
+			best = node.Key
+			bestRank = rank
+		}
+	}
+	return best
+}
+
+func mergeNetworkNode(existing, node networkNode) networkNode {
+	if existing.Key == "" {
+		existing.Key = node.Key
+	}
+	existing.Kind = preferKind(existing.Kind, node.Kind)
+	existing.Label = firstNonEmpty(existing.Label, node.Label)
+	existing.MAC = firstNonUnknown(existing.MAC, node.MAC)
+	existing.IPs = appendUniqueStrings(existing.IPs, node.IPs...)
+	existing.Names = appendUniqueStrings(existing.Names, node.Names...)
+	existing.Tags = appendUniqueStrings(existing.Tags, node.Tags...)
+	if node.PktCount > existing.PktCount {
+		existing.PktCount = node.PktCount
+	}
+	existing.FirstSeen = minTime(existing.FirstSeen, node.FirstSeen)
+	existing.LastSeen = maxTime(existing.LastSeen, node.LastSeen)
+	return existing
 }
 
 func (g networkGraph) selectedNode() networkNode {
@@ -344,18 +635,22 @@ func filterNetworkGraph(graph networkGraph) networkGraph {
 	if !graph.Filters.ShowLAN && !graph.Filters.ShowWAN {
 		graph.Filters.ShowLAN = true
 	}
+	graph.Nodes = sanitizeNetworkGraphNodes(graph.Nodes)
 
 	nodeByKey := make(map[string]networkNode, len(graph.Nodes))
 	visibleNodes := make(map[string]bool, len(graph.Nodes))
 	for _, node := range graph.Nodes {
 		nodeByKey[node.Key] = node
-		if isAnchorNode(node) {
+		if isAlwaysVisibleNode(node) || (isAnchorNode(node) && nodeVisibleInTrafficMode(node, graph.Filters)) {
 			visibleNodes[node.Key] = true
 		}
 	}
 
 	visibleEdges := make([]networkEdge, 0, len(graph.Edges))
 	for _, edge := range graph.Edges {
+		if edgeHasSuppressedSpecial(edge, nodeByKey) {
+			continue
+		}
 		external := edgeIsExternal(edge, nodeByKey)
 		if (external && !graph.Filters.ShowWAN) || (!external && !graph.Filters.ShowLAN) {
 			continue
@@ -385,7 +680,63 @@ func filterNetworkGraph(graph networkGraph) networkGraph {
 	return graph
 }
 
-func isAnchorNode(node networkNode) bool {
+func sanitizeNetworkGraphNodes(nodes []networkNode) []networkNode {
+	out := make([]networkNode, 0, len(nodes))
+	for _, node := range nodes {
+		filteredIPs := make([]string, 0, len(node.IPs))
+		for _, ip := range node.IPs {
+			if ipStringIsSuppressedSpecial(ip) {
+				continue
+			}
+			filteredIPs = appendUniqueString(filteredIPs, ip)
+		}
+		node.IPs = filteredIPs
+		if keyLooksSuppressedSpecial(node.Key) && len(node.IPs) == 0 && !isAlwaysVisibleNode(node) {
+			continue
+		}
+		out = append(out, node)
+	}
+	return out
+}
+
+func tagNetworkNodesByIPScope(nodes []networkNode) []networkNode {
+	out := append([]networkNode(nil), nodes...)
+	for i := range out {
+		tags := out[i].Tags
+		seenPrivate := false
+		seenSpecial := false
+		seenWAN := false
+		for _, value := range out[i].IPs {
+			scopeTags := ipScopeTags(value)
+			if len(scopeTags) == 0 {
+				continue
+			}
+			tags = appendUniqueStrings(tags, scopeTags...)
+			scopeSet := tagSet(scopeTags)
+			seenPrivate = seenPrivate || scopeSet["ip:rfc1918"]
+			seenSpecial = seenSpecial || scopeSet["scope:special"]
+			seenWAN = seenWAN || scopeSet["scope:wan"]
+		}
+		if ip := ipFromHostKey(out[i].Key); ip != "" {
+			scopeTags := ipScopeTags(ip)
+			tags = appendUniqueStrings(tags, scopeTags...)
+			scopeSet := tagSet(scopeTags)
+			seenPrivate = seenPrivate || scopeSet["ip:rfc1918"]
+			seenSpecial = seenSpecial || scopeSet["scope:special"]
+			seenWAN = seenWAN || scopeSet["scope:wan"]
+		}
+		if seenPrivate && seenSpecial {
+			tags = appendUniqueStrings(tags, "ip:mixed-private-special")
+		}
+		if seenPrivate && seenWAN {
+			tags = appendUniqueStrings(tags, "ip:mixed-lan-wan")
+		}
+		out[i].Tags = tags
+	}
+	return out
+}
+
+func isAlwaysVisibleNode(node networkNode) bool {
 	switch node.Kind {
 	case "local", "switch", "target":
 		return true
@@ -394,8 +745,34 @@ func isAnchorNode(node networkNode) bool {
 	}
 }
 
+func isAnchorNode(node networkNode) bool {
+	switch node.Kind {
+	case "gateway", "dhcp", "dns", "radius", "nas":
+		return true
+	default:
+		return false
+	}
+}
+
+func nodeVisibleInTrafficMode(node networkNode, filters networkGraphFilters) bool {
+	external := nodeIsExternal(node) || keyLooksExternal(node.Key)
+	if external {
+		return filters.ShowWAN
+	}
+	return filters.ShowLAN
+}
+
 func edgeIsExternal(edge networkEdge, nodes map[string]networkNode) bool {
 	return nodeIsExternal(nodes[edge.SrcKey]) || nodeIsExternal(nodes[edge.DstKey]) || keyLooksExternal(edge.SrcKey) || keyLooksExternal(edge.DstKey)
+}
+
+func edgeIsLinkLocal(edge networkEdge, nodes map[string]networkNode) bool {
+	return nodeHasLinkLocalOnly(nodes[edge.SrcKey]) || nodeHasLinkLocalOnly(nodes[edge.DstKey]) || keyLooksLinkLocal(edge.SrcKey) || keyLooksLinkLocal(edge.DstKey)
+}
+
+func edgeHasSuppressedSpecial(edge networkEdge, nodes map[string]networkNode) bool {
+	return nodeHasSuppressedSpecialOnly(nodes[edge.SrcKey]) || nodeHasSuppressedSpecialOnly(nodes[edge.DstKey]) ||
+		keyLooksSuppressedSpecial(edge.SrcKey) || keyLooksSuppressedSpecial(edge.DstKey)
 }
 
 func nodeIsExternal(node networkNode) bool {
@@ -414,6 +791,42 @@ func nodeIsExternal(node networkNode) bool {
 	return false
 }
 
+func nodeHasLinkLocalOnly(node networkNode) bool {
+	if node.Key == "" {
+		return false
+	}
+	if keyLooksLinkLocal(node.Key) {
+		return true
+	}
+	if len(node.IPs) == 0 {
+		return false
+	}
+	for _, ip := range node.IPs {
+		if !ipStringIsLinkLocal(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+func nodeHasSuppressedSpecialOnly(node networkNode) bool {
+	if node.Key == "" {
+		return false
+	}
+	if keyLooksSuppressedSpecial(node.Key) {
+		return true
+	}
+	if len(node.IPs) == 0 {
+		return false
+	}
+	for _, ip := range node.IPs {
+		if !ipStringIsSuppressedSpecial(ip) {
+			return false
+		}
+	}
+	return true
+}
+
 func keyLooksExternal(key string) bool {
 	if !strings.HasPrefix(key, "ip:") {
 		return false
@@ -423,6 +836,103 @@ func keyLooksExternal(key string) bool {
 		return false
 	}
 	return !ip.IsPrivate() && !ip.IsLinkLocalUnicast() && !ip.IsLoopback() && !ip.IsMulticast() && !ip.IsUnspecified()
+}
+
+func keyLooksLinkLocal(key string) bool {
+	if !strings.HasPrefix(key, "ip:") {
+		return false
+	}
+	return ipStringIsLinkLocal(strings.TrimPrefix(key, "ip:"))
+}
+
+func ipStringIsLinkLocal(value string) bool {
+	ip := net.ParseIP(value)
+	return ip != nil && ip.IsLinkLocalUnicast()
+}
+
+func keyLooksSuppressedSpecial(key string) bool {
+	if !strings.HasPrefix(key, "ip:") {
+		return false
+	}
+	return ipStringIsSuppressedSpecial(strings.TrimPrefix(key, "ip:"))
+}
+
+func ipStringIsSuppressedSpecial(value string) bool {
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return false
+	}
+	return ip.IsUnspecified() || ip.IsLoopback() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ipIsLimitedBroadcast(ip) || ipIsReservedNonHost(ip)
+}
+
+func ipScopeTags(value string) []string {
+	ip := net.ParseIP(strings.TrimSpace(value))
+	if ip == nil {
+		return nil
+	}
+	var tags []string
+	switch {
+	case ip.IsUnspecified():
+		tags = appendUniqueStrings(tags, "scope:special", "ip:rfc1122-unspecified")
+	case ipIsLimitedBroadcast(ip):
+		tags = appendUniqueStrings(tags, "scope:special", "ip:rfc919-broadcast")
+	case ip.IsLoopback():
+		tags = appendUniqueStrings(tags, "scope:special", "ip:rfc1122-loopback")
+	case ip.IsLinkLocalUnicast():
+		tags = appendUniqueStrings(tags, "scope:special", "ip:rfc3927-link-local")
+	case ip.IsLinkLocalMulticast():
+		tags = appendUniqueStrings(tags, "scope:special", "ip:link-local-multicast")
+	case ip.IsMulticast():
+		tags = appendUniqueStrings(tags, "scope:special", "ip:rfc5771-multicast")
+	case ip.IsPrivate():
+		tags = appendUniqueStrings(tags, "scope:lan", "ip:rfc1918")
+	case ipIsCarrierGradeNAT(ip):
+		tags = appendUniqueStrings(tags, "scope:special", "ip:rfc6598-shared")
+	case ipIsDocumentation(ip):
+		tags = appendUniqueStrings(tags, "scope:special", "ip:rfc5737-documentation")
+	case ipIsBenchmark(ip):
+		tags = appendUniqueStrings(tags, "scope:special", "ip:rfc2544-benchmark")
+	case ipIsReservedNonHost(ip):
+		tags = appendUniqueStrings(tags, "scope:special", "ip:rfc6890-reserved")
+	case ip.IsGlobalUnicast():
+		tags = appendUniqueStrings(tags, "scope:wan", "ip:global-unicast")
+	default:
+		tags = appendUniqueStrings(tags, "scope:special", "ip:rfc6890-special")
+	}
+	return tags
+}
+
+func ipIsLimitedBroadcast(ip net.IP) bool {
+	ip4 := ip.To4()
+	return ip4 != nil && ip4[0] == 255 && ip4[1] == 255 && ip4[2] == 255 && ip4[3] == 255
+}
+
+func ipIsCarrierGradeNAT(ip net.IP) bool {
+	ip4 := ip.To4()
+	return ip4 != nil && ip4[0] == 100 && ip4[1]&0xc0 == 64
+}
+
+func ipIsDocumentation(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 != nil {
+		return (ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 2) ||
+			(ip4[0] == 198 && ip4[1] == 51 && ip4[2] == 100) ||
+			(ip4[0] == 203 && ip4[1] == 0 && ip4[2] == 113)
+	}
+	return strings.EqualFold(ip.String(), "2001:db8::") || strings.HasPrefix(strings.ToLower(ip.String()), "2001:db8:")
+}
+
+func ipIsBenchmark(ip net.IP) bool {
+	ip4 := ip.To4()
+	return ip4 != nil && ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19)
+}
+
+func ipIsReservedNonHost(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	return ip4[0] >= 240
 }
 
 func (m DashboardModel) networkGraphContent(graph networkGraph, width int) (string, int) {
@@ -518,8 +1028,6 @@ func (m DashboardModel) networkGraphContent(graph networkGraph, width int) (stri
 		line := trunc(fmt.Sprintf("      %s==L2== %s", connector, topologyNodeHeader(item.Index, item.Node, leftWidth-16)), leftWidth)
 		if item.Index == graph.Selected {
 			line = styleWarning.Render(line)
-		} else if nodeIsExternal(item.Node) {
-			line = styleDim.Render(line)
 		} else {
 			line = styleVal.Render(line)
 		}
@@ -529,8 +1037,15 @@ func (m DashboardModel) networkGraphContent(graph networkGraph, width int) (stri
 			leftBlock = append(leftBlock, styleDim.Render(trunc("      "+childConnector+"       "+meta, leftWidth)))
 		}
 		rightBlock := make([]string, len(leftBlock))
-		leftBlock, rightBlock = graph.appendTopologyCommRows(item.Node.Key, childConnector, leftWidth, rightWidth, leftBlock, rightBlock)
-		addBlock(leftBlock, rightBlock, selectedTopologyLine(item.Index == graph.Selected))
+		selectedBranch := item.Index == graph.Selected
+		if selectedBranch {
+			leftBlock, rightBlock = graph.appendTopologyCommRows(item.Node.Key, childConnector, leftWidth, rightWidth, leftBlock, rightBlock)
+		}
+		selectedLineInBlock := selectedTopologyLine(selectedBranch)
+		if selectedBranch && len(leftBlock) > 0 {
+			selectedLineInBlock = len(leftBlock) - 1
+		}
+		addBlock(leftBlock, rightBlock, selectedLineInBlock)
 	}
 	return sb.String(), selectedLine
 }
@@ -583,8 +1098,8 @@ func topologyNodeHeader(index int, node networkNode, width int) string {
 		title = firstNonEmpty(node.Label, node.Key)
 	}
 	parts := []string{title}
-	if node.Note != "" {
-		parts = append(parts, "note")
+	if role := displayNodeRole(node); role != "" {
+		parts = append(parts, role)
 	}
 	prefix := fmt.Sprintf("[%02d %s ", index+1, nodeKindGlyph(node.Kind))
 	if index < 0 {
@@ -598,16 +1113,26 @@ func topologyNodeMeta(node networkNode, width int) []string {
 		return nil
 	}
 	var meta []string
+	ipLabel := "ip"
+	switch node.Kind {
+	case "local":
+		ipLabel = "operator ip"
+	case "target":
+		ipLabel = "pc ip"
+	}
 	if len(node.IPs) > 0 {
-		meta = append(meta, "ip: "+strings.Join(node.IPs, ", "))
+		meta = append(meta, ipLabel+": "+strings.Join(node.IPs, ", "))
 	} else {
-		meta = append(meta, "ip: unknown")
+		meta = append(meta, ipLabel+": unknown")
 	}
 	if node.MAC != "" && node.MAC != "unknown" {
 		meta = append(meta, "mac: "+node.MAC)
 	}
 	if len(node.Names) > 0 {
 		meta = append(meta, "name: "+strings.Join(node.Names, ", "))
+	}
+	if len(node.Tags) > 0 {
+		meta = append(meta, "tags: "+strings.Join(limitStrings(node.Tags, 8), ", "))
 	}
 	if node.PktCount > 0 {
 		meta = append(meta, fmt.Sprintf("seen: %d pkt", node.PktCount))
@@ -669,21 +1194,21 @@ func (m DashboardModel) nodeDetailContent(graph networkGraph, node networkNode, 
 	}
 	sb.WriteString(styleLabel.Render("Node Detail") + " " + styleWarning.Render(nodeTitle(node)) + "\n")
 	sb.WriteString(renderKeyValue("Kind", node.Kind) + "\n")
+	sb.WriteString(renderKeyValue("Role", emptyText(displayNodeRole(node))) + "\n")
+	sb.WriteString(renderKeyValue("Tags", emptyText(strings.Join(node.Tags, ", "))) + "\n")
 	sb.WriteString(renderKeyValue("MAC", emptyText(node.MAC)) + "\n")
-	sb.WriteString(renderKeyValue("IPs", emptyText(strings.Join(node.IPs, ", "))) + "\n")
+	ipLabel := "IPs"
+	switch node.Kind {
+	case "local":
+		ipLabel = "Operator IP"
+	case "target":
+		ipLabel = "PC IPs"
+	}
+	sb.WriteString(renderKeyValue(ipLabel, emptyText(strings.Join(node.IPs, ", "))) + "\n")
 	sb.WriteString(renderKeyValue("DNS/Names", emptyText(strings.Join(node.Names, ", "))) + "\n")
 	sb.WriteString(renderKeyValue("Packets", fmt.Sprintf("%d", node.PktCount)) + "\n")
 	if !node.LastSeen.IsZero() {
 		sb.WriteString(renderKeyValue("Last seen", ageString(node.LastSeen)) + "\n")
-	}
-	sb.WriteString(styleLabel.Render("Note") + "\n")
-	if m.noteEditing {
-		sb.WriteString(styleWarning.Render("> "+trunc(m.noteBuffer, width-6)) + "\n")
-		sb.WriteString(styleDim.Render("Enter saves, Backspace deletes, Ctrl+U clears.") + "\n")
-	} else if strings.TrimSpace(node.Note) != "" {
-		sb.WriteString(styleVal.Render(trunc(node.Note, width-4)) + "\n")
-	} else {
-		sb.WriteString(styleDim.Render("No note. Press N to add one.") + "\n")
 	}
 	sb.WriteString(styleLabel.Render("Inbound") + "\n")
 	for _, edge := range graph.EdgesFor(node.Key, false) {
@@ -705,9 +1230,12 @@ func (g networkGraph) EdgesFor(key string, outbound bool) []networkEdge {
 		if !outbound && edge.DstKey == key {
 			out = append(out, edge)
 		}
-		if len(out) >= 12 {
-			break
-		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return topologyEdgeSortKey(out[i], g, key) < topologyEdgeSortKey(out[j], g, key)
+	})
+	if len(out) > 12 {
+		out = out[:12]
 	}
 	return out
 }
@@ -715,16 +1243,19 @@ func (g networkGraph) EdgesFor(key string, outbound bool) []networkEdge {
 func (g networkGraph) topologyCommsFor(key string, limit int) []networkEdge {
 	out := make([]networkEdge, 0, limit)
 	for _, edge := range g.Edges {
-		if edge.Protocol == "inline" || edge.Protocol == "L2" {
+		if edge.Protocol == "inline" || edge.Protocol == "L2" || edge.Protocol == "DHCP-OPT" {
 			continue
 		}
 		if edge.SrcKey != key && edge.DstKey != key {
 			continue
 		}
 		out = append(out, edge)
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return topologyEdgeSortKey(out[i], g, key) < topologyEdgeSortKey(out[j], g, key)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out
 }
@@ -733,7 +1264,7 @@ func (g networkGraph) appendTopologyCommRows(key, childConnector string, leftWid
 	if key == "" {
 		return leftBlock, rightBlock
 	}
-	comms := g.topologyCommsFor(key, 4)
+	comms := g.topologyCommsFor(key, 0)
 	if len(comms) == 0 {
 		left := fmt.Sprintf("      %s       no %s links", childConnector, g.shortTrafficModeLabel())
 		leftBlock = append(leftBlock, styleDim.Render(trunc(left, leftWidth)))
@@ -755,6 +1286,23 @@ func (g networkGraph) appendTopologyCommRows(key, childConnector string, leftWid
 	return leftBlock, rightBlock
 }
 
+func topologyEdgeSortKey(edge networkEdge, graph networkGraph, perspective string) string {
+	peer := edge.DstKey
+	direction := "out"
+	if edge.DstKey == perspective {
+		peer = edge.SrcKey
+		direction = "in"
+	}
+	return strings.Join([]string{
+		direction,
+		graph.nodeShort(peer),
+		strings.ToUpper(edge.Protocol),
+		fmt.Sprintf("%05d", edge.DstPort),
+		fmt.Sprintf("%05d", edge.SrcPort),
+		fmt.Sprintf("%05d", edge.VLANID),
+	}, "|")
+}
+
 func edgeLine(edge networkEdge, graph networkGraph) string {
 	label := edge.Protocol
 	if edge.DstPort != 0 {
@@ -774,16 +1322,121 @@ func topologyPeerOnlyLine(edge networkEdge, graph networkGraph, perspective stri
 		outbound = false
 	}
 	peerLabel := "(" + graph.nodeShort(peer) + ")"
+	credential := edgeCredentialMarker(edge)
 	if graph.edgeIsExternal(edge) {
 		if outbound {
-			return "══>" + peerLabel
+			return connectorWithEdgeLabel("══", ">", credential) + peerLabel
 		}
-		return "<══" + peerLabel
+		return connectorWithEdgeLabel("══", "<", credential) + peerLabel
 	}
 	if outbound {
-		return "──>" + peerLabel
+		return connectorWithEdgeLabel("──", ">", credential) + peerLabel
 	}
-	return "<──" + peerLabel
+	return connectorWithEdgeLabel("──", "<", credential) + peerLabel
+}
+
+func connectorWithEdgeLabel(line, arrow, label string) string {
+	if label == "" {
+		if arrow == "<" {
+			return "<" + line
+		}
+		return line + arrow
+	}
+	label = "[" + label + "]"
+	if arrow == "<" {
+		return "<" + line + label + line
+	}
+	return line + label + line + arrow
+}
+
+func edgeCredentialMarker(edge networkEdge) string {
+	for _, value := range edge.Creds {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func annotateCredentialEdges(edges []networkEdge, nodes []networkNode, findings []stealth.CredentialExposureSummary) []networkEdge {
+	if len(edges) == 0 || len(findings) == 0 {
+		return edges
+	}
+	out := append([]networkEdge(nil), edges...)
+	nodeByKey := make(map[string]networkNode, len(nodes))
+	for _, node := range nodes {
+		nodeByKey[node.Key] = node
+	}
+	for i := range out {
+		for _, finding := range findings {
+			if edgeMatchesCredential(out[i], nodeByKey, finding) {
+				out[i].Creds = appendUniqueStrings(out[i].Creds, credentialEdgeLabel(finding))
+			}
+		}
+		out[i].Creds = limitStrings(out[i].Creds, 3)
+	}
+	return out
+}
+
+func edgeMatchesCredential(edge networkEdge, nodes map[string]networkNode, finding stealth.CredentialExposureSummary) bool {
+	if finding.ServicePort != 0 && edge.SrcPort != finding.ServicePort && edge.DstPort != finding.ServicePort {
+		return false
+	}
+	if finding.VLANID != 0 && edge.VLANID != 0 && finding.VLANID != edge.VLANID {
+		return false
+	}
+	if finding.Service != "" && edge.Protocol != "" && edge.Protocol != "TCP" && edge.Protocol != "UDP" &&
+		!strings.EqualFold(edge.Protocol, finding.Service) {
+		return false
+	}
+
+	src := nodes[edge.SrcKey]
+	dst := nodes[edge.DstKey]
+	serviceIP := formatIP(finding.ServiceIP)
+	srcIP := formatIP(finding.SrcIP)
+	dstIP := formatIP(finding.DstIP)
+	serviceOnSrc := nodeHasIP(src, serviceIP)
+	serviceOnDst := nodeHasIP(dst, serviceIP)
+	if !serviceOnSrc && !serviceOnDst {
+		return false
+	}
+	if srcIP == "unknown" && dstIP == "unknown" {
+		return true
+	}
+	return (nodeHasIP(src, srcIP) && nodeHasIP(dst, dstIP)) ||
+		(nodeHasIP(src, dstIP) && nodeHasIP(dst, srcIP)) ||
+		(serviceOnSrc && (nodeHasIP(dst, srcIP) || nodeHasIP(dst, dstIP))) ||
+		(serviceOnDst && (nodeHasIP(src, srcIP) || nodeHasIP(src, dstIP)))
+}
+
+func nodeHasIP(node networkNode, ip string) bool {
+	if ip == "" || ip == "unknown" {
+		return false
+	}
+	for _, value := range node.IPs {
+		if value == ip {
+			return true
+		}
+	}
+	if strings.TrimPrefix(node.Key, "ip:") == ip {
+		return true
+	}
+	return false
+}
+
+func credentialEdgeLabel(finding stealth.CredentialExposureSummary) string {
+	secret := strings.TrimSpace(finding.SecretValue)
+	if secret == "" {
+		return ""
+	}
+	user := strings.TrimSpace(finding.Username)
+	if user != "" && !strings.EqualFold(user, "unknown") {
+		return trunc("cred "+user+":"+secret, 42)
+	}
+	if kind := strings.TrimSpace(finding.SecretKind); kind != "" {
+		return trunc("cred "+kind+"="+secret, 42)
+	}
+	return trunc("cred "+secret, 42)
 }
 
 func edgeLabel(edge networkEdge) string {
@@ -816,14 +1469,14 @@ func (g networkGraph) nodeShort(key string) string {
 
 func nodeSummary(node networkNode, width int) string {
 	parts := []string{nodeTitle(node)}
+	if role := displayNodeRole(node); role != "" {
+		parts = append(parts, role)
+	}
 	if node.MAC != "" && node.MAC != "unknown" {
 		parts = append(parts, node.MAC)
 	}
 	if len(node.Names) > 0 {
 		parts = append(parts, strings.Join(node.Names, ","))
-	}
-	if node.Note != "" {
-		parts = append(parts, "note")
 	}
 	return trunc(strings.Join(parts, "  "), width)
 }
@@ -855,6 +1508,30 @@ func nodeKindGlyph(kind string) string {
 		return "DH"
 	case "radius":
 		return "RA"
+	case "nas":
+		return "NAS"
+	case "dns":
+		return "DNS"
+	case "printer":
+		return "PRN"
+	case "dc":
+		return "AD"
+	case "windows":
+		return "WIN"
+	case "unix":
+		return "UNX"
+	case "apple":
+		return "APL"
+	case "network":
+		return "NET"
+	case "phone":
+		return "PHN"
+	case "web":
+		return "WEB"
+	case "ntp":
+		return "NTP"
+	case "service":
+		return "SVC"
 	case "external":
 		return "EX"
 	default:
@@ -879,8 +1556,10 @@ func nodeRank(kind string) int {
 		return 80
 	case "gateway":
 		return 70
-	case "dhcp", "radius", "nas":
+	case "dhcp", "radius", "nas", "dns", "dc", "network":
 		return 60
+	case "printer", "windows", "unix", "apple", "phone", "web", "ntp", "service":
+		return 45
 	case "external":
 		return 20
 	default:

@@ -1,6 +1,7 @@
 package stealth
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -12,7 +13,13 @@ import (
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/macs"
 	"github.com/google/gopacket/pcap"
+)
+
+const (
+	maxObserverRateLimitEntries = 4096
+	maxDNSResponsesPerQuery     = 16
 )
 
 // ObservedHost represents a host seen traversing the bridge.
@@ -45,7 +52,22 @@ type DNSQuery struct {
 	Name      string
 	Type      string   // A, AAAA, CNAME, etc.
 	Response  []string // resolved IPs/values
+	ClientIP  net.IP
+	ServerIP  net.IP
+	VLANID    uint16
 	Timestamp time.Time
+}
+
+// HostSignal records passive identity evidence for an endpoint.
+type HostSignal struct {
+	MAC       net.HardwareAddr
+	IP        net.IP
+	Kind      string
+	Value     string
+	Tags      []string
+	Count     uint64
+	FirstSeen time.Time
+	LastSeen  time.Time
 }
 
 // VLANInfo tracks a single observed VLAN on the wire.
@@ -114,8 +136,14 @@ type DHCPTelemetry struct {
 	ACKIP        net.IP
 	ServerIP     net.IP
 	RouterIP     net.IP
+	DNSServers   []net.IP
 	Netmask      net.IPMask
 	Hostname     string
+	VendorClass  string
+	ClientID     string
+	DomainName   string
+	DomainSearch string
+	ParamRequest []byte
 	LeaseSeconds uint32
 	LastSeen     time.Time
 }
@@ -181,6 +209,7 @@ type NetworkMap struct {
 	SeenEvents            map[string]time.Time
 	Hosts                 map[string]*ObservedHost // keyed by MAC string
 	Conversations         map[string]*Conversation
+	HostSignals           map[string]*HostSignal
 	CredentialFindings    map[string]*CredentialExposure
 	CredentialSessions    map[string]credentialSession
 	DNSLog                []DNSQuery           // recent DNS queries (capped)
@@ -194,6 +223,7 @@ type NetworkMap struct {
 	maxDNSLog             int // cap on DNS log entries
 	maxHosts              int // cap on hosts map size
 	maxConversations      int
+	maxHostSignals        int
 	maxCredentials        int
 	maxCredentialSessions int
 	maxEvents             int // cap on recent control-plane events
@@ -205,6 +235,7 @@ func NewNetworkMap() *NetworkMap {
 		SeenEvents:            make(map[string]time.Time),
 		Hosts:                 make(map[string]*ObservedHost),
 		Conversations:         make(map[string]*Conversation),
+		HostSignals:           make(map[string]*HostSignal),
 		CredentialFindings:    make(map[string]*CredentialExposure),
 		CredentialSessions:    make(map[string]credentialSession),
 		VLANs:                 make(map[uint16]*VLANInfo),
@@ -212,6 +243,7 @@ func NewNetworkMap() *NetworkMap {
 		maxDNSLog:             200,
 		maxHosts:              500,
 		maxConversations:      300,
+		maxHostSignals:        600,
 		maxCredentials:        120,
 		maxCredentialSessions: 1000,
 		maxEvents:             120,
@@ -253,6 +285,17 @@ type HostSummary struct {
 	LastSeen  time.Time
 }
 
+// HostSignalSummary is a compact passive endpoint evidence row.
+type HostSignalSummary struct {
+	MAC      net.HardwareAddr
+	IP       net.IP
+	Kind     string
+	Value    string
+	Tags     []string
+	Count    uint64
+	LastSeen time.Time
+}
+
 // ConversationSummary is a compact talker row for a NetworkMapSnapshot.
 type ConversationSummary struct {
 	SrcMAC   net.HardwareAddr
@@ -272,6 +315,7 @@ type ConversationSummary struct {
 type NetworkMapSnapshot struct {
 	HostCount           int
 	Hosts               []HostSummary
+	HostSignals         []HostSignalSummary
 	Conversations       []ConversationSummary
 	CredentialExposures []CredentialExposureSummary
 	DNSLog              []DNSQuery
@@ -306,6 +350,28 @@ func (nm *NetworkMap) Snapshot() NetworkMapSnapshot {
 	sort.Slice(hosts, func(i, j int) bool { return hosts[i].PktCount > hosts[j].PktCount })
 	if len(hosts) > 64 {
 		hosts = hosts[:64]
+	}
+
+	hostSignals := make([]HostSignalSummary, 0, len(nm.HostSignals))
+	for _, signal := range nm.HostSignals {
+		hostSignals = append(hostSignals, HostSignalSummary{
+			MAC:      copyMAC(signal.MAC),
+			IP:       copyIP(signal.IP),
+			Kind:     signal.Kind,
+			Value:    signal.Value,
+			Tags:     append([]string(nil), signal.Tags...),
+			Count:    signal.Count,
+			LastSeen: signal.LastSeen,
+		})
+	}
+	sort.Slice(hostSignals, func(i, j int) bool {
+		if hostSignals[i].LastSeen.Equal(hostSignals[j].LastSeen) {
+			return hostSignals[i].Count > hostSignals[j].Count
+		}
+		return hostSignals[i].LastSeen.After(hostSignals[j].LastSeen)
+	})
+	if len(hostSignals) > 120 {
+		hostSignals = hostSignals[:120]
 	}
 
 	conversations := make([]ConversationSummary, 0, len(nm.Conversations))
@@ -358,6 +424,8 @@ func (nm *NetworkMap) Snapshot() NetworkMapSnapshot {
 	for i, query := range nm.DNSLog {
 		dnsLog[i] = query
 		dnsLog[i].Response = append([]string(nil), query.Response...)
+		dnsLog[i].ClientIP = copyIP(query.ClientIP)
+		dnsLog[i].ServerIP = copyIP(query.ServerIP)
 	}
 	if len(dnsLog) > 64 {
 		dnsLog = dnsLog[len(dnsLog)-64:]
@@ -390,7 +458,9 @@ func (nm *NetworkMap) Snapshot() NetworkMapSnapshot {
 	dhcp.ACKIP = copyIP(dhcp.ACKIP)
 	dhcp.ServerIP = copyIP(dhcp.ServerIP)
 	dhcp.RouterIP = copyIP(dhcp.RouterIP)
+	dhcp.DNSServers = copyIPList(dhcp.DNSServers)
 	dhcp.Netmask = append(net.IPMask(nil), dhcp.Netmask...)
+	dhcp.ParamRequest = append([]byte(nil), dhcp.ParamRequest...)
 
 	radius := nm.RADIUS
 	radius.ClientIP = copyIP(radius.ClientIP)
@@ -409,6 +479,7 @@ func (nm *NetworkMap) Snapshot() NetworkMapSnapshot {
 	return NetworkMapSnapshot{
 		HostCount:           len(nm.Hosts),
 		Hosts:               hosts,
+		HostSignals:         hostSignals,
 		Conversations:       conversations,
 		CredentialExposures: credentialExposures,
 		DNSLog:              dnsLog,
@@ -488,6 +559,7 @@ func (o *Observer) runIntoHandle(ctx context.Context, targetMAC net.HardwareAddr
 	hostLogCooldown := 30 * time.Second
 	dnsLogCooldown := 60 * time.Second
 	vlanChangeLogged := make(map[uint16]bool)
+	lastRateLimitPrune := time.Now()
 
 	for {
 		select {
@@ -500,6 +572,12 @@ func (o *Observer) runIntoHandle(ctx context.Context, targetMAC net.HardwareAddr
 
 			o.processPacket(packet, targetMAC, nm, eventLog,
 				lastHostLog, lastDNSLog, hostLogCooldown, dnsLogCooldown, vlanChangeLogged)
+			if time.Since(lastRateLimitPrune) > time.Minute {
+				now := time.Now()
+				pruneObserverTimeMap(lastHostLog, now.Add(-5*time.Minute), maxObserverRateLimitEntries)
+				pruneObserverTimeMap(lastDNSLog, now.Add(-10*time.Minute), maxObserverRateLimitEntries)
+				lastRateLimitPrune = now
+			}
 		}
 	}
 }
@@ -529,6 +607,7 @@ func (o *Observer) processPacket(
 	if srcMAC[0]&1 != 0 {
 		return
 	}
+	o.processEthernetSignals(eth, nm, now)
 
 	// ── VLAN tracking ──────────────────────────────────────────────
 	vlanID := uint16(0)
@@ -547,16 +626,27 @@ func (o *Observer) processPacket(
 		o.processEAPOL(packet, eth, eapol, vlanID, targetMAC, nm, now, eventLog)
 	}
 
+	if lldpLayer := packet.Layer(layers.LayerTypeLinkLayerDiscoveryInfo); lldpLayer != nil {
+		lldp, _ := lldpLayer.(*layers.LinkLayerDiscoveryInfo)
+		o.processLLDP(lldp, eth, vlanID, targetMAC, nm, now, eventLog, lastHostLog, hostLogCooldown)
+	}
+	if cdpLayer := packet.Layer(layers.LayerTypeCiscoDiscoveryInfo); cdpLayer != nil {
+		cdp, _ := cdpLayer.(*layers.CiscoDiscoveryInfo)
+		o.processCDP(cdp, eth, vlanID, targetMAC, nm, now, eventLog, lastHostLog, hostLogCooldown)
+	}
+
 	// ── IPv4: Host tracking + static IP inference ──────────────────
+	var ipv4 *layers.IPv4
 	ipLayer := packet.Layer(layers.LayerTypeIPv4)
 	if ipLayer != nil {
-		ipv4, _ := ipLayer.(*layers.IPv4)
+		ipv4, _ = ipLayer.(*layers.IPv4)
 
 		// Track the source host (MAC → IP mapping).
 		if !ipv4.SrcIP.IsUnspecified() && !ipv4.SrcIP.IsMulticast() {
 			o.trackHost(nm, srcMAC, ipv4.SrcIP, now, eventLog, lastHostLog, hostLogCooldown, targetMAC)
 		}
 		o.trackConversation(packet, nm, eth, ipv4, vlanID, now, uint64(len(packet.Data())))
+		o.processIPv4Signals(packet, eth, ipv4, vlanID, nm, now)
 
 		if macEqual(eth.DstMAC, targetMAC) && !macEqual(srcMAC, targetMAC) &&
 			!ipv4.SrcIP.IsUnspecified() && !ipv4.SrcIP.IsMulticast() {
@@ -592,6 +682,7 @@ func (o *Observer) processPacket(
 			!strings.HasPrefix(senderIP.String(), "169.254") && senderMAC[0]&1 == 0 {
 			o.trackHost(nm, senderMAC, senderIP, now, eventLog, lastHostLog, hostLogCooldown, targetMAC)
 		}
+		o.processARPSignals(arp, nm, now)
 
 		// Gateway confirmation: if non-target host has high packet count, it's likely the gateway.
 		if !macEqual(senderMAC, targetMAC) && !senderIP.IsUnspecified() {
@@ -625,7 +716,7 @@ func (o *Observer) processPacket(
 
 		// Log ALL observed DNS traffic on the wire for maximum network recon.
 		isQuery := !dns.QR
-		o.processDNS(dns, isQuery, nm, now, eventLog, lastDNSLog, dnsLogCooldown)
+		o.processDNS(dns, isQuery, nm, ipv4, vlanID, now, eventLog, lastDNSLog, dnsLogCooldown)
 	}
 
 	// ── DHCP and RADIUS control-plane ───────────────────────────────
@@ -655,6 +746,128 @@ func (o *Observer) processPacket(
 		ipv4, _ := ipLayer.(*layers.IPv4)
 		o.processCredentialExposure(packet, ipv4, vlanID, nm, now, eventLog)
 	}
+}
+
+func (o *Observer) processEthernetSignals(eth *layers.Ethernet, nm *NetworkMap, now time.Time) {
+	if eth == nil || len(eth.SrcMAC) < 3 {
+		return
+	}
+	prefix := [3]byte{eth.SrcMAC[0], eth.SrcMAC[1], eth.SrcMAC[2]}
+	vendor := strings.TrimSpace(macs.ValidMACPrefixMap[prefix])
+	if vendor == "" {
+		return
+	}
+	o.recordHostSignal(nm, eth.SrcMAC, nil, "oui", vendor, []string{"oui", vendorSignalTag(vendor)}, now)
+}
+
+func (o *Observer) processIPv4Signals(packet gopacket.Packet, eth *layers.Ethernet, ipv4 *layers.IPv4, vlanID uint16, nm *NetworkMap, now time.Time) {
+	if packet == nil || eth == nil || ipv4 == nil {
+		return
+	}
+	if !ipv4.SrcIP.IsUnspecified() && !ipv4.SrcIP.IsMulticast() {
+		o.recordHostSignal(nm, eth.SrcMAC, ipv4.SrcIP, "ip-stack", fmt.Sprintf("ttl=%d", ipv4.TTL), ttlSignalTags(ipv4.TTL), now)
+	}
+
+	if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+		tcp, _ := tcpLayer.(*layers.TCP)
+		if tcp.SYN && !tcp.ACK {
+			value, tags := tcpFingerprint(ipv4, tcp)
+			o.recordHostSignal(nm, eth.SrcMAC, ipv4.SrcIP, "tcp-fingerprint", value, tags, now)
+		}
+		o.processTCPPayloadSignals(tcp, eth, ipv4, nm, now)
+	}
+	if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+		udp, _ := udpLayer.(*layers.UDP)
+		o.processUDPPayloadSignals(udp, eth, ipv4, vlanID, nm, now)
+	}
+}
+
+func (o *Observer) processTCPPayloadSignals(tcp *layers.TCP, eth *layers.Ethernet, ipv4 *layers.IPv4, nm *NetworkMap, now time.Time) {
+	if tcp == nil || eth == nil || ipv4 == nil || len(tcp.Payload) == 0 {
+		return
+	}
+	srcPort := uint16(tcp.SrcPort)
+	dstPort := uint16(tcp.DstPort)
+	payload := tcp.Payload
+
+	if bytes.HasPrefix(payload, []byte("SSH-")) {
+		line := firstPayloadLine(payload)
+		o.recordHostSignal(nm, eth.SrcMAC, ipv4.SrcIP, "ssh-banner", line, []string{"ssh", "server-banner"}, now)
+		return
+	}
+
+	if host, userAgent := parseHTTPRequestHeaders(payload); host != "" || userAgent != "" {
+		if host != "" {
+			o.recordHostSignal(nm, eth.DstMAC, ipv4.DstIP, "http-host", host, []string{"http", "web", "http-host"}, now)
+		}
+		if userAgent != "" {
+			o.recordHostSignal(nm, eth.SrcMAC, ipv4.SrcIP, "http-user-agent", userAgent, userAgentTags(userAgent), now)
+		}
+	}
+	if server := parseHTTPResponseServer(payload); server != "" {
+		o.recordHostSignal(nm, eth.SrcMAC, ipv4.SrcIP, "http-server", server, []string{"http", "web", "http-server"}, now)
+	}
+
+	if srcPort == 443 || dstPort == 443 || srcPort == 8443 || dstPort == 8443 || looksLikeTLSClientHello(payload) {
+		if sni := parseTLSSNI(payload); sni != "" {
+			o.recordHostSignal(nm, eth.DstMAC, ipv4.DstIP, "tls-sni", sni, []string{"tls", "sni", "https"}, now)
+		}
+	}
+}
+
+func (o *Observer) processUDPPayloadSignals(udp *layers.UDP, eth *layers.Ethernet, ipv4 *layers.IPv4, vlanID uint16, nm *NetworkMap, now time.Time) {
+	if udp == nil || eth == nil || ipv4 == nil || len(udp.Payload) == 0 {
+		return
+	}
+	srcPort := uint16(udp.SrcPort)
+	dstPort := uint16(udp.DstPort)
+	payload := udp.Payload
+	if srcPort == 1900 || dstPort == 1900 {
+		if value := parseHeaderLikeValue(payload, "SERVER"); value != "" {
+			o.recordHostSignal(nm, eth.SrcMAC, ipv4.SrcIP, "ssdp-server", value, []string{"ssdp", "upnp", "iot-discovery"}, now)
+		}
+		if value := firstString(parseHeaderLikeValue(payload, "ST"), parseHeaderLikeValue(payload, "NT")); value != "" {
+			o.recordHostSignal(nm, eth.SrcMAC, ipv4.SrcIP, "ssdp-type", value, []string{"ssdp", "upnp", "service-discovery"}, now)
+		}
+	}
+	if srcPort == 3702 || dstPort == 3702 {
+		o.recordHostSignal(nm, eth.SrcMAC, ipv4.SrcIP, "ws-discovery", "WS-Discovery", []string{"ws-discovery", "windows", "printer-discovery"}, now)
+	}
+	if srcPort == 5355 || dstPort == 5355 {
+		o.recordHostSignal(nm, eth.SrcMAC, ipv4.SrcIP, "llmnr", "LLMNR", []string{"llmnr", "windows-name-resolution", "windows"}, now)
+	}
+	if srcPort == 137 || dstPort == 137 || srcPort == 138 || dstPort == 138 {
+		o.recordHostSignal(nm, eth.SrcMAC, ipv4.SrcIP, "netbios", "NetBIOS", []string{"netbios", "windows-name-resolution", "windows"}, now)
+	}
+	if vlanID != 0 {
+		o.recordHostSignal(nm, eth.SrcMAC, ipv4.SrcIP, "vlan", fmt.Sprintf("%d", vlanID), []string{fmt.Sprintf("vlan/%d", vlanID)}, now)
+	}
+}
+
+func (o *Observer) processARPSignals(arp *layers.ARP, nm *NetworkMap, now time.Time) {
+	if arp == nil || len(arp.SourceHwAddress) == 0 {
+		return
+	}
+	srcMAC := net.HardwareAddr(arp.SourceHwAddress)
+	srcIP := net.IP(arp.SourceProtAddress)
+	dstIP := net.IP(arp.DstProtAddress)
+	tags := []string{"arp"}
+	value := "arp"
+	switch {
+	case srcIP.Equal(dstIP) && !srcIP.IsUnspecified():
+		value = "gratuitous arp"
+		tags = append(tags, "gratuitous-arp", "address-owner")
+	case srcIP.IsUnspecified() && !dstIP.IsUnspecified():
+		value = "arp probe for " + dstIP.String()
+		tags = append(tags, "arp-probe", "duplicate-address-detection")
+	case arp.Operation == layers.ARPRequest:
+		value = "arp who-has " + dstIP.String()
+		tags = append(tags, "arp-request")
+	case arp.Operation == layers.ARPReply:
+		value = "arp reply"
+		tags = append(tags, "arp-reply")
+	}
+	o.recordHostSignal(nm, srcMAC, srcIP, "arp", value, tags, now)
 }
 
 func (o *Observer) processEAPOL(packet gopacket.Packet, eth *layers.Ethernet, eapol *layers.EAPOL, vlanID uint16,
@@ -826,6 +1039,109 @@ func (o *Observer) processEAPOL(packet gopacket.Packet, eth *layers.Ethernet, ea
 	}
 }
 
+func (o *Observer) processLLDP(info *layers.LinkLayerDiscoveryInfo, eth *layers.Ethernet, vlanID uint16, targetMAC net.HardwareAddr,
+	nm *NetworkMap, now time.Time, eventLog func(string), lastHostLog map[string]time.Time, hostLogCooldown time.Duration) {
+	if info == nil || eth == nil || nm == nil {
+		return
+	}
+	mgmtIP := lldpMgmtIPv4(info)
+	if len(mgmtIP) > 0 {
+		o.trackHost(nm, eth.SrcMAC, mgmtIP, now, eventLog, lastHostLog, hostLogCooldown, targetMAC)
+	}
+
+	parts := []string{}
+	if value := sanitizeText([]byte(info.SysName)); value != "" {
+		parts = append(parts, "sys="+value)
+	}
+	if value := sanitizeText([]byte(info.PortDescription)); value != "" {
+		parts = append(parts, "port="+value)
+	}
+	if len(mgmtIP) > 0 {
+		parts = append(parts, "mgmt="+mgmtIP.String())
+	}
+	if caps := lldpCapabilitiesText(info.SysCapabilities.EnabledCap); len(caps) > 0 {
+		parts = append(parts, "caps="+strings.Join(caps, ","))
+	}
+	if value := sanitizeText([]byte(info.SysDescription)); value != "" {
+		parts = append(parts, "desc="+value)
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "LLDP advertisement")
+	}
+	summary := strings.Join(parts, " ")
+
+	nm.mu.Lock()
+	o.recordHostSignalLocked(nm, eth.SrcMAC, mgmtIP, "lldp", summary, lldpSignalTags(info, summary), now)
+	o.addEventLocked(nm, NACEvent{
+		Timestamp: now,
+		Kind:      "LLDP",
+		Interface: o.iface,
+		Direction: "l2-advertisement",
+		Summary:   limitEventSummary(summary),
+		VLANID:    vlanID,
+		SrcMAC:    copyMAC(eth.SrcMAC),
+		DstMAC:    copyMAC(eth.DstMAC),
+		SrcIP:     copyIP(mgmtIP),
+	})
+	nm.mu.Unlock()
+}
+
+func (o *Observer) processCDP(info *layers.CiscoDiscoveryInfo, eth *layers.Ethernet, vlanID uint16, targetMAC net.HardwareAddr,
+	nm *NetworkMap, now time.Time, eventLog func(string), lastHostLog map[string]time.Time, hostLogCooldown time.Duration) {
+	if info == nil || eth == nil || nm == nil {
+		return
+	}
+	mgmtIP := firstIPv4(info.MgmtAddresses...)
+	if len(mgmtIP) == 0 {
+		mgmtIP = firstIPv4(info.Addresses...)
+	}
+	if len(mgmtIP) > 0 {
+		o.trackHost(nm, eth.SrcMAC, mgmtIP, now, eventLog, lastHostLog, hostLogCooldown, targetMAC)
+	}
+
+	parts := []string{}
+	if value := sanitizeText([]byte(firstString(info.SysName, info.DeviceID))); value != "" {
+		parts = append(parts, "sys="+value)
+	}
+	if value := sanitizeText([]byte(info.Platform)); value != "" {
+		parts = append(parts, "platform="+value)
+	}
+	if value := sanitizeText([]byte(info.PortID)); value != "" {
+		parts = append(parts, "port="+value)
+	}
+	if len(mgmtIP) > 0 {
+		parts = append(parts, "mgmt="+mgmtIP.String())
+	}
+	if caps := cdpCapabilitiesText(info.Capabilities); len(caps) > 0 {
+		parts = append(parts, "caps="+strings.Join(caps, ","))
+	}
+	if info.NativeVLAN != 0 {
+		parts = append(parts, fmt.Sprintf("native-vlan=%d", info.NativeVLAN))
+	}
+	if value := sanitizeText([]byte(info.Version)); value != "" {
+		parts = append(parts, "version="+value)
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "CDP advertisement")
+	}
+	summary := strings.Join(parts, " ")
+
+	nm.mu.Lock()
+	o.recordHostSignalLocked(nm, eth.SrcMAC, mgmtIP, "cdp", summary, cdpSignalTags(info, summary), now)
+	o.addEventLocked(nm, NACEvent{
+		Timestamp: now,
+		Kind:      "CDP",
+		Interface: o.iface,
+		Direction: "l2-advertisement",
+		Summary:   limitEventSummary(summary),
+		VLANID:    vlanID,
+		SrcMAC:    copyMAC(eth.SrcMAC),
+		DstMAC:    copyMAC(eth.DstMAC),
+		SrcIP:     copyIP(mgmtIP),
+	})
+	nm.mu.Unlock()
+}
+
 func (o *Observer) processDHCP(dhcp *layers.DHCPv4, eth *layers.Ethernet, vlanID uint16, targetMAC net.HardwareAddr,
 	nm *NetworkMap, now time.Time, eventLog func(string)) {
 
@@ -843,6 +1159,41 @@ func (o *Observer) processDHCP(dhcp *layers.DHCPv4, eth *layers.Ethernet, vlanID
 	nm.DHCP.LastSeen = now
 	if len(dhcp.ClientHWAddr) > 0 {
 		nm.DHCP.ClientMAC = copyMAC(dhcp.ClientHWAddr)
+	}
+
+	for _, opt := range dhcp.Options {
+		switch opt.Type {
+		case layers.DHCPOptServerID:
+			if len(opt.Data) >= 4 {
+				nm.DHCP.ServerIP = copyIP(net.IP(opt.Data[:4]))
+			}
+		case layers.DHCPOptRouter:
+			if len(opt.Data) >= 4 {
+				nm.DHCP.RouterIP = copyIP(net.IP(opt.Data[:4]))
+			}
+		case layers.DHCPOptDNS:
+			nm.DHCP.DNSServers = dhcpIPv4List(opt.Data)
+		case layers.DHCPOptSubnetMask:
+			if len(opt.Data) == 4 {
+				nm.DHCP.Netmask = append(net.IPMask(nil), opt.Data...)
+			}
+		case layers.DHCPOptHostname:
+			nm.DHCP.Hostname = sanitizeText(opt.Data)
+		case layers.DHCPOptClassID:
+			nm.DHCP.VendorClass = sanitizeText(opt.Data)
+		case layers.DHCPOptClientID:
+			nm.DHCP.ClientID = formatDHCPClientID(opt.Data)
+		case layers.DHCPOptDomainName:
+			nm.DHCP.DomainName = sanitizeText(opt.Data)
+		case layers.DHCPOptDomainSearch:
+			nm.DHCP.DomainSearch = sanitizeText(opt.Data)
+		case layers.DHCPOptParamsRequest:
+			nm.DHCP.ParamRequest = append([]byte(nil), opt.Data...)
+		case layers.DHCPOptLeaseTime:
+			if len(opt.Data) == 4 {
+				nm.DHCP.LeaseSeconds = binary.BigEndian.Uint32(opt.Data)
+			}
+		}
 	}
 
 	switch msgType {
@@ -894,29 +1245,6 @@ func (o *Observer) processDHCP(dhcp *layers.DHCPv4, eth *layers.Ethernet, vlanID
 		nm.DHCP.NAKs++
 	}
 
-	for _, opt := range dhcp.Options {
-		switch opt.Type {
-		case layers.DHCPOptServerID:
-			if len(opt.Data) >= 4 {
-				nm.DHCP.ServerIP = copyIP(net.IP(opt.Data[:4]))
-			}
-		case layers.DHCPOptRouter:
-			if len(opt.Data) >= 4 {
-				nm.DHCP.RouterIP = copyIP(net.IP(opt.Data[:4]))
-			}
-		case layers.DHCPOptSubnetMask:
-			if len(opt.Data) == 4 {
-				nm.DHCP.Netmask = append(net.IPMask(nil), opt.Data...)
-			}
-		case layers.DHCPOptHostname:
-			nm.DHCP.Hostname = sanitizeText(opt.Data)
-		case layers.DHCPOptLeaseTime:
-			if len(opt.Data) == 4 {
-				nm.DHCP.LeaseSeconds = binary.BigEndian.Uint32(opt.Data)
-			}
-		}
-	}
-
 	summary := msgType
 	if nm.DHCP.ACKIP != nil && msgType == "Ack" {
 		summary += " " + nm.DHCP.ACKIP.String()
@@ -933,9 +1261,60 @@ func (o *Observer) processDHCP(dhcp *layers.DHCPv4, eth *layers.Ethernet, vlanID
 		SrcMAC:    copyMAC(eth.SrcMAC),
 		DstMAC:    copyMAC(eth.DstMAC),
 	})
+	dhcpIP := firstIPNonNil(nm.DHCP.ACKIP, nm.DHCP.OfferedIP)
+	if len(nm.DHCP.Hostname) > 0 {
+		o.recordHostSignalLocked(nm, nm.DHCP.ClientMAC, dhcpIP, "dhcp-hostname", nm.DHCP.Hostname, []string{"dhcp-hostname", "dhcp-option-12"}, now)
+	}
+	if len(nm.DHCP.VendorClass) > 0 {
+		o.recordHostSignalLocked(nm, nm.DHCP.ClientMAC, dhcpIP, "dhcp-vendor", nm.DHCP.VendorClass, dhcpVendorTags(nm.DHCP.VendorClass), now)
+	}
+	if len(nm.DHCP.ClientID) > 0 {
+		o.recordHostSignalLocked(nm, nm.DHCP.ClientMAC, dhcpIP, "dhcp-client-id", nm.DHCP.ClientID, []string{"dhcp-client-id", "dhcp-option-61"}, now)
+	}
+	if len(nm.DHCP.DomainName) > 0 {
+		o.recordHostSignalLocked(nm, nm.DHCP.ClientMAC, dhcpIP, "dhcp-domain", nm.DHCP.DomainName, []string{"dhcp-domain", "dhcp-option-15"}, now)
+	}
+	if len(nm.DHCP.DomainSearch) > 0 {
+		o.recordHostSignalLocked(nm, nm.DHCP.ClientMAC, dhcpIP, "dhcp-search", nm.DHCP.DomainSearch, []string{"dhcp-search", "dhcp-option-119"}, now)
+	}
+	if len(nm.DHCP.ParamRequest) > 0 {
+		o.recordHostSignalLocked(nm, nm.DHCP.ClientMAC, dhcpIP, "dhcp-params", formatDHCPParamRequestSignal(nm.DHCP.ParamRequest), dhcpParamTags(nm.DHCP.ParamRequest), now)
+	}
 	nm.mu.Unlock()
 
 	eventLog(fmt.Sprintf("[*][AUTH] DHCP %s observed", summary))
+}
+
+func dhcpIPv4List(data []byte) []net.IP {
+	seen := make(map[string]bool)
+	out := make([]net.IP, 0, len(data)/4)
+	for len(data) >= net.IPv4len {
+		ip := net.IP(data[:net.IPv4len]).To4()
+		data = data[net.IPv4len:]
+		if ip == nil || ip.IsUnspecified() || ip.IsMulticast() {
+			continue
+		}
+		key := ip.String()
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, copyIP(ip))
+	}
+	return out
+}
+
+func copyIPList(values []net.IP) []net.IP {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]net.IP, 0, len(values))
+	for _, value := range values {
+		if copied := copyIP(value); copied != nil {
+			out = append(out, copied)
+		}
+	}
+	return out
 }
 
 func (o *Observer) processRADIUS(radius *layers.RADIUS, ipv4 *layers.IPv4, vlanID uint16,
@@ -1155,6 +1534,196 @@ func formatEventIP(ip net.IP) string {
 	return ip.String()
 }
 
+func lldpMgmtIPv4(info *layers.LinkLayerDiscoveryInfo) net.IP {
+	if info == nil || info.MgmtAddress.Subtype != layers.IANAAddressFamilyIPV4 || len(info.MgmtAddress.Address) < 4 {
+		return nil
+	}
+	return copyIP(net.IP(info.MgmtAddress.Address[:4]))
+}
+
+func firstIPv4(values ...net.IP) net.IP {
+	for _, ip := range values {
+		if parsed := ip.To4(); parsed != nil && !parsed.IsUnspecified() && !parsed.IsMulticast() {
+			return copyIP(parsed)
+		}
+	}
+	return nil
+}
+
+func lldpCapabilitiesText(caps layers.LLDPCapabilities) []string {
+	var out []string
+	if caps.Bridge {
+		out = append(out, "bridge")
+	}
+	if caps.Router {
+		out = append(out, "router")
+	}
+	if caps.WLANAP {
+		out = append(out, "wlan-ap")
+	}
+	if caps.Phone {
+		out = append(out, "phone")
+	}
+	if caps.Repeater {
+		out = append(out, "repeater")
+	}
+	if caps.StationOnly {
+		out = append(out, "station")
+	}
+	if caps.CVLAN {
+		out = append(out, "c-vlan")
+	}
+	if caps.SVLAN {
+		out = append(out, "s-vlan")
+	}
+	return out
+}
+
+func cdpCapabilitiesText(caps layers.CDPCapabilities) []string {
+	var out []string
+	if caps.L3Router {
+		out = append(out, "router")
+	}
+	if caps.L2Switch {
+		out = append(out, "switch")
+	}
+	if caps.TBBridge || caps.SPBridge {
+		out = append(out, "bridge")
+	}
+	if caps.IsPhone {
+		out = append(out, "phone")
+	}
+	if caps.IsHost {
+		out = append(out, "host")
+	}
+	if caps.L1Repeater {
+		out = append(out, "repeater")
+	}
+	if caps.RemotelyManaged {
+		out = append(out, "remote-managed")
+	}
+	return out
+}
+
+func lldpSignalTags(info *layers.LinkLayerDiscoveryInfo, summary string) []string {
+	tags := []string{"lldp", "l2-discovery", "network-discovery"}
+	if info != nil {
+		tags = append(tags, capabilitySignalTags(lldpCapabilitiesText(info.SysCapabilities.EnabledCap))...)
+	}
+	tags = append(tags, networkIdentityTags(summary)...)
+	return tags
+}
+
+func cdpSignalTags(info *layers.CiscoDiscoveryInfo, summary string) []string {
+	tags := []string{"cdp", "cisco-discovery", "l2-discovery", "network-discovery", "vendor:cisco", "cisco"}
+	if info != nil {
+		tags = append(tags, capabilitySignalTags(cdpCapabilitiesText(info.Capabilities))...)
+	}
+	tags = append(tags, networkIdentityTags(summary)...)
+	return tags
+}
+
+func capabilitySignalTags(caps []string) []string {
+	var tags []string
+	for _, cap := range caps {
+		switch strings.ToLower(strings.TrimSpace(cap)) {
+		case "switch", "bridge", "c-vlan", "s-vlan":
+			tags = append(tags, "switch", "bridge", "device:switch")
+		case "router":
+			tags = append(tags, "router", "device:router")
+		case "phone":
+			tags = append(tags, "phone", "device:phone")
+		case "wlan-ap":
+			tags = append(tags, "wireless-ap", "device:ap")
+		case "repeater":
+			tags = append(tags, "repeater", "device:network")
+		case "host", "station":
+			tags = append(tags, "device:host")
+		case "remote-managed":
+			tags = append(tags, "remote-managed")
+		}
+	}
+	return tags
+}
+
+func networkIdentityTags(values ...string) []string {
+	joined := strings.ToLower(strings.Join(values, " "))
+	var tags []string
+	addVendor := func(canonical string, aliases ...string) {
+		for _, alias := range aliases {
+			if strings.Contains(joined, alias) {
+				tags = append(tags, "vendor:"+canonical, canonical)
+				return
+			}
+		}
+	}
+
+	addVendor("cisco", "cisco", "ios-xe", "ios xr", "nx-os", "meraki")
+	addVendor("extreme", "extreme", "extremexos", "exos", "voss")
+	addVendor("juniper", "juniper", "junos")
+	addVendor("aruba", "aruba", "procurve")
+	addVendor("hpe", "hewlett packard", "hewlett-packard", "hpe ", "hp ")
+	addVendor("fortinet", "fortinet", "fortigate", "fortios")
+	addVendor("mikrotik", "mikrotik", "routeros")
+	addVendor("ubiquiti", "ubiquiti", "unifi", "edgeos")
+	addVendor("ruckus", "ruckus", "brocade icx")
+	addVendor("brocade", "brocade")
+	addVendor("dell", "dell ", "powerconnect", "force10", "os10")
+	addVendor("huawei", "huawei")
+	addVendor("paloalto", "palo alto", "pan-os", "panos")
+	addVendor("checkpoint", "checkpoint", "check point", "gaia")
+	addVendor("netgear", "netgear")
+	addVendor("sonicwall", "sonicwall")
+	addVendor("tplink", "tp-link", "tplink")
+	addVendor("openwrt", "openwrt")
+
+	switch {
+	case strings.Contains(joined, "ip phone") || strings.Contains(joined, "phone"):
+		tags = append(tags, "phone", "device:phone")
+	case strings.Contains(joined, "access point") || strings.Contains(joined, "aironet") ||
+		strings.Contains(joined, "air-ap") || strings.Contains(joined, "wlan-ap") ||
+		strings.Contains(joined, "wifi") || strings.Contains(joined, "unifi ap"):
+		tags = append(tags, "wireless-ap", "device:ap")
+	}
+	if strings.Contains(joined, "firewall") || strings.Contains(joined, "fortigate") ||
+		strings.Contains(joined, "pan-os") || strings.Contains(joined, "sonicwall") ||
+		strings.Contains(joined, "checkpoint") || strings.Contains(joined, "check point") {
+		tags = append(tags, "firewall", "device:firewall")
+	}
+	if strings.Contains(joined, "switch") || strings.Contains(joined, "catalyst") ||
+		strings.Contains(joined, "nexus") || strings.Contains(joined, "procurve") ||
+		strings.Contains(joined, "powerconnect") || strings.Contains(joined, "icx") {
+		tags = append(tags, "switch", "bridge", "device:switch")
+	}
+	if strings.Contains(joined, "router") || strings.Contains(joined, "isr") || strings.Contains(joined, "asr") {
+		tags = append(tags, "router", "device:router")
+	}
+	if strings.Contains(joined, "linux") || strings.Contains(joined, "openwrt") {
+		tags = append(tags, "unix-like", "os-hint:unix")
+	}
+	if strings.Contains(joined, "windows") {
+		tags = append(tags, "windows", "os-hint:windows")
+	}
+	return tags
+}
+
+func limitEventSummary(value string) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if len(value) > 180 {
+		return value[:177] + "..."
+	}
+	return value
+}
+
+func firstString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 // trackVLAN records a VLAN observation and logs new VLANs or trunk detection.
 func (o *Observer) trackVLAN(nm *NetworkMap, vlanID uint16, now time.Time,
 	eventLog func(string), vlanChangeLogged map[uint16]bool) {
@@ -1253,6 +1822,120 @@ func (o *Observer) trackHost(nm *NetworkMap, mac net.HardwareAddr, ip net.IP, no
 	}
 }
 
+func (o *Observer) recordHostSignal(nm *NetworkMap, mac net.HardwareAddr, ip net.IP, kind string, value string, tags []string, now time.Time) {
+	if nm == nil || strings.TrimSpace(kind) == "" {
+		return
+	}
+	value = limitSignalValue(value)
+	tags = sanitizeSignalTags(tags)
+	if value == "" && len(tags) == 0 {
+		return
+	}
+
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	o.recordHostSignalLocked(nm, mac, ip, kind, value, tags, now)
+}
+
+func (o *Observer) recordHostSignalLocked(nm *NetworkMap, mac net.HardwareAddr, ip net.IP, kind string, value string, tags []string, now time.Time) {
+	if nm == nil || strings.TrimSpace(kind) == "" {
+		return
+	}
+	value = limitSignalValue(value)
+	tags = sanitizeSignalTags(tags)
+	if value == "" && len(tags) == 0 {
+		return
+	}
+	if nm.HostSignals == nil {
+		nm.HostSignals = make(map[string]*HostSignal)
+	}
+	if len(nm.HostSignals) >= nm.maxHostSignals {
+		if _, exists := nm.HostSignals[hostSignalKey(mac, ip, kind, value)]; !exists {
+			pruneOldestHostSignalLocked(nm)
+		}
+	}
+	key := hostSignalKey(mac, ip, kind, value)
+	signal := nm.HostSignals[key]
+	if signal == nil {
+		signal = &HostSignal{
+			MAC:       copyMAC(mac),
+			IP:        copyIP(ip),
+			Kind:      strings.TrimSpace(kind),
+			Value:     value,
+			FirstSeen: now,
+		}
+		nm.HostSignals[key] = signal
+	}
+	signal.Tags = appendUniqueStringsStealth(signal.Tags, tags...)
+	signal.Count++
+	signal.LastSeen = now
+}
+
+func hostSignalKey(mac net.HardwareAddr, ip net.IP, kind string, value string) string {
+	macPart := strings.ToLower(mac.String())
+	ipPart := ""
+	if ip4 := ip.To4(); ip4 != nil {
+		ipPart = ip4.String()
+	} else if len(ip) > 0 {
+		ipPart = ip.String()
+	}
+	return strings.Join([]string{macPart, ipPart, strings.TrimSpace(kind), strings.TrimSpace(value)}, "|")
+}
+
+func pruneOldestHostSignalLocked(nm *NetworkMap) {
+	var oldestKey string
+	var oldest time.Time
+	for key, signal := range nm.HostSignals {
+		if oldestKey == "" || signal.LastSeen.Before(oldest) {
+			oldestKey = key
+			oldest = signal.LastSeen
+		}
+	}
+	if oldestKey != "" {
+		delete(nm.HostSignals, oldestKey)
+	}
+}
+
+func sanitizeSignalTags(tags []string) []string {
+	out := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		tag = strings.ToLower(strings.TrimSpace(tag))
+		if tag == "" {
+			continue
+		}
+		out = appendUniqueStringsStealth(out, tag)
+	}
+	return out
+}
+
+func limitSignalValue(value string) string {
+	value = strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+	if len(value) > 96 {
+		return value[:93] + "..."
+	}
+	return value
+}
+
+func appendUniqueStringsStealth(values []string, additions ...string) []string {
+	for _, addition := range additions {
+		addition = strings.TrimSpace(addition)
+		if addition == "" {
+			continue
+		}
+		found := false
+		for _, existing := range values {
+			if existing == addition {
+				found = true
+				break
+			}
+		}
+		if !found {
+			values = append(values, addition)
+		}
+	}
+	return values
+}
+
 // checkGateway uses traffic volume heuristics to confirm the gateway.
 func (o *Observer) checkGateway(nm *NetworkMap, mac net.HardwareAddr, ip net.IP, eventLog func(string)) {
 	nm.mu.Lock()
@@ -1339,24 +2022,27 @@ func conversationProtocol(packet gopacket.Packet, ipv4 *layers.IPv4) (string, ui
 	}
 	if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 		tcp, _ := tcpLayer.(*layers.TCP)
-		return "TCP", uint16(tcp.SrcPort), uint16(tcp.DstPort)
+		srcPort := uint16(tcp.SrcPort)
+		dstPort := uint16(tcp.DstPort)
+		if packet.Layer(layers.LayerTypeDNS) != nil {
+			return "DNS", srcPort, dstPort
+		}
+		return serviceProtocolName(srcPort, dstPort, true), srcPort, dstPort
 	}
 	if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
 		udp, _ := udpLayer.(*layers.UDP)
 		srcPort := uint16(udp.SrcPort)
 		dstPort := uint16(udp.DstPort)
-		switch {
-		case srcPort == 53 || dstPort == 53:
+		if packet.Layer(layers.LayerTypeDNS) != nil {
 			return "DNS", srcPort, dstPort
-		case srcPort == 67 || srcPort == 68 || dstPort == 67 || dstPort == 68:
-			return "DHCP", srcPort, dstPort
-		case isRADIUSPort(srcPort) || isRADIUSPort(dstPort):
-			return "RADIUS", srcPort, dstPort
-		case srcPort == 161 || srcPort == 162 || dstPort == 161 || dstPort == 162:
-			return "SNMP", srcPort, dstPort
-		default:
-			return "UDP", srcPort, dstPort
 		}
+		if packet.Layer(layers.LayerTypeDHCPv4) != nil {
+			return "DHCP", srcPort, dstPort
+		}
+		if packet.Layer(layers.LayerTypeRADIUS) != nil {
+			return "RADIUS", srcPort, dstPort
+		}
+		return serviceProtocolName(srcPort, dstPort, false), srcPort, dstPort
 	}
 	if packet.Layer(layers.LayerTypeICMPv4) != nil {
 		return "ICMP", 0, 0
@@ -1365,6 +2051,387 @@ func conversationProtocol(packet gopacket.Packet, ipv4 *layers.IPv4) (string, ui
 		return ipv4.Protocol.String(), 0, 0
 	}
 	return "IP", 0, 0
+}
+
+func serviceProtocolName(srcPort, dstPort uint16, tcp bool) string {
+	servicePort := dstPort
+	if isKnownConversationServicePort(srcPort) && !isKnownConversationServicePort(dstPort) {
+		servicePort = srcPort
+	}
+	if !tcp {
+		switch {
+		case srcPort == 53 || dstPort == 53:
+			return "DNS"
+		case srcPort == 67 || srcPort == 68 || dstPort == 67 || dstPort == 68:
+			return "DHCP"
+		case isRADIUSPort(srcPort) || isRADIUSPort(dstPort):
+			return "RADIUS"
+		case srcPort == 161 || srcPort == 162 || dstPort == 161 || dstPort == 162:
+			return "SNMP"
+		case srcPort == 123 || dstPort == 123:
+			return "NTP"
+		case srcPort == 514 || dstPort == 514:
+			return "SYSLOG"
+		case srcPort == 137 || srcPort == 138 || dstPort == 137 || dstPort == 138:
+			return "NBNS"
+		case srcPort == 5353 || dstPort == 5353:
+			return "MDNS"
+		case srcPort == 5355 || dstPort == 5355:
+			return "LLMNR"
+		case srcPort == 1900 || dstPort == 1900:
+			return "SSDP"
+		case srcPort == 3702 || dstPort == 3702:
+			return "WSD"
+		default:
+			return "UDP"
+		}
+	}
+	switch servicePort {
+	case 21:
+		return "FTP"
+	case 22:
+		return "SSH"
+	case 23:
+		return "TELNET"
+	case 111:
+		return "RPCBIND"
+	case 25, 465, 587:
+		return "SMTP"
+	case 53:
+		return "DNS"
+	case 80, 8080:
+		return "HTTP"
+	case 88, 464:
+		return "KERBEROS"
+	case 110, 995:
+		return "POP3"
+	case 135:
+		return "MSRPC"
+	case 139, 445:
+		return "SMB"
+	case 143, 993:
+		return "IMAP"
+	case 389, 636, 3268, 3269:
+		return "LDAP"
+	case 515:
+		return "LPD"
+	case 631:
+		return "IPP"
+	case 2049:
+		return "NFS"
+	case 443, 8443:
+		return "HTTPS"
+	case 9100:
+		return "JETDIRECT"
+	case 3389:
+		return "RDP"
+	case 5985, 5986:
+		return "WINRM"
+	default:
+		return "TCP"
+	}
+}
+
+func isKnownConversationServicePort(port uint16) bool {
+	switch port {
+	case 21, 22, 23, 25, 53, 67, 68, 69, 80, 88, 110, 111, 123, 135, 137, 138, 139, 143, 161, 162, 389, 443, 445, 464, 465, 514, 515, 587, 631, 636, 993, 995, 1812, 1813, 1900, 2049, 3268, 3269, 3389, 3702, 5353, 5355, 5985, 5986, 8080, 8443, 9100:
+		return true
+	default:
+		return false
+	}
+}
+
+func ttlSignalTags(ttl uint8) []string {
+	tags := []string{fmt.Sprintf("ttl/%d", ttl)}
+	switch {
+	case ttl >= 120 && ttl <= 128:
+		tags = append(tags, "stack:windows")
+	case ttl >= 60 && ttl <= 64:
+		tags = append(tags, "stack:unix")
+	case ttl >= 250:
+		tags = append(tags, "stack:network")
+	}
+	return tags
+}
+
+func tcpFingerprint(ipv4 *layers.IPv4, tcp *layers.TCP) (string, []string) {
+	if tcp == nil {
+		return "", nil
+	}
+	parts := []string{
+		fmt.Sprintf("ttl=%d", ipv4.TTL),
+		fmt.Sprintf("win=%d", tcp.Window),
+	}
+	tags := append([]string{"tcp-fingerprint"}, ttlSignalTags(ipv4.TTL)...)
+	optionNames := make([]string, 0, len(tcp.Options))
+	for _, opt := range tcp.Options {
+		switch opt.OptionType {
+		case layers.TCPOptionKindMSS:
+			if len(opt.OptionData) >= 2 {
+				mss := binary.BigEndian.Uint16(opt.OptionData[:2])
+				parts = append(parts, fmt.Sprintf("mss=%d", mss))
+				tags = append(tags, fmt.Sprintf("mss/%d", mss))
+			}
+			optionNames = append(optionNames, "mss")
+		case layers.TCPOptionKindWindowScale:
+			if len(opt.OptionData) >= 1 {
+				parts = append(parts, fmt.Sprintf("wscale=%d", opt.OptionData[0]))
+				tags = append(tags, "wscale")
+			}
+			optionNames = append(optionNames, "wscale")
+		case layers.TCPOptionKindSACKPermitted:
+			tags = append(tags, "sack")
+			optionNames = append(optionNames, "sack")
+		case layers.TCPOptionKindTimestamps:
+			tags = append(tags, "timestamps")
+			optionNames = append(optionNames, "ts")
+		case layers.TCPOptionKindNop:
+			optionNames = append(optionNames, "nop")
+		}
+	}
+	if len(optionNames) > 0 {
+		parts = append(parts, "opts="+strings.Join(optionNames, "-"))
+		tags = append(tags, "opts:"+strings.Join(optionNames, "-"))
+	}
+	switch {
+	case ipv4.TTL >= 120 && ipv4.TTL <= 128 && tcp.Window >= 64000:
+		tags = append(tags, "os-hint:windows")
+	case ipv4.TTL >= 60 && ipv4.TTL <= 64:
+		tags = append(tags, "os-hint:unix")
+	case ipv4.TTL >= 250:
+		tags = append(tags, "os-hint:network")
+	}
+	return strings.Join(parts, " "), tags
+}
+
+func parseHTTPRequestHeaders(payload []byte) (host string, userAgent string) {
+	if !looksLikeHTTPRequest(payload) {
+		return "", ""
+	}
+	return parseHeaderLikeValue(payload, "HOST"), parseHeaderLikeValue(payload, "USER-AGENT")
+}
+
+func parseHTTPResponseServer(payload []byte) string {
+	if !bytes.HasPrefix(payload, []byte("HTTP/")) {
+		return ""
+	}
+	return parseHeaderLikeValue(payload, "SERVER")
+}
+
+func parseHeaderLikeValue(payload []byte, name string) string {
+	limit := len(payload)
+	if limit > 4096 {
+		limit = 4096
+	}
+	name = strings.ToUpper(name)
+	for _, rawLine := range strings.Split(string(payload[:limit]), "\n") {
+		line := strings.TrimSpace(strings.TrimRight(rawLine, "\r"))
+		if line == "" {
+			continue
+		}
+		idx := strings.IndexByte(line, ':')
+		if idx <= 0 {
+			continue
+		}
+		if strings.ToUpper(strings.TrimSpace(line[:idx])) == name {
+			return sanitizeText([]byte(strings.TrimSpace(line[idx+1:])))
+		}
+	}
+	return ""
+}
+
+func looksLikeHTTPRequest(payload []byte) bool {
+	methods := [][]byte{
+		[]byte("GET "), []byte("POST "), []byte("HEAD "), []byte("PUT "),
+		[]byte("DELETE "), []byte("OPTIONS "), []byte("PATCH "), []byte("CONNECT "),
+	}
+	for _, method := range methods {
+		if bytes.HasPrefix(payload, method) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstPayloadLine(payload []byte) string {
+	limit := len(payload)
+	if limit > 160 {
+		limit = 160
+	}
+	line := string(payload[:limit])
+	if idx := strings.IndexAny(line, "\r\n"); idx >= 0 {
+		line = line[:idx]
+	}
+	return sanitizeText([]byte(line))
+}
+
+func looksLikeTLSClientHello(payload []byte) bool {
+	return len(payload) >= 6 && payload[0] == 0x16 && payload[5] == 0x01
+}
+
+func parseTLSSNI(payload []byte) string {
+	if len(payload) < 6 || payload[0] != 0x16 {
+		return ""
+	}
+	recordLen := int(binary.BigEndian.Uint16(payload[3:5]))
+	if recordLen <= 0 || len(payload) < 5+recordLen {
+		return ""
+	}
+	p := payload[5 : 5+recordLen]
+	if len(p) < 42 || p[0] != 0x01 {
+		return ""
+	}
+	pos := 4 + 2 + 32 // handshake header, version, random.
+	if pos >= len(p) {
+		return ""
+	}
+	sessionLen := int(p[pos])
+	pos++
+	pos += sessionLen
+	if pos+2 > len(p) {
+		return ""
+	}
+	cipherLen := int(binary.BigEndian.Uint16(p[pos : pos+2]))
+	pos += 2 + cipherLen
+	if pos >= len(p) {
+		return ""
+	}
+	compressionLen := int(p[pos])
+	pos++
+	pos += compressionLen
+	if pos+2 > len(p) {
+		return ""
+	}
+	extensionsLen := int(binary.BigEndian.Uint16(p[pos : pos+2]))
+	pos += 2
+	end := pos + extensionsLen
+	if end > len(p) {
+		return ""
+	}
+	for pos+4 <= end {
+		extType := binary.BigEndian.Uint16(p[pos : pos+2])
+		extLen := int(binary.BigEndian.Uint16(p[pos+2 : pos+4]))
+		pos += 4
+		if pos+extLen > end {
+			return ""
+		}
+		if extType == 0x0000 {
+			return parseTLSServerNameExtension(p[pos : pos+extLen])
+		}
+		pos += extLen
+	}
+	return ""
+}
+
+func parseTLSServerNameExtension(data []byte) string {
+	if len(data) < 2 {
+		return ""
+	}
+	listLen := int(binary.BigEndian.Uint16(data[:2]))
+	pos := 2
+	end := pos + listLen
+	if end > len(data) {
+		return ""
+	}
+	for pos+3 <= end {
+		nameType := data[pos]
+		nameLen := int(binary.BigEndian.Uint16(data[pos+1 : pos+3]))
+		pos += 3
+		if pos+nameLen > end {
+			return ""
+		}
+		if nameType == 0 {
+			return sanitizeText(data[pos : pos+nameLen])
+		}
+		pos += nameLen
+	}
+	return ""
+}
+
+func userAgentTags(userAgent string) []string {
+	lower := strings.ToLower(userAgent)
+	tags := []string{"http-user-agent", "client-software"}
+	switch {
+	case strings.Contains(lower, "windows"):
+		tags = append(tags, "windows", "os-hint:windows")
+	case strings.Contains(lower, "mac os") || strings.Contains(lower, "iphone") || strings.Contains(lower, "ipad"):
+		tags = append(tags, "apple", "bonjour", "os-hint:apple")
+	case strings.Contains(lower, "android"):
+		tags = append(tags, "android", "unix-like", "os-hint:android")
+	case strings.Contains(lower, "linux") || strings.Contains(lower, "x11"):
+		tags = append(tags, "unix-like", "os-hint:unix")
+	}
+	return tags
+}
+
+func dhcpVendorTags(vendor string) []string {
+	lower := strings.ToLower(vendor)
+	tags := []string{"dhcp-vendor", "dhcp-option-60"}
+	switch {
+	case strings.Contains(lower, "msft") || strings.Contains(lower, "microsoft"):
+		tags = append(tags, "windows", "dhcp-vendor:msft")
+	case strings.Contains(lower, "android"):
+		tags = append(tags, "android", "unix-like", "dhcp-vendor:android")
+	case strings.Contains(lower, "apple") || strings.Contains(lower, "darwin"):
+		tags = append(tags, "apple", "bonjour", "dhcp-vendor:apple")
+	case strings.Contains(lower, "linux") || strings.Contains(lower, "dhcpcd") || strings.Contains(lower, "busybox") || strings.Contains(lower, "systemd"):
+		tags = append(tags, "unix-like", "dhcp-vendor:unix")
+	case strings.Contains(lower, "pxeclient"):
+		tags = append(tags, "pxe", "boot-client")
+	}
+	return tags
+}
+
+func dhcpParamTags(params []byte) []string {
+	tags := []string{"dhcp-params", "dhcp-option-55"}
+	set := make(map[byte]bool, len(params))
+	for _, param := range params {
+		set[param] = true
+	}
+	if set[44] || set[46] {
+		tags = append(tags, "netbios-request", "windows")
+	}
+	if set[119] || set[252] {
+		tags = append(tags, "domain-search", "wpad-request")
+	}
+	if set[121] {
+		tags = append(tags, "classless-routes")
+	}
+	return tags
+}
+
+func formatDHCPParamRequestSignal(params []byte) string {
+	labels := make([]string, 0, len(params))
+	for i, param := range params {
+		if i >= 16 {
+			labels = append(labels, fmt.Sprintf("+%d", len(params)-i))
+			break
+		}
+		labels = append(labels, fmt.Sprintf("%d", param))
+	}
+	return strings.Join(labels, ",")
+}
+
+func formatDHCPClientID(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	if len(data) == 7 && data[0] == 1 {
+		return net.HardwareAddr(data[1:]).String()
+	}
+	return fmt.Sprintf("%x", data)
+}
+
+func vendorSignalTag(vendor string) string {
+	lower := strings.ToLower(vendor)
+	replacer := strings.NewReplacer(
+		" ", "-", "\t", "-", ",", "", ".", "", "(", "", ")", "", "/", "-", "_", "-",
+	)
+	value := replacer.Replace(lower)
+	if len(value) > 40 {
+		value = value[:40]
+	}
+	return "vendor:" + strings.Trim(value, "-")
 }
 
 func pruneOldestConversationLocked(nm *NetworkMap) {
@@ -1382,7 +2449,7 @@ func pruneOldestConversationLocked(nm *NetworkMap) {
 }
 
 // processDNS extracts DNS query names and response records.
-func (o *Observer) processDNS(dns *layers.DNS, isQuery bool, nm *NetworkMap, now time.Time,
+func (o *Observer) processDNS(dns *layers.DNS, isQuery bool, nm *NetworkMap, ipv4 *layers.IPv4, vlanID uint16, now time.Time,
 	eventLog func(string), lastLog map[string]time.Time, cooldown time.Duration) {
 
 	if isQuery && len(dns.Questions) > 0 {
@@ -1401,13 +2468,14 @@ func (o *Observer) processDNS(dns *layers.DNS, isQuery bool, nm *NetworkMap, now
 			qType := dnsTypeString(q.Type)
 
 			nm.mu.Lock()
-			if len(nm.DNSLog) < nm.maxDNSLog {
-				nm.DNSLog = append(nm.DNSLog, DNSQuery{
-					Name:      name,
-					Type:      qType,
-					Timestamp: now,
-				})
-			}
+			appendDNSQueryLocked(nm, DNSQuery{
+				Name:      name,
+				Type:      qType,
+				ClientIP:  dnsClientIP(ipv4, isQuery),
+				ServerIP:  dnsServerIP(ipv4, isQuery),
+				VLANID:    vlanID,
+				Timestamp: now,
+			})
 			nm.mu.Unlock()
 
 			eventLog(fmt.Sprintf("[*][NET] DNS query: %s (%s)", name, qType))
@@ -1451,17 +2519,129 @@ func (o *Observer) processDNS(dns *layers.DNS, isQuery bool, nm *NetworkMap, now
 
 			// Update existing DNS log entry with response if we have the query.
 			nm.mu.Lock()
+			updated := false
 			for i := len(nm.DNSLog) - 1; i >= 0 && i >= len(nm.DNSLog)-20; i-- {
 				if nm.DNSLog[i].Name == name {
-					nm.DNSLog[i].Response = append(nm.DNSLog[i].Response, resolved)
+					nm.DNSLog[i].Response = appendDNSResponse(nm.DNSLog[i].Response, resolved)
+					nm.DNSLog[i].ClientIP = firstIPNonNil(nm.DNSLog[i].ClientIP, dnsClientIP(ipv4, isQuery))
+					nm.DNSLog[i].ServerIP = firstIPNonNil(nm.DNSLog[i].ServerIP, dnsServerIP(ipv4, isQuery))
+					if nm.DNSLog[i].VLANID == 0 {
+						nm.DNSLog[i].VLANID = vlanID
+					}
+					updated = true
 					break
 				}
+			}
+			if !updated {
+				appendDNSQueryLocked(nm, DNSQuery{
+					Name:      name,
+					Type:      dnsTypeString(a.Type),
+					Response:  []string{resolved},
+					ClientIP:  dnsClientIP(ipv4, isQuery),
+					ServerIP:  dnsServerIP(ipv4, isQuery),
+					VLANID:    vlanID,
+					Timestamp: now,
+				})
+			}
+			if ip := net.ParseIP(resolved); ip != nil && ip.To4() != nil && ip.IsPrivate() && !ip.IsLinkLocalUnicast() {
+				tags := []string{"dns-name", "private-dns-answer", strings.ToLower(dnsTypeString(a.Type))}
+				o.recordHostSignalLocked(nm, nil, ip, "dns-name", name, tags, now)
 			}
 			nm.mu.Unlock()
 
 			eventLog(fmt.Sprintf("[+][NET] DNS resolved: %s → %s", name, resolved))
 		}
 	}
+}
+
+func appendDNSQueryLocked(nm *NetworkMap, query DNSQuery) {
+	if nm == nil {
+		return
+	}
+	nm.DNSLog = append(nm.DNSLog, query)
+	if len(nm.DNSLog) <= nm.maxDNSLog {
+		return
+	}
+	nm.DNSLog = append([]DNSQuery(nil), nm.DNSLog[len(nm.DNSLog)-nm.maxDNSLog:]...)
+}
+
+func appendDNSResponse(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	values = append(values, value)
+	if len(values) > maxDNSResponsesPerQuery {
+		return append([]string(nil), values[len(values)-maxDNSResponsesPerQuery:]...)
+	}
+	return values
+}
+
+func pruneObserverTimeMap(values map[string]time.Time, cutoff time.Time, maxEntries int) {
+	for key, seenAt := range values {
+		if seenAt.Before(cutoff) {
+			delete(values, key)
+		}
+	}
+	if maxEntries <= 0 || len(values) <= maxEntries {
+		return
+	}
+	type entry struct {
+		key string
+		at  time.Time
+	}
+	entries := make([]entry, 0, len(values))
+	for key, seenAt := range values {
+		entries = append(entries, entry{key: key, at: seenAt})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].at.Before(entries[j].at) })
+	for len(values) > maxEntries && len(entries) > 0 {
+		delete(values, entries[0].key)
+		entries = entries[1:]
+	}
+}
+
+func dnsClientIP(ipv4 *layers.IPv4, isQuery bool) net.IP {
+	if ipv4 == nil {
+		return nil
+	}
+	if isQuery {
+		return copyIP(ipv4.SrcIP)
+	}
+	return copyIP(ipv4.DstIP)
+}
+
+func dnsServerIP(ipv4 *layers.IPv4, isQuery bool) net.IP {
+	if ipv4 == nil {
+		return nil
+	}
+	var ip net.IP
+	if isQuery {
+		ip = ipv4.DstIP
+	} else {
+		if ipv4.DstIP.IsMulticast() || ipv4.DstIP.IsLinkLocalMulticast() {
+			return nil
+		}
+		ip = ipv4.SrcIP
+	}
+	if ip == nil || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalMulticast() {
+		return nil
+	}
+	return copyIP(ip)
+}
+
+func firstIPNonNil(values ...net.IP) net.IP {
+	for _, value := range values {
+		if len(value) > 0 {
+			return copyIP(value)
+		}
+	}
+	return nil
 }
 
 func isRADIUSPort(port uint16) bool {

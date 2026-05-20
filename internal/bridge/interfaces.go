@@ -145,12 +145,12 @@ func LockdownInterface(ifName, hardwarePort string) error {
 	var errs []string
 
 	// 1. Administratively cut power
-	if out, err := exec.Command("ifconfig", ifName, "down").CombinedOutput(); err != nil {
+	if out, err := runInterfaceCommand(5*time.Second, "ifconfig", ifName, "down"); err != nil {
 		errs = append(errs, fmt.Sprintf("down failed: %v (%s)", err, strings.TrimSpace(string(out))))
 	}
 
 	// 2. Strip IPv4 leases natively
-	if out, err := exec.Command("ifconfig", ifName, "0.0.0.0").CombinedOutput(); err != nil {
+	if out, err := runInterfaceCommand(5*time.Second, "ifconfig", ifName, "0.0.0.0"); err != nil {
 		// Ignore metric errors if the interface didn't have an IP anyway
 		if !strings.Contains(string(out), "invalid") && !strings.Contains(string(out), "file exists") {
 			errs = append(errs, fmt.Sprintf("ipv4 strip failed: %v (%s)", err, strings.TrimSpace(string(out))))
@@ -159,8 +159,8 @@ func LockdownInterface(ifName, hardwarePort string) error {
 
 	// 3. Disable OS tracking explicitly (stops configd from running DHCP or bringing it UP on cable hot-plugs)
 	if hardwarePort != "" {
-		_ = exec.Command("networksetup", "-setnetworkserviceenabled", hardwarePort, "off").Run()
-		_ = exec.Command("networksetup", "-setv6off", hardwarePort).Run()
+		_, _ = runInterfaceCommand(5*time.Second, "networksetup", "-setnetworkserviceenabled", hardwarePort, "off")
+		_, _ = runInterfaceCommand(5*time.Second, "networksetup", "-setv6off", hardwarePort)
 	}
 
 	if len(errs) > 0 {
@@ -179,7 +179,7 @@ func CaptureInterfaceRestoreState(ifName, hardwarePort string) InterfaceRestoreS
 		return state
 	}
 
-	out, err := exec.Command("networksetup", "-getnetworkserviceenabled", hardwarePort).CombinedOutput()
+	out, err := runInterfaceCommand(5*time.Second, "networksetup", "-getnetworkserviceenabled", hardwarePort)
 	if err != nil {
 		return state
 	}
@@ -473,7 +473,7 @@ func classifyType(hardwarePort string) InterfaceType {
 
 // getCurrentMAC retrieves the current (possibly spoofed) MAC from ifconfig.
 func getCurrentMAC(device string) string {
-	out, err := exec.Command("ifconfig", device).CombinedOutput()
+	out, err := runInterfaceCommand(3*time.Second, "ifconfig", device)
 	if err != nil {
 		return ""
 	}
@@ -491,7 +491,7 @@ func getCurrentMAC(device string) string {
 
 // isInterfaceUp checks ifconfig status flags for active status.
 func isInterfaceUp(device string) bool {
-	out, err := exec.Command("ifconfig", device).CombinedOutput()
+	out, err := runInterfaceCommand(3*time.Second, "ifconfig", device)
 	if err != nil {
 		return false
 	}

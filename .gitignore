@@ -40,13 +40,26 @@ sessions/
 pcaps/
 captures/
 logs/
+*.pcap.*
 *.pcap
 *.pcapng
 *.cap
+*.har
 *.log
 *.log.*
 *.jsonl
 *.ndjson
+session.json
+session-*.json
+*.session.json
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+*.csv
+*.tsv
+*.dump
+*.dmp
 
 # Local secrets and lab credentials
 *.pem

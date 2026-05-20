@@ -9,8 +9,6 @@ Software Layer 2 network bridge for macOS; virtual female-to-female RJ45 adapter
 
 Built with Go, [Bubbletea](https://github.com/charmbracelet/bubbletea), and [Lipgloss](https://github.com/charmbracelet/lipgloss).
 
-![alt text](img/G4.png)
-
 ## Install
 
 ```bash
@@ -21,15 +19,13 @@ make install
 go build -o .
 ```
 
-## Sessions
+## Packet Captures
 
-goLAN writes each session under `~/.config/goLAN/sessions/<session-id>/` with the session JSON and pcaps together. On exit it prints the session ID. Resume or append to it with:
+goLAN writes passive captures under a timestamped directory:
 
-```bash
-sudo golan <session-id>
-```
+`~/.config/goLAN/pcaps/<timestamp>/`
 
-`--session <path-or-id>` is also supported for explicit paths or IDs. `--nuke` purges goLAN sessions and pcaps from the config directory.
+On exit it prints generated `.pcap` files. `--nuke` purges saved goLAN pcaps from the config directory.
 
 # Example usage
 

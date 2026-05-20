@@ -28,30 +28,44 @@ type Model struct {
 
 	shutdownFrame  int
 	shutdownPhrase int
-	session        *SessionStore
+	pcapRun        *PcapRun
 }
 
 // NewModel creates the root application model.
-func NewModel(sessionPath string) Model {
+func NewModel() Model {
 	return Model{
 		view:     viewSelector,
 		selector: NewSelectorModel(),
-		session:  NewSessionStore(sessionPath),
+		pcapRun:  NewPcapRun(),
 	}
 }
 
-func (m Model) SessionID() string {
-	if m.session == nil {
+func (m Model) PcapTimestamp() string {
+	if m.pcapRun == nil {
 		return ""
 	}
-	return m.session.SessionID()
+	return m.pcapRun.Timestamp
 }
 
-func (m Model) SessionPath() string {
-	if m.session == nil {
+func (m Model) PcapDir() string {
+	if m.pcapRun == nil {
 		return ""
 	}
-	return m.session.SessionPath()
+	return m.pcapRun.PcapDir()
+}
+
+func (m Model) PcapFiles() []string {
+	if m.pcapRun != nil {
+		return m.pcapRun.Files()
+	}
+	return nil
+}
+
+func (m Model) FinalizePcaps() error {
+	if m.pcapRun == nil {
+		return nil
+	}
+	return m.pcapRun.FinalizePermissions()
 }
 
 func (m Model) Init() tea.Cmd {
@@ -178,7 +192,7 @@ func (m Model) updateSelector(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Check if selector produced a result — transition to dashboard.
 	if result, ok := msg.(SelectorResult); ok {
 		m.view = viewDashboard
-		m.dashboard = NewDashboardModel(result.IfaceA, result.IfaceB, m.session)
+		m.dashboard = NewDashboardModel(result.IfaceA, result.IfaceB, m.pcapRun)
 		// Seed the dashboard with the current window size so it doesn't render blank.
 		m.dashboard.width = m.width
 		m.dashboard.height = m.height

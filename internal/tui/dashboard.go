@@ -7,8 +7,11 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mcrn/goLAN/internal/bridge"
@@ -23,12 +26,11 @@ type dashboardPage int
 const (
 	pageOverview dashboardPage = iota
 	pageTopology
-	pageIntel
 	pageNetwork
 	pageNodeDetail
 )
 
-const pageCount = 4
+const pageCount = 3
 
 // DashboardModel is the main bridge monitoring dashboard.
 type DashboardModel struct {
@@ -52,11 +54,8 @@ type DashboardModel struct {
 	pageScroll int
 	page       dashboardPage
 
-	session         *SessionStore
-	lastSessionSave time.Time
+	pcapRun         *PcapRun
 	selectedNodeKey string
-	noteEditing     bool
-	noteBuffer      string
 
 	networkShowLAN bool
 	networkShowWAN bool
@@ -76,13 +75,13 @@ type bridgeErrorMsg struct {
 }
 
 // NewDashboardModel creates the dashboard for monitoring an active bridge.
-func NewDashboardModel(ifA, ifB bridge.NetInterface, session *SessionStore) DashboardModel {
+func NewDashboardModel(ifA, ifB bridge.NetInterface, pcapRun *PcapRun) DashboardModel {
 	return DashboardModel{
 		ifaceA:         ifA, // Device port
 		ifaceB:         ifB, // Switch port
 		restoreA:       bridge.CaptureInterfaceRestoreState(ifA.Name, ifA.HardwarePort),
 		restoreB:       bridge.CaptureInterfaceRestoreState(ifB.Name, ifB.HardwarePort),
-		session:        session,
+		pcapRun:        pcapRun,
 		networkShowLAN: true,
 	}
 }
@@ -90,8 +89,8 @@ func NewDashboardModel(ifA, ifB bridge.NetInterface, session *SessionStore) Dash
 func (m DashboardModel) createBridgeCmd(ifA, ifB string, ignoreMAC string) tea.Cmd {
 	return func() tea.Msg {
 		captureDir := ""
-		if m.session != nil {
-			captureDir = m.session.PcapDir()
+		if m.pcapRun != nil {
+			captureDir = m.pcapRun.PcapDir()
 		}
 		br, err := bridge.NewBridge(ifA, ifB, ignoreMAC, captureDir,
 			m.ifaceA.CurrentMAC,
@@ -158,14 +157,9 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 	case statsMsg:
 		m.latestStats = stats.StatsUpdate(msg)
 		m.hasStats = true
-		m.persistSessionSnapshot(false)
 		return m, waitForStats(m.statsCh)
 
 	case tea.KeyMsg:
-		if m.noteEditing {
-			return m.handleNoteEditKey(msg), nil
-		}
-
 		bState := bridge.BridgeStateDown
 		if m.bridge != nil {
 			bState = m.bridge.State()
@@ -186,9 +180,6 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 			m.page = pageTopology
 			m.pageScroll = 0
 		case "3":
-			m.page = pageIntel
-			m.pageScroll = 0
-		case "4":
 			m.page = pageNetwork
 			m.pageScroll = 0
 		case "w", "W":
@@ -206,7 +197,7 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 		case "up", "k":
 			if m.page == pageNetwork {
 				m.moveNetworkSelection(-1)
-			} else if m.page == pageTopology || m.page == pageIntel || m.page == pageNodeDetail {
+			} else if m.page == pageTopology || m.page == pageNodeDetail {
 				m.pageScroll--
 			} else {
 				m.logScroll++
@@ -214,7 +205,7 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 		case "down", "j":
 			if m.page == pageNetwork {
 				m.moveNetworkSelection(1)
-			} else if m.page == pageTopology || m.page == pageIntel || m.page == pageNodeDetail {
+			} else if m.page == pageTopology || m.page == pageNodeDetail {
 				m.pageScroll++
 			} else {
 				m.logScroll--
@@ -261,11 +252,7 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 				}
 			}
 		case "n", "N":
-			if m.page == pageNodeDetail {
-				m.ensureNetworkSelection()
-				m.noteBuffer = m.currentNodeNote()
-				m.noteEditing = true
-			} else if m.bridge != nil {
+			if m.bridge != nil {
 				// If NAT is already active, hitting N acts as Disable (toggle off).
 				if m.bridge.IsNATActive() {
 					logFunc := m.bridgeLogFunc()
@@ -323,7 +310,6 @@ func (m *DashboardModel) Shutdown() error {
 	if m.cancel != nil {
 		m.cancel()
 	}
-	m.persistSessionSnapshot(true)
 	var errs []string
 	runStep := func(name string, timeout time.Duration, fn func() error) {
 		done := make(chan error, 1)
@@ -348,6 +334,13 @@ func (m *DashboardModel) Shutdown() error {
 		return errors.New(strings.Join(errs, " | "))
 	}
 	return nil
+}
+
+func (m DashboardModel) CaptureFiles() []string {
+	if m.bridge == nil {
+		return nil
+	}
+	return m.bridge.Status().CaptureFiles
 }
 
 func (m DashboardModel) View() string {
@@ -382,8 +375,6 @@ func (m DashboardModel) View() string {
 	switch m.page {
 	case pageTopology:
 		body = m.renderTopologyPageContent(contentWidth, bodyBudget)
-	case pageIntel:
-		body = m.renderIntelPageContent(contentWidth, bodyBudget)
 	case pageNetwork:
 		body = m.renderNetworkPageContent(contentWidth, bodyBudget)
 	case pageNodeDetail:
@@ -393,7 +384,7 @@ func (m DashboardModel) View() string {
 	}
 
 	scroll := 0
-	if m.page == pageTopology || m.page == pageIntel || m.page == pageNodeDetail {
+	if m.page == pageTopology || m.page == pageNodeDetail {
 		scroll = m.pageScroll
 	}
 	body = m.fitBodyHeight(body, bodyBudget, scroll)
@@ -1144,86 +1135,37 @@ func (m DashboardModel) renderTopologyPageContent(width int, maxHeight int) stri
 	status, snap, ok := m.authSnapshot()
 	usable, margin := pageContentArea(width)
 	if !ok {
-		content := styleDim.Render("Topology waiting for bridge observer...")
-		return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(
-			renderCard(usable, content),
-		)
-	}
-
-	if usable >= 96 && maxHeight >= 10 {
-		gap := 2
-		leftWidth := (usable - gap) / 2
-		rightWidth := usable - leftWidth - gap
-		rightGap := 1
-		layer2Height := (maxHeight - rightGap) / 2
-		layer3Height := maxHeight - rightGap - layer2Height
-
-		if layer2Height >= 4 && layer3Height >= 4 {
-			left := renderFixedCard(leftWidth, maxHeight, m.topologyBoxContent(status, snap, leftWidth))
-			right := renderFixedCard(rightWidth, layer2Height, m.layer2DetailContent(status, snap, rightWidth)) +
-				"\n" +
-				renderFixedCard(rightWidth, layer3Height, m.layer3DetailContent(status, snap, rightWidth))
-
-			return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(
-				lipgloss.JoinHorizontal(lipgloss.Top, left, strings.Repeat(" ", gap), right),
-			)
-		}
-	}
-
-	sections := []string{
-		m.renderTopologyBox(status, snap, usable),
-		m.renderLayer2DetailBox(status, snap, usable),
-		m.renderLayer3DetailBox(status, snap, usable),
-	}
-	return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(strings.Join(sections, "\n\n"))
-}
-
-func (m DashboardModel) renderIntelPageContent(width int, maxHeight int) string {
-	status, snap, ok := m.authSnapshot()
-	usable, margin := pageContentArea(width)
-	if !ok {
 		content := styleDim.Render("Passive intelligence waiting for bridge observer...")
 		return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(
 			renderCard(usable, content),
 		)
 	}
 
-	allContents := []string{
+	contents := []string{
 		m.credentialExposureContent(status, snap, usable),
 		m.conversationsContent(status, snap, usable),
-		m.signalsContent(snap, usable),
-		m.eapolContent(snap, usable),
-		m.dhcpContent(snap, usable),
-		m.radiusContent(snap, usable),
-		m.recentEventsContent(snap, usable),
+		m.layer2DetailContent(status, snap, usable),
+		m.layer3DetailContent(status, snap, usable),
+		m.hostsMapContent(snap, usable),
 	}
 
-	if usable < 96 {
+	if usable < 96 || maxHeight < 10 {
 		return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(
-			renderScrollableCardStack(usable, maxHeight, allContents),
+			renderScrollableCardStack(usable, maxHeight, contents),
 		)
 	}
 
 	gap := 2
 	leftWidth := (usable - gap) / 2
 	rightWidth := usable - leftWidth - gap
-	rightMinHeight := (4 * 3) + 3 // four cards, three one-line gaps.
-	if maxHeight < rightMinHeight {
-		return lipgloss.NewStyle().MarginLeft(margin).Width(usable).MaxWidth(usable).Render(
-			renderScrollableCardStack(usable, maxHeight, allContents),
-		)
-	}
-
 	leftContents := []string{
 		m.credentialExposureContent(status, snap, leftWidth),
 		m.conversationsContent(status, snap, leftWidth),
-		m.recentEventsContent(snap, leftWidth),
+		m.hostsMapContent(snap, leftWidth),
 	}
 	rightContents := []string{
-		m.signalsContent(snap, rightWidth),
-		m.eapolContent(snap, rightWidth),
-		m.dhcpContent(snap, rightWidth),
-		m.radiusContent(snap, rightWidth),
+		m.layer2DetailContent(status, snap, rightWidth),
+		m.layer3DetailContent(status, snap, rightWidth),
 	}
 	left := renderFixedCardStack(leftWidth, maxHeight, leftContents)
 	right := renderFixedCardStack(rightWidth, maxHeight, rightContents)
@@ -1242,47 +1184,6 @@ func (m DashboardModel) authSnapshot() (bridge.BridgeStatus, stealth.NetworkMapS
 		return status, stealth.NetworkMapSnapshot{}, true
 	}
 	return status, status.TargetID.NetworkMap.Snapshot(), true
-}
-
-func (m *DashboardModel) persistSessionSnapshot(force bool) {
-	if m == nil || m.session == nil || m.bridge == nil {
-		return
-	}
-	if !force && !m.lastSessionSave.IsZero() && time.Since(m.lastSessionSave) < 5*time.Second {
-		return
-	}
-	status, snap, ok := m.authSnapshot()
-	if !ok {
-		return
-	}
-	m.session.Merge(status, snap)
-	_ = m.session.Save()
-	m.lastSessionSave = time.Now()
-}
-
-func (m DashboardModel) handleNoteEditKey(msg tea.KeyMsg) DashboardModel {
-	switch msg.String() {
-	case "enter":
-		if m.session != nil && strings.TrimSpace(m.selectedNodeKey) != "" {
-			m.session.SetNote(m.selectedNodeKey, m.noteBuffer)
-			_ = m.session.Save()
-		}
-		m.noteEditing = false
-	case "backspace", "ctrl+h":
-		runes := []rune(m.noteBuffer)
-		if len(runes) > 0 {
-			m.noteBuffer = string(runes[:len(runes)-1])
-		}
-	case "ctrl+u":
-		m.noteBuffer = ""
-	default:
-		if msg.Type == tea.KeyRunes {
-			m.noteBuffer += string(msg.Runes)
-		} else if msg.String() == " " || msg.String() == "space" {
-			m.noteBuffer += " "
-		}
-	}
-	return m
 }
 
 func (m *DashboardModel) ensureNetworkSelection() {
@@ -1343,67 +1244,6 @@ func (m *DashboardModel) setNetworkTrafficMode(mode string) {
 	m.ensureNetworkSelection()
 }
 
-func (m DashboardModel) currentNodeNote() string {
-	if m.session == nil || strings.TrimSpace(m.selectedNodeKey) == "" {
-		return ""
-	}
-	return m.session.Note(m.selectedNodeKey)
-}
-
-func (m DashboardModel) renderTopologyBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
-	return renderCard(width, m.topologyBoxContent(status, snap, width))
-}
-
-func (m DashboardModel) topologyBoxContent(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
-	targetMAC := "unknown"
-	targetIP := "unknown"
-	if status.TargetID != nil {
-		targetMAC = formatMAC(status.TargetID.MAC)
-		targetIP = formatIP(firstIP(status.TargetID.IP, snap.DHCP.ACKIP, snap.DHCP.OfferedIP))
-	}
-	bridgeName := emptyText(status.Name)
-	if bridgeName == "unknown" {
-		bridgeName = "bridge"
-	}
-
-	port := formatPortState(snap.Port)
-	evidence := trunc(emptyText(snap.Port.Reason), width-16)
-	if evidence == "unknown" {
-		evidence = "waiting for traffic evidence"
-	}
-
-	var sb strings.Builder
-	sb.WriteString(styleLabel.Render("Where We Are") + "\n")
-	sb.WriteString(styleIfaceNameDevice.Render(trunc("PC / supplicant", width-4)) + "\n")
-	sb.WriteString(styleDim.Render("  "+trunc(targetIP+"  "+targetMAC, width-4)) + "\n")
-	sb.WriteString(styleDim.Render(trunc("        | "+status.IfaceA+" device-side", width-4)) + "\n")
-	sb.WriteString(styleSuccess.Render(trunc("goLAN inline bridge  "+bridgeName, width-4)) + "\n")
-	sb.WriteString(styleDim.Render(trunc("        | "+status.IfaceB+" switch-side", width-4)) + "\n")
-	sb.WriteString(styleIfaceNameSwitch.Render(trunc("Switch / network", width-4)) + "\n")
-	sb.WriteString(styleIfaceNameDevice.Render(trunc(status.IfaceA+" adapter", width-4)) + "\n")
-	sb.WriteString(renderKeyValue("Hardware", trunc(emptyText(m.ifaceA.HardwarePort), width-18)) + "\n")
-	sb.WriteString(renderKeyValue("Adapter MAC", trunc(emptyText(m.ifaceA.CurrentMAC), width-18)) + "\n")
-	sb.WriteString(renderKeyValue("Factory MAC", trunc(emptyText(m.ifaceA.PermanentMAC), width-18)) + "\n")
-	sb.WriteString(renderKeyValue("MTU/Addrs", trunc(fmt.Sprintf("%d  %s", m.ifaceA.MTU, formatStrings(m.ifaceA.Addrs)), width-18)) + "\n")
-	sb.WriteString(styleIfaceNameSwitch.Render(trunc(status.IfaceB+" adapter", width-4)) + "\n")
-	sb.WriteString(renderKeyValue("Hardware", trunc(emptyText(m.ifaceB.HardwarePort), width-18)) + "\n")
-	sb.WriteString(renderKeyValue("Adapter MAC", trunc(emptyText(m.ifaceB.CurrentMAC), width-18)) + "\n")
-	sb.WriteString(renderKeyValue("Factory MAC", trunc(emptyText(m.ifaceB.PermanentMAC), width-18)) + "\n")
-	sb.WriteString(renderKeyValue("MTU/Addrs", trunc(fmt.Sprintf("%d  %s", m.ifaceB.MTU, formatStrings(m.ifaceB.Addrs)), width-18)) + "\n")
-	sb.WriteString(styleSuccess.Render("Target MAC use") + "\n")
-	sb.WriteString(renderKeyValue("Found", trunc(targetMAC, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("PC -> Mac", trunc(targetMAC+" observed on "+status.IfaceA, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("Bridge", trunc(bridgeName+" mirrors "+targetMAC, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("Switch side", trunc(status.IfaceB+" mirrors "+targetMAC+" when supported", width-18)) + "\n")
-	sb.WriteString(renderKeyValue("Port", port) + "\n")
-	sb.WriteString(renderKeyValue("Evidence", evidence) + "\n")
-	return sb.String()
-}
-
-func (m DashboardModel) renderLayer2DetailBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
-	return renderCard(width, m.layer2DetailContent(status, snap, width))
-}
-
 func (m DashboardModel) layer2DetailContent(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
 	targetMAC := "unknown"
 	if status.TargetID != nil {
@@ -1427,6 +1267,9 @@ func (m DashboardModel) layer2DetailContent(status bridge.BridgeStatus, snap ste
 	sb.WriteString(renderKeyValue("Supplicant", trunc(supplicant, width-18)) + "\n")
 	sb.WriteString(renderKeyValue("Authenticator", trunc(formatMAC(eap.AuthenticatorMAC), width-18)) + "\n")
 	sb.WriteString(renderKeyValue("EAPOL", trunc(eapolLast, width-18)) + "\n")
+	sb.WriteString(renderKeyValue("EAP R/R", fmt.Sprintf("%d/%d", eap.Requests, eap.Responses)) + "\n")
+	sb.WriteString(renderKeyValue("EAP S/F", fmt.Sprintf("%d/%d", eap.Successes, eap.Failures)) + "\n")
+	sb.WriteString(renderKeyValue("Start/Logoff", fmt.Sprintf("%d/%d", eap.Starts, eap.Logoffs)) + "\n")
 	sb.WriteString(renderKeyValue("Passthrough", boolText(status.EAPOLPassthrough)) + "\n")
 	sb.WriteString(renderKeyValue("Port", formatPortState(snap.Port)) + "\n")
 	sb.WriteString(renderKeyValue("Evidence", trunc(emptyText(firstString(snap.Port.Evidence, snap.Port.Reason)), width-18)) + "\n")
@@ -1434,94 +1277,20 @@ func (m DashboardModel) layer2DetailContent(status bridge.BridgeStatus, snap ste
 	return sb.String()
 }
 
-func (m DashboardModel) renderLayer3DetailBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
-	return renderCard(width, m.layer3DetailContent(status, snap, width))
-}
-
 func (m DashboardModel) layer3DetailContent(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
 	targetIPs := targetIPList(status, snap)
-	gateway := "unknown"
-	if snap.Gateway.Confirmed {
-		gateway = formatIP(snap.Gateway.IP) + "  " + formatMAC(snap.Gateway.MAC)
-	} else if len(snap.DHCP.RouterIP) > 0 {
-		gateway = formatIP(snap.DHCP.RouterIP) + "  DHCP router"
-	}
-
-	radius := "not visible"
-	if snap.RADIUS.Seen {
-		radius = fmt.Sprintf("%s -> %s", formatIP(snap.RADIUS.ClientIP), formatIP(snap.RADIUS.ServerIP))
-	}
-	natSource := "off"
-	if status.NATActive && status.NATHiddenIP != "" {
-		natSource = status.NATHiddenIP
-		if status.NATHiddenNetmask != "" {
-			natSource += "/" + status.NATHiddenNetmask
-		}
-	}
-	natRange := "unknown"
-	if status.NATRouteNetwork != "" {
-		natRange = status.NATRouteNetwork + "/" + status.NATRouteNetmask
-	}
 
 	var sb strings.Builder
 	sb.WriteString(styleLabel.Render("Layer 3 Detail") + "\n")
 	sb.WriteString(renderKeyValue("Target IPs", trunc(targetIPs, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("DHCP Offer", trunc(formatIP(snap.DHCP.OfferedIP), width-18)) + "\n")
-	sb.WriteString(renderKeyValue("DHCP ACK", trunc(formatIP(snap.DHCP.ACKIP), width-18)) + "\n")
-	sb.WriteString(renderKeyValue("Netmask", trunc(formatMask(snap.DHCP.Netmask), width-18)) + "\n")
-	sb.WriteString(renderKeyValue("DHCP Server", trunc(formatIP(snap.DHCP.ServerIP), width-18)) + "\n")
-	sb.WriteString(renderKeyValue("Gateway", trunc(gateway, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("RADIUS", trunc(radius, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("NAT Source", trunc(natSource, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("NAT Mode", trunc(firstString(status.NATAnchorMode, "off"), width-18)) + "\n")
-	sb.WriteString(renderKeyValue("NAT Range", trunc(natRange, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("DNS seen", fmt.Sprintf("%d recent", len(snap.DNSLog))) + "\n")
+	sb.WriteString(renderKeyValue("IP Evidence", trunc(layer3IPEvidence(status, snap), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Gateway", trunc(formatGatewayEvidence(status, snap), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("DNS Servers", trunc(formatDNSServers(snap), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Netmask", trunc(formatNetmaskEvidence(status, snap), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("DHCP Lease", trunc(formatDHCPLease(snap), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("Observed LAN", trunc(formatObservedLAN(status, snap), width-18)) + "\n")
+	sb.WriteString(renderKeyValue("External Seen", formatExternalSeen(snap)) + "\n")
 	return sb.String()
-}
-
-func (m DashboardModel) renderVisibilityBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
-	vlanText := formatVLANs(snap.VLANIDs, snap.RADIUS.AssignedVLAN)
-	gateway := "unknown"
-	if snap.Gateway.Confirmed {
-		gateway = formatIP(snap.Gateway.IP)
-	} else if len(snap.DHCP.RouterIP) > 0 {
-		gateway = formatIP(snap.DHCP.RouterIP)
-	}
-	radius := "not visible"
-	if snap.RADIUS.Seen {
-		radius = formatIP(firstIP(snap.RADIUS.ServerIP, snap.RADIUS.ClientIP))
-	}
-	dhcp := "not visible"
-	if snap.DHCP.Seen {
-		dhcp = firstString(formatIP(snap.DHCP.ServerIP), snap.DHCP.LastType)
-		if dhcp == "unknown" {
-			dhcp = emptyText(snap.DHCP.LastType)
-		}
-	}
-
-	var sb strings.Builder
-	sb.WriteString(styleLabel.Render("Visibility") + "\n")
-	sb.WriteString(renderKeyValue("VLANs", trunc(vlanText, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("Gateway", trunc(gateway, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("RADIUS", trunc(radius, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("DHCP", trunc(dhcp, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("Hosts", fmt.Sprintf("%d", snap.HostCount)) + "\n")
-	sb.WriteString(renderKeyValue("Flows", fmt.Sprintf("%d recent", len(snap.Conversations))) + "\n")
-	if len(snap.CredentialExposures) > 0 {
-		sb.WriteString(renderKeyValue("Cleartext", styleWarning.Render(fmt.Sprintf("%d", len(snap.CredentialExposures)))) + "\n")
-	} else {
-		sb.WriteString(renderKeyValue("Cleartext", styleDim.Render("none")) + "\n")
-	}
-	if status.EAPOLPassthrough {
-		sb.WriteString(renderKeyValue("802.1X", styleUp.Render("passthrough")) + "\n")
-	} else {
-		sb.WriteString(renderKeyValue("802.1X", boolText(snap.EAPOL.Detected)) + "\n")
-	}
-	return renderCard(width, sb.String())
-}
-
-func (m DashboardModel) renderCredentialExposureBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
-	return renderCard(width, m.credentialExposureContent(status, snap, width))
 }
 
 func (m DashboardModel) credentialExposureContent(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
@@ -1569,49 +1338,6 @@ func (m DashboardModel) renderCredentialExposureLine(status bridge.BridgeStatus,
 	return styleWarning.Render(trunc(line, width-4)) + "\n"
 }
 
-func (m DashboardModel) renderSignalsBox(snap stealth.NetworkMapSnapshot, width int) string {
-	return renderCard(width, m.signalsContent(snap, width))
-}
-
-func (m DashboardModel) signalsContent(snap stealth.NetworkMapSnapshot, width int) string {
-	e := snap.EAPOL
-	eapLast := "not observed"
-	if e.Detected {
-		method := emptyText(e.LastMethod)
-		eapLast = strings.TrimSpace(e.LastCode + " " + method)
-		if !e.LastSeen.IsZero() {
-			eapLast += "  " + ageString(e.LastSeen)
-		}
-	}
-	dhcpLast := "not observed"
-	if snap.DHCP.Seen {
-		dhcpLast = emptyText(snap.DHCP.LastType)
-		if !snap.DHCP.LastSeen.IsZero() {
-			dhcpLast += "  " + ageString(snap.DHCP.LastSeen)
-		}
-	}
-	radiusLast := "not visible"
-	if snap.RADIUS.Seen {
-		radiusLast = emptyText(snap.RADIUS.LastCode)
-		if snap.RADIUS.AccessRequests > 0 && snap.RADIUS.AccessAccepts == 0 && snap.RADIUS.AccessRejects == 0 && snap.RADIUS.AccessChallenges == 0 {
-			radiusLast += "  no response"
-		}
-	}
-
-	var sb strings.Builder
-	sb.WriteString(styleLabel.Render("Control Plane") + "\n")
-	sb.WriteString(renderKeyValue("EAPOL", trunc(eapLast, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("EAP S/F", fmt.Sprintf("%d/%d", e.Successes, e.Failures)) + "\n")
-	sb.WriteString(renderKeyValue("DHCP", trunc(dhcpLast, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("RADIUS", trunc(radiusLast, width-18)) + "\n")
-	sb.WriteString(renderKeyValue("Req/Resp", fmt.Sprintf("%d/%d", snap.RADIUS.AccessRequests, snap.RADIUS.AccessAccepts+snap.RADIUS.AccessRejects+snap.RADIUS.AccessChallenges)) + "\n")
-	return sb.String()
-}
-
-func (m DashboardModel) renderConversationsBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
-	return renderCard(width, m.conversationsContent(status, snap, width))
-}
-
 func (m DashboardModel) conversationsContent(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
 	var sb strings.Builder
 	sb.WriteString(styleLabel.Render("Visible Conversations") + "\n")
@@ -1651,24 +1377,14 @@ func (m DashboardModel) endpointLabel(status bridge.BridgeStatus, snap stealth.N
 		if len(status.TargetID.MAC) > 0 && macEqualUI(mac, status.TargetID.MAC) {
 			return "target"
 		}
-		if len(status.TargetID.IP) > 0 && ip.Equal(status.TargetID.IP) {
-			return "target"
+		for _, targetIP := range targetIPCandidates(status, snap) {
+			if ip.Equal(targetIP) {
+				return "target"
+			}
 		}
 	}
-	if len(snap.Gateway.IP) > 0 && ip.Equal(snap.Gateway.IP) {
-		return "gateway"
-	}
-	if len(snap.Gateway.MAC) > 0 && macEqualUI(mac, snap.Gateway.MAC) {
-		return "gateway"
-	}
-	if len(snap.RADIUS.ServerIP) > 0 && ip.Equal(snap.RADIUS.ServerIP) {
-		return "radius"
-	}
-	if len(snap.DHCP.ServerIP) > 0 && ip.Equal(snap.DHCP.ServerIP) {
-		return "dhcp"
-	}
-	if len(snap.DHCP.RouterIP) > 0 && ip.Equal(snap.DHCP.RouterIP) {
-		return "gateway"
+	if roles := endpointInfraRoles(snap, ip, mac); len(roles) > 0 {
+		return strings.Join(roles, "+")
 	}
 	if len(ip) > 0 {
 		return ip.String()
@@ -1679,176 +1395,143 @@ func (m DashboardModel) endpointLabel(status bridge.BridgeStatus, snap stealth.N
 	return "unknown"
 }
 
-func (m DashboardModel) renderAuthFlowBox(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot, width int) string {
-	targetMAC := "unknown"
-	targetIP := "unknown"
-	if status.TargetID != nil {
-		targetMAC = formatMAC(status.TargetID.MAC)
-		targetIP = formatIP(status.TargetID.IP)
+func endpointInfraRoles(snap stealth.NetworkMapSnapshot, ip net.IP, mac net.HardwareAddr) []string {
+	roles := make([]string, 0, 4)
+	add := func(role string) {
+		if role == "" {
+			return
+		}
+		for _, existing := range roles {
+			if existing == role {
+				return
+			}
+		}
+		roles = append(roles, role)
 	}
-	if targetIP == "unknown" && len(snap.DHCP.ACKIP) > 0 {
-		targetIP = snap.DHCP.ACKIP.String()
+	if len(snap.Gateway.IP) > 0 && ip.Equal(snap.Gateway.IP) {
+		add("gateway")
 	}
-
-	portState := formatPortState(snap.Port)
-
-	radius := "not visible"
-	if snap.RADIUS.Seen {
-		radius = formatIP(snap.RADIUS.ServerIP)
+	if len(snap.Gateway.MAC) > 0 && macEqualUI(mac, snap.Gateway.MAC) {
+		add("gateway")
 	}
+	if len(snap.DHCP.RouterIP) > 0 && ip.Equal(snap.DHCP.RouterIP) {
+		add("gateway")
+	}
+	if len(snap.DHCP.ServerIP) > 0 && ip.Equal(snap.DHCP.ServerIP) {
+		add("dhcp")
+	}
+	if len(snap.RADIUS.ServerIP) > 0 && ip.Equal(snap.RADIUS.ServerIP) {
+		add("radius")
+	}
+	if len(snap.RADIUS.ClientIP) > 0 && ip.Equal(snap.RADIUS.ClientIP) {
+		add("nas")
+	}
+	if len(snap.RADIUS.NASIPAddress) > 0 && ip.Equal(snap.RADIUS.NASIPAddress) {
+		add("nas")
+	}
+	for _, dnsIP := range dnsServerCandidates(snap) {
+		if len(dnsIP) > 0 && ip.Equal(dnsIP) {
+			add("dns")
+		}
+	}
+	return roles
+}
 
+func (m DashboardModel) hostsMapContent(snap stealth.NetworkMapSnapshot, width int) string {
 	var sb strings.Builder
-	sb.WriteString(styleLabel.Render("Passive NAC Map") + "\n")
-	sb.WriteString(renderKeyValue("Device", targetMAC+"  "+targetIP) + "\n")
-	sb.WriteString(renderKeyValue("Supplicant", formatMAC(snap.EAPOL.SupplicantMAC)) + "\n")
-	sb.WriteString(renderKeyValue("Authenticator", formatMAC(snap.EAPOL.AuthenticatorMAC)) + "\n")
-	sb.WriteString(renderKeyValue("RADIUS", radius) + "\n")
-	sb.WriteString(renderKeyValue("Port", portState) + "\n")
-	sb.WriteString(renderKeyValue("Evidence", trunc(emptyText(snap.Port.Reason), width-18)) + "\n")
-	sb.WriteString(renderKeyValue("VLANs", formatVLANs(snap.VLANIDs, snap.RADIUS.AssignedVLAN)) + "\n")
-	return renderCard(width, sb.String())
-}
+	sb.WriteString(styleLabel.Render("Hosts Map") + "\n")
 
-func (m DashboardModel) renderEAPOLBox(snap stealth.NetworkMapSnapshot, width int) string {
-	return renderCard(width, m.eapolContent(snap, width))
-}
-
-func (m DashboardModel) eapolContent(snap stealth.NetworkMapSnapshot, width int) string {
-	e := snap.EAPOL
-	method := e.LastMethod
-	if method == "" {
-		method = "unknown"
-	}
-	last := "never"
-	if !e.LastSeen.IsZero() {
-		last = ageString(e.LastSeen)
-	}
-
-	var sb strings.Builder
-	sb.WriteString(styleLabel.Render("802.1X / EAPOL") + "\n")
-	sb.WriteString(renderKeyValue("Detected", boolText(e.Detected)) + "\n")
-	sb.WriteString(renderKeyValue("Last", e.LastCode+" "+method+"  "+last) + "\n")
-	sb.WriteString(renderKeyValue("Requests", fmt.Sprintf("%d", e.Requests)) + "\n")
-	sb.WriteString(renderKeyValue("Responses", fmt.Sprintf("%d", e.Responses)) + "\n")
-	sb.WriteString(renderKeyValue("Success/Fail", fmt.Sprintf("%d / %d", e.Successes, e.Failures)) + "\n")
-	sb.WriteString(renderKeyValue("Start/Logoff", fmt.Sprintf("%d / %d", e.Starts, e.Logoffs)) + "\n")
-	sb.WriteString(renderKeyValue("MKA/Key", fmt.Sprintf("%d / %d", e.MKAFrames, e.KeyFrames)) + "\n")
-	return sb.String()
-}
-
-func (m DashboardModel) renderDHCPBox(snap stealth.NetworkMapSnapshot, width int) string {
-	return renderCard(width, m.dhcpContent(snap, width))
-}
-
-func (m DashboardModel) dhcpContent(snap stealth.NetworkMapSnapshot, width int) string {
-	d := snap.DHCP
-	last := "never"
-	if !d.LastSeen.IsZero() {
-		last = ageString(d.LastSeen)
-	}
-	lease := "unknown"
-	if d.LeaseSeconds > 0 {
-		lease = stats.HumanizeDuration(time.Duration(d.LeaseSeconds) * time.Second)
-	}
-
-	var sb strings.Builder
-	sb.WriteString(styleLabel.Render("DHCP / VLAN") + "\n")
-	sb.WriteString(renderKeyValue("Seen", boolText(d.Seen)) + "\n")
-	sb.WriteString(renderKeyValue("Last", d.LastType+"  "+last) + "\n")
-	sb.WriteString(renderKeyValue("D/O/R/A/N", fmt.Sprintf("%d/%d/%d/%d/%d", d.Discovers, d.Offers, d.Requests, d.ACKs, d.NAKs)) + "\n")
-	sb.WriteString(renderKeyValue("Address", formatIP(firstIP(d.ACKIP, d.OfferedIP))) + "\n")
-	sb.WriteString(renderKeyValue("Server", formatIP(d.ServerIP)) + "\n")
-	sb.WriteString(renderKeyValue("Router", formatIP(d.RouterIP)) + "\n")
-	sb.WriteString(renderKeyValue("Hostname", emptyText(d.Hostname)) + "\n")
-	sb.WriteString(renderKeyValue("Lease", lease) + "\n")
-	return sb.String()
-}
-
-func (m DashboardModel) renderRADIUSBox(snap stealth.NetworkMapSnapshot, width int) string {
-	return renderCard(width, m.radiusContent(snap, width))
-}
-
-func (m DashboardModel) radiusContent(snap stealth.NetworkMapSnapshot, width int) string {
-	r := snap.RADIUS
-	last := "never"
-	if !r.LastSeen.IsZero() {
-		last = ageString(r.LastSeen)
-	}
-
-	var sb strings.Builder
-	sb.WriteString(styleLabel.Render("RADIUS") + "\n")
-	if !r.Seen {
-		sb.WriteString(styleDim.Render("RADIUS traffic is not visible on this inline path unless it traverses the bridge or a mirror feed.") + "\n")
+	entries := dnsHostMapEntries(snap)
+	if len(entries) == 0 {
+		sb.WriteString(styleDim.Render("No DNS host mappings observed yet.") + "\n")
 		return sb.String()
 	}
-	sb.WriteString(renderKeyValue("Server", formatIP(r.ServerIP)) + "\n")
-	sb.WriteString(renderKeyValue("NAS", formatIP(r.NASIPAddress)) + "\n")
-	sb.WriteString(renderKeyValue("Last", r.LastCode+"  "+last) + "\n")
-	sb.WriteString(renderKeyValue("Req/Chal", fmt.Sprintf("%d / %d", r.AccessRequests, r.AccessChallenges)) + "\n")
-	sb.WriteString(renderKeyValue("Accept/Reject", fmt.Sprintf("%d / %d", r.AccessAccepts, r.AccessRejects)) + "\n")
-	sb.WriteString(renderKeyValue("Acct", fmt.Sprintf("%d / %d", r.AccountingRequests, r.AccountingResponses)) + "\n")
-	if r.AccessRequests > 0 && r.AccessAccepts == 0 && r.AccessRejects == 0 && r.AccessChallenges == 0 {
-		path := "no response seen"
-		if !r.LastRequestSeen.IsZero() {
-			path += " " + ageString(r.LastRequestSeen)
-		}
-		sb.WriteString(renderKeyValue("Path", styleWarning.Render(path)) + "\n")
-	}
-	sb.WriteString(renderKeyValue("Calling", emptyText(r.CallingStationID)) + "\n")
-	sb.WriteString(renderKeyValue("Called", emptyText(r.CalledStationID)) + "\n")
-	sb.WriteString(renderKeyValue("Policy", emptyText(firstString(r.FilterID, r.ReplyMessage))) + "\n")
-	sb.WriteString(renderKeyValue("VLAN", emptyText(r.AssignedVLAN)) + "\n")
-	return sb.String()
-}
 
-func (m DashboardModel) renderRecentEventsBox(snap stealth.NetworkMapSnapshot, width int) string {
-	return renderCard(width, m.recentEventsContent(snap, width))
-}
-
-func (m DashboardModel) recentEventsContent(snap stealth.NetworkMapSnapshot, width int) string {
-	var sb strings.Builder
-	sb.WriteString(styleLabel.Render("Auth Events") + "\n")
-	if len(snap.RecentEvents) == 0 {
-		sb.WriteString(styleDim.Render("No control-plane events observed yet.") + "\n")
-		return sb.String()
+	limit := 10
+	if width < 64 {
+		limit = 6
 	}
-	start := 0
-	if len(snap.RecentEvents) > 8 {
-		start = len(snap.RecentEvents) - 8
-	}
-	for _, ev := range snap.RecentEvents[start:] {
-		prefix := ev.Kind
-		if ev.VLANID != 0 {
-			prefix += fmt.Sprintf("/%d", ev.VLANID)
+	for i, entry := range entries {
+		if i >= limit {
+			sb.WriteString(styleDim.Render(fmt.Sprintf("+%d more DNS names", len(entries)-i)) + "\n")
+			break
 		}
-		if ev.Interface != "" {
-			prefix += "@" + ev.Interface
+		target := strings.Join(entry.IPs, ", ")
+		meta := emptyText(strings.Join(entry.Types, ","))
+		if !entry.LastSeen.IsZero() {
+			meta += " " + ageString(entry.LastSeen)
 		}
-		sb.WriteString(styleKeyDesc.Render(ageString(ev.Timestamp)) + " " +
-			styleKey.Render(prefix) + " " +
-			styleVal.Render(trunc(ev.Summary, width-18)) + "\n")
-	}
-	return sb.String()
-}
-
-func (m DashboardModel) renderHostsBox(snap stealth.NetworkMapSnapshot, width int) string {
-	var sb strings.Builder
-	sb.WriteString(styleLabel.Render("Observed Network") + "\n")
-	sb.WriteString(renderKeyValue("Hosts", fmt.Sprintf("%d", snap.HostCount)) + "\n")
-	if snap.Gateway.Confirmed {
-		sb.WriteString(renderKeyValue("Gateway", formatIP(snap.Gateway.IP)+"  "+formatMAC(snap.Gateway.MAC)) + "\n")
-	}
-	for _, host := range snap.Hosts {
-		line := formatMAC(host.MAC) + "  " + formatIPs(host.IPs)
+		line := fmt.Sprintf("%s -> %s  %s", entry.Name, target, meta)
 		sb.WriteString(styleDim.Render(trunc(line, width-4)) + "\n")
 	}
-	if len(snap.DNSLog) > 0 {
-		sb.WriteString(styleLabel.Render("DNS") + "\n")
-		for _, q := range snap.DNSLog {
-			sb.WriteString(styleDim.Render(trunc(q.Name+" "+q.Type, width-4)) + "\n")
+	return sb.String()
+}
+
+type dnsHostMapEntry struct {
+	Name     string
+	IPs      []string
+	Types    []string
+	LastSeen time.Time
+}
+
+func dnsHostMapEntries(snap stealth.NetworkMapSnapshot) []dnsHostMapEntry {
+	byName := make(map[string]*dnsHostMapEntry)
+	for _, query := range snap.DNSLog {
+		name := normalizeDNSName(query.Name)
+		if name == "" {
+			continue
+		}
+		entry := byName[name]
+		if entry == nil {
+			entry = &dnsHostMapEntry{Name: name}
+			byName[name] = entry
+		}
+		entry.Types = appendUniqueString(entry.Types, emptyText(query.Type))
+		entry.LastSeen = maxTime(entry.LastSeen, query.Timestamp)
+		for _, response := range query.Response {
+			response = strings.TrimSpace(response)
+			if response == "" {
+				continue
+			}
+			if ip := net.ParseIP(response); ip != nil {
+				if !ipLooksLAN(ip) {
+					continue
+				}
+				entry.IPs = appendUniqueString(entry.IPs, ip.String())
+			}
+		}
+		if len(entry.IPs) == 0 {
+			delete(byName, name)
 		}
 	}
-	return renderCard(width, sb.String())
+
+	entries := make([]dnsHostMapEntry, 0, len(byName))
+	for _, entry := range byName {
+		if len(entry.IPs) == 0 {
+			continue
+		}
+		entries = append(entries, *entry)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Name == entries[j].Name {
+			return entries[i].LastSeen.After(entries[j].LastSeen)
+		}
+		return entries[i].Name < entries[j].Name
+	})
+	return entries
+}
+
+func ipLooksLAN(ip net.IP) bool {
+	if ip == nil || ip.IsLinkLocalUnicast() || ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	return ip.IsPrivate()
+}
+
+func normalizeDNSName(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.TrimSuffix(name, ".")
+	return name
 }
 
 // renderLeftColumn renders Traffic Statistics (stacked) and Throughput sparklines.
@@ -2011,33 +1694,13 @@ func (m DashboardModel) renderReconPanel(width int, targetHeight int) string {
 	var sb strings.Builder
 	sb.WriteString(styleLabel.Render(trunc("Reconnaissance Log", innerWidth)) + styleDim.Render(trunc("  (↑↓/jk scroll)", innerWidth-18)) + "\n")
 
-	sepLen := innerWidth
-	sep := strings.Repeat("─", sepLen)
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorBorder).Render(sep) + "\n")
-
 	logs := []string{"[*] Waiting for sniffer to initialize..."}
 	if len(status.ReconLogs) > 0 {
 		logs = status.ReconLogs
 	}
 
-	// Dynamic maxVis: content height minus title and separator.
-	maxVis := contentHeight - 2
-	if maxVis < 0 {
-		maxVis = 0
-	}
-
-	logsLen := len(logs)
-	start := logsLen - maxVis - m.logScroll
-	if start < 0 {
-		start = 0
-	}
-	end := start + maxVis
-	if end > logsLen {
-		end = logsLen
-	}
-
-	for _, log := range logs[start:end] {
-		sb.WriteString(formatLogLine(trunc(log, innerWidth)) + "\n")
+	for _, log := range visibleReconLogLines(logs, innerWidth, contentHeight-1, m.logScroll) {
+		sb.WriteString(formatLogLine(log) + "\n")
 	}
 
 	return lipgloss.NewStyle().
@@ -2049,6 +1712,102 @@ func (m DashboardModel) renderReconPanel(width int, targetHeight int) string {
 		Height(contentHeight).
 		MaxHeight(outerHeight).
 		Render(sb.String())
+}
+
+func visibleReconLogLines(logs []string, width int, maxLines int, scroll int) []string {
+	if maxLines <= 0 || len(logs) == 0 {
+		return nil
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+	end := len(logs) - scroll
+	if end < 0 {
+		end = 0
+	}
+	if end > len(logs) {
+		end = len(logs)
+	}
+
+	lines := make([]string, 0, maxLines)
+	for i := end - 1; i >= 0 && len(lines) < maxLines; i-- {
+		wrapped := wrapReconLogLine(logs[i], width)
+		for j := len(wrapped) - 1; j >= 0 && len(lines) < maxLines; j-- {
+			lines = append(lines, wrapped[j])
+		}
+	}
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	return lines
+}
+
+func wrapReconLogLine(line string, width int) []string {
+	line = strings.TrimRight(line, " \t")
+	if width <= 0 {
+		return nil
+	}
+	if line == "" || lipgloss.Width(line) <= width {
+		return []string{line}
+	}
+
+	const continuation = "    "
+	var out []string
+	prefix := ""
+	for line != "" {
+		available := width - lipgloss.Width(prefix)
+		if available < 1 {
+			prefix = ""
+			available = width
+		}
+		cut := reconWrapCut(line, available)
+		if cut <= 0 {
+			break
+		}
+		part := strings.TrimRight(line[:cut], " \t")
+		if part != "" {
+			out = append(out, prefix+part)
+		}
+		line = strings.TrimLeft(line[cut:], " \t")
+		if line == "" {
+			break
+		}
+		if width > lipgloss.Width(continuation)+1 {
+			prefix = continuation
+		} else {
+			prefix = ""
+		}
+	}
+	if len(out) == 0 {
+		return []string{""}
+	}
+	return out
+}
+
+func reconWrapCut(line string, width int) int {
+	if lipgloss.Width(line) <= width {
+		return len(line)
+	}
+	lastSpace := -1
+	for idx, r := range line {
+		next := idx + utf8.RuneLen(r)
+		if lipgloss.Width(line[:next]) > width {
+			if unicode.IsSpace(r) && idx > 0 {
+				return idx
+			}
+			if lastSpace > 0 {
+				return lastSpace
+			}
+			if idx > 0 {
+				return idx
+			}
+			return next
+		}
+		if unicode.IsSpace(r) {
+			lastSpace = next
+		}
+	}
+	return len(line)
 }
 
 var (
@@ -2198,6 +1957,10 @@ func formatStrings(values []string) string {
 }
 
 func targetIPList(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot) string {
+	return formatIPs(targetIPCandidates(status, snap))
+}
+
+func targetIPCandidates(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot) []net.IP {
 	var targetMAC net.HardwareAddr
 	if status.TargetID != nil {
 		targetMAC = status.TargetID.MAC
@@ -2205,21 +1968,24 @@ func targetIPList(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot) s
 	seen := make(map[string]bool)
 	ips := make([]net.IP, 0, 4)
 	add := func(ip net.IP) {
-		if len(ip) == 0 {
+		ip4 := ip.To4()
+		if ip4 == nil || ip4.IsUnspecified() || ip4.IsMulticast() {
 			return
 		}
-		key := ip.String()
+		key := ip4.String()
 		if key == "" || key == "<nil>" || seen[key] {
 			return
 		}
 		seen[key] = true
-		ips = append(ips, ip)
+		ips = append(ips, append(net.IP(nil), ip4...))
 	}
 	if status.TargetID != nil {
 		add(status.TargetID.IP)
 	}
-	add(snap.DHCP.ACKIP)
-	add(snap.DHCP.OfferedIP)
+	if len(targetMAC) == 0 || macEqualUI(snap.DHCP.ClientMAC, targetMAC) {
+		add(snap.DHCP.ACKIP)
+		add(snap.DHCP.OfferedIP)
+	}
 	for _, host := range snap.Hosts {
 		if len(targetMAC) > 0 && macEqualUI(host.MAC, targetMAC) {
 			for _, ip := range host.IPs {
@@ -2227,7 +1993,330 @@ func targetIPList(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot) s
 			}
 		}
 	}
-	return formatIPs(ips)
+	for _, conv := range snap.Conversations {
+		if len(targetMAC) > 0 && macEqualUI(conv.SrcMAC, targetMAC) {
+			add(conv.SrcIP)
+		}
+		if len(targetMAC) > 0 && macEqualUI(conv.DstMAC, targetMAC) {
+			add(conv.DstIP)
+		}
+	}
+	if len(targetMAC) > 0 && macEqualUI(snap.Port.SrcMAC, targetMAC) {
+		add(snap.Port.SrcIP)
+	}
+	if len(targetMAC) > 0 && macEqualUI(snap.Port.DstMAC, targetMAC) {
+		add(snap.Port.DstIP)
+	}
+	return ips
+}
+
+func layer3IPEvidence(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot) string {
+	targets := targetIPCandidates(status, snap)
+	if len(targets) == 0 {
+		return "unknown"
+	}
+
+	var targetMAC net.HardwareAddr
+	if status.TargetID != nil {
+		targetMAC = status.TargetID.MAC
+	}
+	evidence := make([]string, 0, 5)
+	add := func(label string) {
+		evidence = appendUniqueString(evidence, label)
+	}
+
+	if status.TargetID != nil && ipInList(status.TargetID.IP, targets) {
+		add("initial passive")
+	}
+	if ipInList(snap.DHCP.ACKIP, targets) {
+		add("DHCP ACK")
+	}
+	if ipInList(snap.DHCP.OfferedIP, targets) {
+		add("DHCP offer")
+	}
+	for _, host := range snap.Hosts {
+		if len(targetMAC) > 0 && macEqualUI(host.MAC, targetMAC) {
+			for _, ip := range host.IPs {
+				if ipInList(ip, targets) {
+					add("host traffic")
+					break
+				}
+			}
+		}
+	}
+	for _, conv := range snap.Conversations {
+		switch {
+		case len(targetMAC) > 0 && (macEqualUI(conv.SrcMAC, targetMAC) || macEqualUI(conv.DstMAC, targetMAC)):
+			add("passive traffic")
+		case ipInList(conv.SrcIP, targets) || ipInList(conv.DstIP, targets):
+			add("passive traffic")
+		}
+	}
+	if ipInList(snap.Port.SrcIP, targets) || ipInList(snap.Port.DstIP, targets) {
+		add("port telemetry")
+	}
+
+	if len(evidence) == 0 {
+		return "passive IP"
+	}
+	return strings.Join(evidence, ", ")
+}
+
+func formatGatewayEvidence(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot) string {
+	evidence := make(map[string][]string)
+	addEvidence := func(ip net.IP, label string) {
+		ip4 := ip.To4()
+		if ip4 == nil || ip4.IsUnspecified() || ip4.IsMulticast() {
+			return
+		}
+		key := ip4.String()
+		evidence[key] = appendUniqueString(evidence[key], label)
+	}
+
+	addEvidence(snap.DHCP.RouterIP, "DHCP option 3")
+	if snap.Gateway.Confirmed {
+		addEvidence(snap.Gateway.IP, "traffic analysis")
+	}
+	if status.TargetID != nil {
+		addEvidence(status.TargetID.Gateway, "passive ARP/DHCP")
+	}
+
+	for _, ip := range []net.IP{snap.DHCP.RouterIP, snap.Gateway.IP} {
+		ip4 := ip.To4()
+		if ip4 == nil {
+			continue
+		}
+		label := ip4.String()
+		if snap.Gateway.Confirmed && snap.Gateway.IP.Equal(ip4) && len(snap.Gateway.MAC) > 0 {
+			label += "  " + formatMAC(snap.Gateway.MAC)
+		}
+		if tags := evidence[ip4.String()]; len(tags) > 0 {
+			label += " (" + strings.Join(tags, ", ") + ")"
+		}
+		return label
+	}
+	if status.TargetID != nil {
+		if ip4 := status.TargetID.Gateway.To4(); ip4 != nil {
+			label := ip4.String()
+			if tags := evidence[ip4.String()]; len(tags) > 0 {
+				label += " (" + strings.Join(tags, ", ") + ")"
+			}
+			return label
+		}
+	}
+	return "unknown"
+}
+
+func formatNetmaskEvidence(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot) string {
+	if len(snap.DHCP.Netmask) > 0 {
+		return formatMask(snap.DHCP.Netmask) + " (DHCP option 1)"
+	}
+	if status.TargetID != nil && status.TargetID.NetmaskObserved && len(status.TargetID.Netmask) > 0 {
+		return formatMask(status.TargetID.Netmask) + " (passive)"
+	}
+	return "unknown"
+}
+
+func formatDHCPLease(snap stealth.NetworkMapSnapshot) string {
+	d := snap.DHCP
+	leaseIP := firstIP(d.ACKIP, d.OfferedIP)
+	if len(leaseIP) == 0 {
+		if d.Seen {
+			return "pending (" + emptyText(d.LastType) + ")"
+		}
+		return "not observed"
+	}
+
+	parts := []string{formatIP(leaseIP)}
+	if len(d.ServerIP) > 0 {
+		parts = append(parts, "from "+formatIP(d.ServerIP))
+	}
+	if d.LeaseSeconds > 0 {
+		parts = append(parts, stats.HumanizeDuration(time.Duration(d.LeaseSeconds)*time.Second))
+	}
+	if strings.TrimSpace(d.LastType) != "" {
+		parts = append(parts, d.LastType)
+	}
+	return strings.Join(parts, "  ")
+}
+
+func formatObservedLAN(status bridge.BridgeStatus, snap stealth.NetworkMapSnapshot) string {
+	ip := firstIPFromSlice(targetIPCandidates(status, snap))
+	if len(ip) == 0 {
+		ip = firstIP(snap.DHCP.ACKIP, snap.DHCP.OfferedIP, snap.Gateway.IP)
+	}
+
+	mask := snap.DHCP.Netmask
+	evidence := "DHCP option 1"
+	if len(mask) == 0 && status.TargetID != nil && status.TargetID.NetmaskObserved {
+		mask = status.TargetID.Netmask
+		evidence = "passive"
+	}
+
+	ip4 := ip.To4()
+	if ip4 == nil || len(mask) == 0 {
+		return "unknown"
+	}
+	ones, bits := mask.Size()
+	if bits == 0 {
+		return "unknown"
+	}
+	return fmt.Sprintf("%s/%d (%s)", ip4.Mask(mask).String(), ones, evidence)
+}
+
+func formatExternalSeen(snap stealth.NetworkMapSnapshot) string {
+	count := 0
+	for _, conv := range snap.Conversations {
+		if ipIsExternal(conv.SrcIP) || ipIsExternal(conv.DstIP) {
+			count++
+		}
+	}
+	if count == 0 {
+		return "no"
+	}
+	if count == 1 {
+		return "yes (1 flow)"
+	}
+	return fmt.Sprintf("yes (%d flows)", count)
+}
+
+func ipInList(ip net.IP, values []net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	for _, value := range values {
+		if ip4.Equal(value.To4()) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstIPFromSlice(values []net.IP) net.IP {
+	for _, value := range values {
+		if value.To4() != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func ipIsExternal(ip net.IP) bool {
+	if len(ip) == 0 || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	return ip.IsGlobalUnicast()
+}
+
+func ipStringCandidates(ips []net.IP) []string {
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		out = appendUniqueString(out, formatIP(ip))
+	}
+	return out
+}
+
+func dnsServerCandidates(snap stealth.NetworkMapSnapshot) []net.IP {
+	evidence := dnsServerEvidence(snap)
+	keys := make([]string, 0, len(evidence))
+	for key := range evidence {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	out := make([]net.IP, 0, len(keys))
+	for _, key := range keys {
+		if ip := net.ParseIP(key); ip != nil {
+			out = append(out, ip)
+		}
+	}
+	return out
+}
+
+func dnsServerEvidence(snap stealth.NetworkMapSnapshot) map[string][]string {
+	evidence := make(map[string][]string)
+	add := func(ip net.IP, tags ...string) {
+		ip4 := ip.To4()
+		if ip4 == nil || ip4.IsUnspecified() || ip4.IsMulticast() {
+			return
+		}
+		key := ip4.String()
+		evidence[key] = appendUniqueStrings(evidence[key], tags...)
+	}
+
+	for _, ip := range snap.DHCP.DNSServers {
+		add(ip, "dhcp-option-6")
+	}
+	for _, query := range snap.DNSLog {
+		if len(query.ServerIP) > 0 {
+			tags := []string{"dns-packet"}
+			if len(query.Response) > 0 {
+				tags = append(tags, "dns-response-src")
+			} else {
+				tags = append(tags, "dns-query-dst")
+			}
+			if query.VLANID != 0 {
+				tags = append(tags, fmt.Sprintf("vlan/%d", query.VLANID))
+			}
+			add(query.ServerIP, tags...)
+		}
+	}
+	for _, conv := range snap.Conversations {
+		proto := strings.ToUpper(strings.TrimSpace(conv.Protocol))
+		tags := []string{"dns-port-53"}
+		if proto == "DNS" {
+			tags = append(tags, "dns-conversation", "dns-packet")
+		}
+		if conv.DstPort == 53 {
+			add(conv.DstIP, append(tags, "dns-query-dst")...)
+		}
+		if conv.SrcPort == 53 {
+			add(conv.SrcIP, append(tags, "dns-response-src")...)
+		}
+	}
+	return evidence
+}
+
+func formatDNSServers(snap stealth.NetworkMapSnapshot) string {
+	ips := dnsServerCandidates(snap)
+	if len(ips) == 0 {
+		return "unknown"
+	}
+	evidence := dnsServerEvidence(snap)
+	parts := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		label := formatIP(ip)
+		if tags := limitStrings(evidence[label], 3); len(tags) > 0 {
+			label += " (" + strings.Join(tags, ",") + ")"
+		}
+		parts = append(parts, label)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func dnsServerLastSeen(snap stealth.NetworkMapSnapshot, ip net.IP) time.Time {
+	var last time.Time
+	if ip == nil {
+		return last
+	}
+	for _, dnsIP := range snap.DHCP.DNSServers {
+		if dnsIP.Equal(ip) {
+			last = maxTime(last, snap.DHCP.LastSeen)
+		}
+	}
+	for _, query := range snap.DNSLog {
+		if len(query.ServerIP) > 0 && query.ServerIP.Equal(ip) {
+			last = maxTime(last, query.Timestamp)
+		}
+	}
+	for _, conv := range snap.Conversations {
+		if (conv.SrcPort == 53 && conv.SrcIP.Equal(ip)) || (conv.DstPort == 53 && conv.DstIP.Equal(ip)) ||
+			(strings.EqualFold(conv.Protocol, "DNS") && (conv.SrcIP.Equal(ip) || conv.DstIP.Equal(ip))) {
+			last = maxTime(last, conv.LastSeen)
+		}
+	}
+	return last
 }
 
 func formatMask(mask net.IPMask) string {
@@ -2302,6 +2391,38 @@ func firstString(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func formatDHCPParamRequest(params []byte) string {
+	if len(params) == 0 {
+		return ""
+	}
+	names := map[byte]string{
+		1:   "subnet",
+		3:   "router",
+		6:   "dns",
+		12:  "host",
+		15:  "domain",
+		42:  "ntp",
+		44:  "netbios-ns",
+		46:  "netbios-node",
+		119: "search",
+		121: "routes",
+		252: "wpad",
+	}
+	labels := make([]string, 0, len(params))
+	for i, param := range params {
+		if i >= 12 {
+			labels = append(labels, fmt.Sprintf("+%d", len(params)-i))
+			break
+		}
+		if name := names[param]; name != "" {
+			labels = append(labels, fmt.Sprintf("%d/%s", param, name))
+		} else {
+			labels = append(labels, fmt.Sprintf("%d", param))
+		}
+	}
+	return strings.Join(labels, ",")
 }
 
 func firstIP(values ...net.IP) net.IP {
@@ -2389,18 +2510,12 @@ func (m DashboardModel) renderFooter() string {
 
 	// Navigation first (left side), then actions (right side).
 	parts := []string{
-		styleKey.Render("[Tab/1/2/3/4]"),
+		styleKey.Render("[Tab/1/2/3]"),
 		keyHint("Esc", "back"),
 		keyHint("q", "quit"),
 	}
 
 	switch {
-	case m.noteEditing:
-		parts = append(parts,
-			keyHint("Enter", "save note"),
-			keyHint("Backspace", "delete"),
-			keyHint("Ctrl+U", "clear"),
-		)
 	case m.page == pageNetwork:
 		parts = append(parts,
 			keyHint("↑↓", "select node"),
@@ -2412,7 +2527,6 @@ func (m DashboardModel) renderFooter() string {
 	case m.page == pageNodeDetail:
 		parts = append(parts,
 			keyHint("B", "map"),
-			keyHint("N", "edit note"),
 		)
 	}
 
@@ -2426,7 +2540,7 @@ func (m DashboardModel) renderFooter() string {
 			relayStr = "stop eapol"
 		}
 	}
-	if !m.noteEditing && m.page != pageNodeDetail {
+	if m.page != pageNodeDetail {
 		parts = append(parts,
 			hint(ready || listening, "E", "802.1X listen"),
 			hint(ready, "S", "802.1X send"),

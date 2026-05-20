@@ -17,6 +17,8 @@ import (
 // BridgeState represents the current state of the bridge.
 type BridgeState int
 
+const maxReconLogs = 600
+
 const (
 	BridgeStateDown               BridgeState = iota
 	BridgeStateCreated                        // bridge created but not fully up
@@ -216,7 +218,7 @@ func (b *Bridge) runStealth(ctx context.Context, ignoreMAC string) {
 
 	logFunc := func(msg string) {
 		b.mu.Lock()
-		b.reconLogs = append(b.reconLogs, msg)
+		b.appendReconLogLocked(msg)
 		b.mu.Unlock()
 	}
 	b.startPacketCaptures(ctx, logFunc, b.ifaceA)
@@ -1189,7 +1191,15 @@ func (b *Bridge) State() BridgeState {
 func (b *Bridge) AppendLog(msg string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.appendReconLogLocked(msg)
+}
+
+func (b *Bridge) appendReconLogLocked(msg string) {
 	b.reconLogs = append(b.reconLogs, msg)
+	if len(b.reconLogs) <= maxReconLogs {
+		return
+	}
+	b.reconLogs = append([]string(nil), b.reconLogs[len(b.reconLogs)-maxReconLogs:]...)
 }
 
 // IfaceA returns the name of the first member interface.
@@ -1292,7 +1302,7 @@ func (b *Bridge) destroy() error {
 		val := strings.TrimSpace(b.origIPv6Fwd)
 		_, _ = runCmd("sysctl", "-w", "net.inet6.ip6.forwarding="+val)
 	}
-	b.removeNATRoute(nil)
+	b.removeNATRouteLocked(nil)
 	stealth.RestoreL2Services()
 
 	b.state = BridgeStateDown
@@ -1304,7 +1314,7 @@ func (b *Bridge) destroy() error {
 }
 
 // CleanupStaleBridges finds and destroys any existing bridge interfaces
-// and flushes stale pfctl NAT rules. Useful for recovering from a crashed session.
+// and flushes stale pfctl NAT rules. Useful for recovering from a crashed run.
 func CleanupStaleBridges() ([]string, error) {
 	out, err := runCmd("ifconfig", "-l")
 	if err != nil {
@@ -1614,6 +1624,21 @@ func (b *Bridge) removeNATRoute(logFunc func(string)) {
 	b.natRouteInstalled = false
 	b.mu.Unlock()
 
+	removeNATRoute(network, netmask, bridgeName, installed, logFunc)
+}
+
+func (b *Bridge) removeNATRouteLocked(logFunc func(string)) {
+	network := b.natRouteNetwork
+	netmask := b.natRouteNetmask
+	installed := b.natRouteInstalled
+	bridgeName := b.name
+	b.natRouteNetwork = ""
+	b.natRouteNetmask = ""
+	b.natRouteInstalled = false
+	removeNATRoute(network, netmask, bridgeName, installed, logFunc)
+}
+
+func removeNATRoute(network, netmask, bridgeName string, installed bool, logFunc func(string)) {
 	if !installed || network == "" || netmask == "" {
 		return
 	}
