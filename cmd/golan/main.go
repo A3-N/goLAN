@@ -6,85 +6,32 @@ import (
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/mcrn/goLAN/internal/bridge"
-	"github.com/mcrn/goLAN/internal/tui"
+	"golan/internal/tui"
 )
 
 var version = "dev"
 
 func main() {
-	cleanup := flag.Bool("cleanup", false, "Remove any stale bridge interfaces and exit")
-	nuke := flag.Bool("nuke", false, "Purge goLAN pcaps from the config directory and exit")
 	showVersion := flag.Bool("version", false, "Show version and exit")
+	noAlt := flag.Bool("no-alt", false, "Run without the alternate terminal screen")
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("goLAN %s\n", version)
-		os.Exit(0)
+		fmt.Printf("golan %s\n", version)
+		return
 	}
-
-	if *nuke {
-		root, err := tui.NukePcaps()
-		if err != nil {
-			fmt.Printf("  Error purging pcaps: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("  Purged goLAN pcaps under %s\n", root)
-		os.Exit(0)
-	}
-
-	// Check for root privileges.
 	if os.Geteuid() != 0 {
-		fmt.Println()
-		fmt.Println("  goLAN requires root privileges to manage network bridges.")
-		fmt.Println()
-		fmt.Println("  Run with sudo:")
-		fmt.Println("    sudo golan")
-		fmt.Println()
+		fmt.Fprintln(os.Stderr, "golan requires root privileges to inspect adapters and capture traffic; run it with sudo")
 		os.Exit(1)
 	}
 
-	// Handle --cleanup mode.
-	if *cleanup {
-		fmt.Println("  Cleaning up stale bridge interfaces...")
-		cleaned, err := bridge.CleanupStaleBridges()
-		if err != nil {
-			fmt.Printf("  Error: %v\n", err)
-			os.Exit(1)
-		}
-		if len(cleaned) == 0 {
-			fmt.Println("  No stale bridges found.")
-		} else {
-			for _, name := range cleaned {
-				fmt.Printf("  ✓ Destroyed %s\n", name)
-			}
-		}
-		os.Exit(0)
+	opts := []tea.ProgramOption{}
+	if !*noAlt {
+		opts = append(opts, tea.WithAltScreen())
 	}
 
-	// Launch the TUI.
-	p := tea.NewProgram(
-		tui.NewModel(),
-		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
-	)
-
-	finalModel, err := p.Run()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	if _, err := tea.NewProgram(tui.NewModel(), opts...).Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "golan: %v\n", err)
 		os.Exit(1)
-	}
-	if model, ok := finalModel.(tui.Model); ok {
-		if err := model.FinalizePcaps(); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not finalize pcap permissions: %v\n", err)
-		}
-		if files := model.PcapFiles(); len(files) > 0 {
-			fmt.Println("PCAP files:")
-			for _, file := range files {
-				fmt.Printf("  %s\n", file)
-			}
-		} else {
-			fmt.Println("PCAP files: none created")
-		}
 	}
 }

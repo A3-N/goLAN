@@ -5,61 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
 )
-
-// PFRule defines a NAT masquerade rule.
-type PFRule struct {
-	Interface string
-	HiddenIP  string
-	TargetIP  string
-}
-
-// EnableNAT writes the rule to a temporary file and loads it into pf.
-func EnableNAT(rule PFRule) error {
-	// e.g. nat on bridge0 from 192.168.254.1 to any -> 10.0.0.50
-	r := fmt.Sprintf("nat on %s from %s to any -> %s\n", rule.Interface, rule.HiddenIP, rule.TargetIP)
-	// Block aggressive macOS identifying broadcasts (mDNS/Bonjour, LLMNR) that leak the Hostname
-	// The firewall operates at Layer 3, so Layer 2 True Device passthrough is unharmed.
-	r += fmt.Sprintf("block drop out quick on %s proto udp to 224.0.0.251 port 5353\n", rule.Interface)
-	r += fmt.Sprintf("block drop out quick on %s proto udp to 224.0.0.252 port 5355\n", rule.Interface)
-	r += fmt.Sprintf("block drop out quick on %s to 255.255.255.255\n", rule.Interface)
-
-	// Block the macOS kernel from natively answering local network probes (which leaks the 'mac-os' hostname)
-	// Because of NAT kernel absorption, the Mac natively fields reverse-DNS and Bonjour inquiries meant for the True Device.
-	r += fmt.Sprintf("block drop in quick on %s proto udp to any port { 5353, 5355, 137, 138, 139 }\n", rule.Interface)
-	r += fmt.Sprintf("block drop in quick on %s proto tcp to any port { 139, 445 }\n", rule.Interface)
-
-	// Block IP-based multicast leaks (L3 only — L2 leaks like LLDP/CDP are handled by SuppressL2Leaks).
-	r += fmt.Sprintf("block drop out quick on %s to 224.0.0.0/4\n", rule.Interface)
-
-	f, err := os.Create("/tmp/golan_pf.conf")
-	if err != nil {
-		return err
-	}
-	if _, err := f.WriteString(r); err != nil {
-		f.Close()
-		return fmt.Errorf("writing pfctl rules: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("closing pfctl rules file: %w", err)
-	}
-
-	// pfctl -E enables pf — must succeed before loading rules.
-	if out, err := runSystemCommand(5*time.Second, "pfctl", "-E"); err != nil {
-		return fmt.Errorf("pfctl -E (enable pf) failed: %s", out)
-	}
-
-	// Load the dynamic rule
-	out, err := runSystemCommand(5*time.Second, "pfctl", "-a", "com.apple/golan", "-f", "/tmp/golan_pf.conf")
-	if err != nil {
-		return fmt.Errorf("pfctl failed: %s", out)
-	}
-	return nil
-}
 
 // SuppressL2Leaks blocks Layer 2 discovery protocols that pfctl cannot intercept.
 // LLDP (EtherType 0x88cc, dst 01:80:c2:00:00:0e) and CDP (dst 01:00:0c:cc:cc:cc) are
@@ -149,20 +98,10 @@ func ResetBridgeRules(bridgeName string) error {
 	return nil
 }
 
-// RestoreL2Services re-enables host L2 services that goLAN disabled globally.
+// RestoreL2Services re-enables host L2 services that golan disabled globally.
 func RestoreL2Services() {
 	_, _ = runSystemCommand(3*time.Second, "launchctl", "load", "-w",
 		"/System/Library/LaunchDaemons/com.apple.lldpd.plist")
-}
-
-// DisableNAT flushes the rules.
-func DisableNAT() error {
-	out, err := runSystemCommand(5*time.Second, "pfctl", "-a", "com.apple/golan", "-F", "all")
-	if err != nil {
-		return fmt.Errorf("pfctl flush failed: %s", out)
-	}
-	os.Remove("/tmp/golan_pf.conf")
-	return nil
 }
 
 func runSystemCommand(timeout time.Duration, name string, args ...string) (string, error) {

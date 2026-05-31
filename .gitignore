@@ -36,6 +36,8 @@ go.work.sum
 .golan-session.json
 .config/goLAN/
 goLAN-sessions/
+config.json
+configs/
 sessions/
 pcaps/
 captures/

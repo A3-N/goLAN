@@ -13,11 +13,11 @@ import (
 
 // DetectResult holds the outcome of passive 802.1X detection on a wire.
 type DetectResult struct {
-	Detected         bool              // Whether any EAPOL frames were seen
-	AuthenticatorMAC net.HardwareAddr  // MAC of the switch sending EAPOL
-	EAPMethod        EAPMethod         // If determinable from initial exchange
-	MACsecCapable    bool              // If EAPOL-Key MKA frames were detected
-	FramesSeen       int               // Number of EAPOL frames observed
+	Detected         bool             // Whether any EAPOL frames were seen
+	AuthenticatorMAC net.HardwareAddr // MAC of the switch sending EAPOL
+	EAPMethod        EAPMethod        // If determinable from initial exchange
+	MACsecCapable    bool             // If EAPOL-Key MKA frames were detected
+	FramesSeen       int              // Number of EAPOL frames observed
 }
 
 // Detector passively listens on an interface for 802.1X activity.

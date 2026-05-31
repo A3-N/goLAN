@@ -86,7 +86,7 @@ type InterfaceDetail struct {
 	Dot1XMethod string // EAP method if available
 }
 
-// InterfaceRestoreState captures host-side settings goLAN may change during lockdown.
+// InterfaceRestoreState captures host-side settings golan may change during lockdown.
 type InterfaceRestoreState struct {
 	IfName            string
 	HardwarePort      string
@@ -140,7 +140,7 @@ func DiscoverInterfaces() ([]NetInterface, error) {
 
 // LockdownInterface forcefully isolates a physical network adapter.
 // It tears down its IPv4 routing, disables IPv6 autoconfiguration, and holds it DOWN
-// to guarantee 0 packets leak to the network before goLAN takes over.
+// to guarantee 0 packets leak to the network before golan takes over.
 func LockdownInterface(ifName, hardwarePort string) error {
 	var errs []string
 
@@ -152,7 +152,8 @@ func LockdownInterface(ifName, hardwarePort string) error {
 	// 2. Strip IPv4 leases natively
 	if out, err := runInterfaceCommand(5*time.Second, "ifconfig", ifName, "0.0.0.0"); err != nil {
 		// Ignore metric errors if the interface didn't have an IP anyway
-		if !strings.Contains(string(out), "invalid") && !strings.Contains(string(out), "file exists") {
+		lowerOut := strings.ToLower(string(out))
+		if !strings.Contains(lowerOut, "invalid") && !strings.Contains(lowerOut, "file exists") {
 			errs = append(errs, fmt.Sprintf("ipv4 strip failed: %v (%s)", err, strings.TrimSpace(string(out))))
 		}
 	}

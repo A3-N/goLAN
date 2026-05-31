@@ -1,0 +1,1604 @@
+package tui
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+	"sort"
+	"strings"
+	"time"
+	"unicode"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"golan/internal/adapters"
+	bridge "golan/internal/bridge"
+	"golan/internal/configs"
+	"golan/internal/listen"
+	"golan/internal/profile"
+)
+
+// Model owns the command-first initialization TUI state.
+type Model struct {
+	adapters []adapters.Adapter
+	profile  profile.Profile
+	loading  bool
+	err      error
+	listener *listen.Session
+	capMode  string
+	bridge   *bridge.Session
+
+	bridgeState  string
+	restoreState map[string]bridge.InterfaceRestoreState
+	lockPending  map[string]bool
+
+	activeAdapter string
+	cursorVisible bool
+	activeCard    cardFocus
+	outputScroll  int
+	miscScroll    int
+	output        []string
+	input         string
+	inputMode     inputMode
+	completions   []string
+	cycleContext  string
+	cycleIndex    int
+	cycleOptions  []string
+	history       []string
+	historyIndex  int
+
+	width  int
+	height int
+}
+
+type discoveredMsg struct {
+	adapters []adapters.Adapter
+	err      error
+}
+
+type cursorBlinkMsg struct{}
+
+type listenStartedMsg struct {
+	session *listen.Session
+	err     error
+	mode    string
+}
+
+type listenEventMsg struct {
+	session *listen.Session
+	event   listen.Event
+	ok      bool
+}
+
+type bridgeStartedMsg struct {
+	session *bridge.Session
+	err     error
+}
+
+type bridgeEventMsg struct {
+	session *bridge.Session
+	event   bridge.Event
+	ok      bool
+}
+
+type bridgeStoppedMsg struct {
+	session *bridge.Session
+	err     error
+}
+
+type adapterStateMsg struct {
+	name  string
+	state string
+	err   error
+}
+
+type adapterLockdownMsg struct {
+	name  string
+	role  string
+	state bridge.InterfaceRestoreState
+	err   error
+}
+
+type adapterRestoreMsg struct {
+	name string
+	err  error
+}
+
+type cardFocus int
+type inputMode int
+
+const (
+	cardOutput cardFocus = iota
+	cardCLI
+	cardMisc
+)
+
+const (
+	modeCommand inputMode = iota
+	modeSaveName
+)
+
+const (
+	cursorBlinkInterval = 500 * time.Millisecond
+)
+
+// NewModel creates a new setup model. The output pane intentionally starts
+// blank; command output appears only after the user runs a command.
+func NewModel() Model {
+	return Model{
+		loading:       true,
+		cursorVisible: true,
+		activeCard:    cardCLI,
+		cycleIndex:    -1,
+		historyIndex:  -1,
+		restoreState:  make(map[string]bridge.InterfaceRestoreState),
+		lockPending:   make(map[string]bool),
+	}
+}
+
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(discoverAdaptersCmd, blinkCursorCmd())
+}
+
+func blinkCursorCmd() tea.Cmd {
+	return tea.Tick(cursorBlinkInterval, func(time.Time) tea.Msg {
+		return cursorBlinkMsg{}
+	})
+}
+
+func discoverAdaptersCmd() tea.Msg {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	list, err := adapters.Discover(ctx)
+	return discoveredMsg{adapters: list, err: err}
+}
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case discoveredMsg:
+		m.loading = false
+		m.adapters = msg.adapters
+		m.err = msg.err
+		m.refreshCompletions()
+		return m, nil
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+	case cursorBlinkMsg:
+		m.cursorVisible = !m.cursorVisible
+		return m, blinkCursorCmd()
+	case listenStartedMsg:
+		if msg.err != nil {
+			m.print(msg.mode + " err: " + msg.err.Error())
+			return m, nil
+		}
+		m.listener = msg.session
+		m.capMode = msg.mode
+		m.print("listen: on")
+		m.print("pcap: " + msg.session.Dir)
+		return m, waitListenEventCmd(msg.session)
+	case listenEventMsg:
+		if m.listener != msg.session {
+			return m, nil
+		}
+		if !msg.ok {
+			m.listener = nil
+			mode := m.capMode
+			m.capMode = ""
+			if mode == "" {
+				mode = "listen"
+			}
+			m.print(mode + ": off")
+			return m, nil
+		}
+		cmd := m.handleListenEvent(msg.event)
+		return m, cmd
+	case bridgeStartedMsg:
+		if msg.err != nil {
+			m.print("bridge err: " + msg.err.Error())
+			return m, nil
+		}
+		m.bridge = msg.session
+		m.bridgeState = "starting"
+		m.print("bridge: on")
+		m.print("pcap: " + msg.session.Dir)
+		return m, waitBridgeEventCmd(msg.session)
+	case bridgeEventMsg:
+		if m.bridge != msg.session {
+			return m, nil
+		}
+		if !msg.ok {
+			m.bridge = nil
+			m.bridgeState = ""
+			m.print("bridge: off")
+			return m, nil
+		}
+		return m, m.handleBridgeEvent(msg.session, msg.event)
+	case bridgeStoppedMsg:
+		wasActive := m.bridge == msg.session
+		if wasActive {
+			m.bridge = nil
+			m.bridgeState = ""
+		}
+		if msg.err != nil {
+			m.print("bridge err: stop " + msg.err.Error())
+		} else if wasActive {
+			m.print("bridge: off")
+		}
+		return m, nil
+	case adapterStateMsg:
+		if msg.err != nil {
+			m.print(fmt.Sprintf("adapter state err %s: %v", msg.name, msg.err))
+			return m, nil
+		}
+		if cfg, ok := m.profile.ByName(msg.name); ok {
+			_, _ = cfg.Set("state", msg.state)
+		}
+		m.updateAdapterStatus(msg.name, msg.state == "up")
+		m.print(fmt.Sprintf("adapter state: %s %s", msg.name, msg.state))
+		return m, nil
+	case adapterLockdownMsg:
+		if m.restoreState == nil {
+			m.restoreState = make(map[string]bridge.InterfaceRestoreState)
+		}
+		if m.lockPending != nil {
+			delete(m.lockPending, msg.name)
+		}
+		if _, exists := m.restoreState[msg.name]; !exists {
+			m.restoreState[msg.name] = msg.state
+		}
+		m.updateAdapterStatus(msg.name, false)
+		if msg.err != nil {
+			m.print(fmt.Sprintf("adapter isolate warn %s: %v", msg.name, msg.err))
+		} else {
+			m.print(fmt.Sprintf("adapter isolated: %s %s", msg.role, msg.name))
+		}
+		return m, nil
+	case adapterRestoreMsg:
+		if msg.err != nil {
+			m.print(fmt.Sprintf("adapter restore warn %s: %v", msg.name, msg.err))
+		} else {
+			m.print("adapter restored: " + msg.name)
+		}
+		return m, nil
+	case tea.KeyMsg:
+		return m.updateCLI(msg)
+	default:
+		return m, nil
+	}
+}
+
+func (m Model) updateCLI(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		m.stopCapture()
+		m.stopBridgeNow()
+		m.restoreLockedAdaptersNow()
+		return m, tea.Quit
+	case "ctrl+s":
+		m.startSavePrompt()
+	case "left":
+		m.moveCardFocus(-1)
+	case "right":
+		m.moveCardFocus(1)
+	case "esc":
+		m.activeCard = cardCLI
+		m.input = ""
+		m.inputMode = modeCommand
+		m.completions = nil
+		m.resetCompletionCycle()
+		m.cursorVisible = true
+	case "enter":
+		m.activeCard = cardCLI
+		raw := strings.TrimSpace(m.input)
+		m.input = ""
+		m.completions = nil
+		m.resetCompletionCycle()
+		m.cursorVisible = true
+		if m.inputMode == modeSaveName {
+			m.inputMode = modeCommand
+			if raw == "" {
+				m.print("save: cancel")
+				return m, nil
+			}
+			m.saveConfig(raw)
+			return m, nil
+		}
+		if raw == "" {
+			return m, nil
+		}
+		m.history = append(m.history, raw)
+		m.historyIndex = -1
+		cmd := m.executeCommand(raw)
+		return m, cmd
+	case "backspace", "ctrl+h":
+		m.activeCard = cardCLI
+		m.input = trimLastRune(m.input)
+		m.resetCompletionCycle()
+		m.refreshCompletions()
+		m.cursorVisible = true
+	case "ctrl+u":
+		m.activeCard = cardCLI
+		m.input = ""
+		m.completions = nil
+		m.resetCompletionCycle()
+		m.cursorVisible = true
+	case "tab":
+		m.activeCard = cardCLI
+		m.applyCompletion()
+		m.cursorVisible = true
+	case "up":
+		m.handleVerticalMove(-1)
+		m.cursorVisible = true
+	case "down":
+		m.handleVerticalMove(1)
+		m.cursorVisible = true
+	default:
+		m.activeCard = cardCLI
+		m.input = appendInput(m.input, msg)
+		m.resetCompletionCycle()
+		m.refreshCompletions()
+		m.cursorVisible = true
+	}
+	return m, nil
+}
+
+func (m *Model) startSavePrompt() {
+	m.activeCard = cardCLI
+	m.inputMode = modeSaveName
+	m.input = ""
+	m.completions = nil
+	m.resetCompletionCycle()
+	m.cursorVisible = true
+	m.print("save as:")
+}
+
+func (m *Model) moveCardFocus(delta int) {
+	next := int(m.activeCard) + delta
+	if next < int(cardOutput) {
+		next = int(cardMisc)
+	}
+	if next > int(cardMisc) {
+		next = int(cardOutput)
+	}
+	m.activeCard = cardFocus(next)
+}
+
+func (m *Model) handleVerticalMove(delta int) {
+	switch m.activeCard {
+	case cardOutput:
+		m.outputScroll = max(0, m.outputScroll-delta)
+	case cardMisc:
+		m.miscScroll = max(0, m.miscScroll+delta)
+	default:
+		m.recallHistory(delta)
+	}
+}
+
+func (m *Model) executeCommand(raw string) tea.Cmd {
+	m.print(m.prompt() + raw)
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return nil
+	}
+
+	switch strings.ToLower(fields[0]) {
+	case "help", "?":
+		m.showHelp()
+	case "show":
+		m.executeShow(fields[1:])
+	case "clear", "cls":
+		m.output = nil
+		m.outputScroll = 0
+	case "set":
+		return m.executeSet(fields[1:])
+	case "unset":
+		return m.executeUnset(fields[1:])
+	case "conf", "config", "configure":
+		return m.executeConf(fields[1:])
+	case "load":
+		m.executeLoad(fields[1:])
+	case "start":
+		return m.executeStart(fields[1:])
+	case "stop":
+		return m.executeStop(fields[1:])
+	case "listen", "bridge":
+		m.print("use: start " + strings.ToLower(fields[0]) + " | stop " + strings.ToLower(fields[0]))
+	case "up":
+		return m.executeActiveAdapterState("up")
+	case "down":
+		return m.executeActiveAdapterState("down")
+	case "refresh":
+		m.loading = true
+		m.err = nil
+		m.print("refresh: adapters")
+		return discoverAdaptersCmd
+	case "quit", "exit":
+		m.stopCapture()
+		m.stopBridgeNow()
+		m.restoreLockedAdaptersNow()
+		return tea.Quit
+	default:
+		m.print("unknown: " + fields[0])
+		m.print("use: help")
+	}
+	return nil
+}
+
+func (m Model) prompt() string {
+	if m.inputMode == modeSaveName {
+		return "save as > "
+	}
+	if m.activeAdapter == "" {
+		return "> "
+	}
+	return "> (" + m.activeAdapter + ") "
+}
+
+func (m *Model) executeShow(args []string) {
+	if len(args) == 0 {
+		m.print("use: show adapters|config|bridge")
+		return
+	}
+	switch strings.ToLower(args[0]) {
+	case "adapters", "adapter":
+		m.showAdapters()
+	case "config", "conf":
+		m.showConfig()
+	case "bridge":
+		m.showBridge()
+	default:
+		m.print("use: show adapters|config|bridge")
+	}
+}
+
+func (m *Model) executeSet(args []string) tea.Cmd {
+	if len(args) == 0 {
+		m.print("use: set <adapter> <host|switch> | set <property> <value>")
+		return nil
+	}
+
+	key := strings.ToLower(args[0])
+	if key == "adapter" {
+		if len(args) < 2 {
+			m.print("use: set adapter <name> [host|switch]")
+			return nil
+		}
+		if len(args) >= 3 {
+			return m.stageAdapter(args[1], args[2])
+		}
+		return m.stageAdapterNext(args[1])
+	}
+
+	if _, ok := m.findAdapter(args[0]); ok {
+		if len(args) < 2 {
+			m.print("use: set <adapter> <host|switch>")
+			return nil
+		}
+		return m.stageAdapter(args[0], args[1])
+	}
+
+	if len(args) < 2 {
+		m.print("use: set <property> <value>")
+		return nil
+	}
+	if m.activeAdapter == "" {
+		m.print("ctx: none; use: conf <adapter>")
+		return nil
+	}
+
+	cfg, ok := m.profile.ByName(m.activeAdapter)
+	if !ok {
+		m.print("ctx: stale")
+		m.activeAdapter = ""
+		return nil
+	}
+
+	value := strings.Join(args[1:], " ")
+	old, err := cfg.Set(key, value)
+	if err != nil {
+		m.print("set err: " + err.Error())
+		return nil
+	}
+	canonical := profile.CanonicalKey(key)
+	next := cfg.Value(canonical)
+	autoApplied := false
+	if strings.EqualFold(next, "auto") {
+		if _, ok := cfg.ApplyFirstDiscovery(canonical); ok {
+			next = cfg.Value(canonical)
+			autoApplied = true
+		}
+	}
+	if old == next {
+		m.print(fmt.Sprintf("%s %s: same %s", cfg.Name, canonical, next))
+		return nil
+	}
+	suffix := ""
+	if autoApplied {
+		suffix = " auto"
+	}
+	m.print(fmt.Sprintf("%s %s: %s -> %s%s", cfg.Name, canonical, old, next, suffix))
+	return nil
+}
+
+func (m *Model) stageAdapter(name, roleValue string) tea.Cmd {
+	adapter, ok := m.findAdapter(name)
+	if !ok {
+		m.print("adapter err: " + name)
+		return nil
+	}
+	adapterRole := profile.CanonicalAdapterRole(roleValue)
+	if !profile.ValidAdapterRole(adapterRole) {
+		m.print("role err: host|switch")
+		return nil
+	}
+	before := append([]profile.AdapterConfig(nil), m.profile.Adapters...)
+	cfg, err := m.profile.SetAdapterRole(adapter, adapterRole)
+	if err != nil {
+		m.print("adapter err: " + err.Error())
+		return nil
+	}
+	if m.activeAdapter != "" {
+		if _, ok := m.profile.ByName(m.activeAdapter); !ok {
+			m.activeAdapter = ""
+		}
+	}
+	if strings.EqualFold(m.activeAdapter, cfg.Name) {
+		m.activeAdapter = ""
+	}
+	m.miscScroll = 0
+	m.print(fmt.Sprintf("adapter: %s %s", cfg.AdapterRole, cfg.Name))
+	m.markLockPending(cfg.Name)
+	return tea.Batch(append(m.restoreRemovedAdapterCmds(before), lockdownAdapterCmd(cfg))...)
+}
+
+func (m *Model) stageAdapterNext(name string) tea.Cmd {
+	adapter, ok := m.findAdapter(name)
+	if !ok {
+		m.print("adapter err: " + name)
+		return nil
+	}
+	cfg, err := m.profile.Add(adapter)
+	if err != nil {
+		m.print("adapter err: " + err.Error())
+		return nil
+	}
+	m.miscScroll = 0
+	m.print(fmt.Sprintf("adapter: %s %s", cfg.AdapterRole, cfg.Name))
+	m.markLockPending(cfg.Name)
+	return lockdownAdapterCmd(cfg)
+}
+
+func (m *Model) executeUnset(args []string) tea.Cmd {
+	if len(args) == 0 {
+		return m.unsetAdapter(m.activeAdapter)
+	}
+	if strings.EqualFold(args[0], "adapter") {
+		if len(args) == 1 {
+			return m.unsetAdapter(m.activeAdapter)
+		}
+		return m.unsetAdapter(args[1])
+	}
+	m.print("use: unset | unset adapter <name>")
+	return nil
+}
+
+func (m *Model) unsetAdapter(name string) tea.Cmd {
+	if name == "" {
+		m.print("ctx: none; use: conf <adapter>")
+		return nil
+	}
+	removed, ok := m.profile.RemoveName(name)
+	if !ok {
+		m.print("adapter unset: " + name)
+		return nil
+	}
+	if strings.EqualFold(m.activeAdapter, removed.Name) {
+		m.activeAdapter = ""
+	}
+	m.miscScroll = 0
+	m.print("adapter off: " + removed.Name)
+	if m.lockPending != nil {
+		delete(m.lockPending, removed.Name)
+	}
+	return m.restoreAdapterCmd(removed.Name)
+}
+
+func (m *Model) markLockPending(name string) {
+	if m.lockPending == nil {
+		m.lockPending = make(map[string]bool)
+	}
+	m.lockPending[name] = true
+}
+
+func (m *Model) restoreRemovedAdapterCmds(before []profile.AdapterConfig) []tea.Cmd {
+	var cmds []tea.Cmd
+	for _, cfg := range before {
+		if _, ok := m.profile.ByName(cfg.Name); ok {
+			continue
+		}
+		if cmd := m.restoreAdapterCmd(cfg.Name); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	return cmds
+}
+
+func (m *Model) restoreAdapterCmd(name string) tea.Cmd {
+	if m.restoreState == nil {
+		return nil
+	}
+	state, ok := m.restoreState[name]
+	if !ok {
+		return nil
+	}
+	delete(m.restoreState, name)
+	return func() tea.Msg {
+		return adapterRestoreMsg{name: name, err: bridge.RestoreInterfaceState(state)}
+	}
+}
+
+func lockdownAdapterCmd(cfg profile.AdapterConfig) tea.Cmd {
+	return func() tea.Msg {
+		state := bridge.CaptureInterfaceRestoreState(cfg.Name, cfg.HardwarePort)
+		err := bridge.LockdownInterface(cfg.Name, cfg.HardwarePort)
+		return adapterLockdownMsg{name: cfg.Name, role: cfg.AdapterRole, state: state, err: err}
+	}
+}
+
+func (m *Model) saveConfig(name string) {
+	if !m.profile.Ready() {
+		m.print("save err: no adapter")
+		return
+	}
+	path, err := configs.Save(name, configs.Snapshot{
+		ActiveAdapter: m.activeAdapter,
+		Profile:       m.profile,
+	})
+	if err != nil {
+		m.print("save err: " + err.Error())
+		return
+	}
+	m.print("saved: " + path)
+}
+
+func (m *Model) executeLoad(args []string) {
+	if len(args) == 0 {
+		m.listConfigs()
+		return
+	}
+	if args[0] == "<>" {
+		m.listConfigs()
+		return
+	}
+	snapshot, path, err := configs.Load(args[0])
+	if err != nil {
+		m.print("load err: " + err.Error())
+		return
+	}
+	m.profile = snapshot.Profile
+	m.activeAdapter = ""
+	if snapshot.ActiveAdapter != "" {
+		if _, ok := m.profile.ByName(snapshot.ActiveAdapter); ok {
+			m.activeAdapter = snapshot.ActiveAdapter
+		}
+	}
+	m.miscScroll = 0
+	m.print("loaded: " + path)
+}
+
+func (m *Model) executeStart(args []string) tea.Cmd {
+	if len(args) == 0 {
+		m.print("use: start listen|bridge")
+		return nil
+	}
+
+	switch strings.ToLower(args[0]) {
+	case "listen":
+		if pending := m.pendingLocks(); len(pending) > 0 {
+			m.print("listen err: adapter isolate pending " + strings.Join(pending, ","))
+			return nil
+		}
+		if m.bridge != nil {
+			m.print("listen err: bridge")
+			return nil
+		}
+		if m.listener != nil {
+			if m.capMode == "listen" {
+				m.print("listen: on")
+			} else {
+				m.print("listen err: bridge")
+			}
+			return nil
+		}
+		targets := m.listenTargets()
+		if len(targets) == 0 {
+			m.print("listen err: no adapter")
+			return nil
+		}
+		m.print("listen: start")
+		return startListenCmd(targets, "listen")
+	case "bridge":
+		if pending := m.pendingLocks(); len(pending) > 0 {
+			m.print("bridge err: adapter isolate pending " + strings.Join(pending, ","))
+			return nil
+		}
+		if m.bridge != nil {
+			m.print("bridge: on")
+			return nil
+		}
+		if m.listener != nil {
+			m.print("bridge err: listen")
+			return nil
+		}
+		host, sw, errText := m.bridgeAdapters()
+		if errText != "" {
+			m.print("bridge err: " + errText)
+			return nil
+		}
+		m.print("bridge: start")
+		return startBridgeCmd(host, sw)
+	default:
+		m.print("use: start listen|bridge")
+		return nil
+	}
+}
+
+func (m *Model) executeStop(args []string) tea.Cmd {
+	if len(args) == 0 {
+		m.print("use: stop listen|bridge")
+		return nil
+	}
+
+	switch strings.ToLower(args[0]) {
+	case "listen":
+		if m.listener == nil || m.capMode != "listen" {
+			m.print("listen: off")
+			return nil
+		}
+		m.stopCapture()
+		m.print("listen: stop")
+		return nil
+	case "bridge":
+		if m.bridge == nil {
+			m.print("bridge: off")
+			return nil
+		}
+		m.print("bridge: stop")
+		return stopBridgeCmd(m.bridge)
+	default:
+		m.print("use: stop listen|bridge")
+		return nil
+	}
+}
+
+func (m Model) listenTargets() []listen.Target {
+	cfg, ok := m.profile.Role(profile.AdapterRoleHost)
+	if !ok {
+		return nil
+	}
+	target := *cfg
+	if adapter, ok := m.findAdapter(target.Name); ok {
+		target.CurrentMAC = adapter.MAC
+		target.HardwarePort = adapter.HardwarePort
+	}
+	return []listen.Target{{
+		Name:         target.Name,
+		Role:         target.AdapterRole,
+		HardwarePort: target.HardwarePort,
+		LocalMAC:     target.CurrentMAC,
+	}}
+}
+
+func (m Model) bridgeAdapters() (profile.AdapterConfig, profile.AdapterConfig, string) {
+	host, okHost := m.profile.Role(profile.AdapterRoleHost)
+	sw, okSwitch := m.profile.Role(profile.AdapterRoleSwitch)
+	if !okHost || !okSwitch {
+		return profile.AdapterConfig{}, profile.AdapterConfig{}, "host+switch"
+	}
+	hostCfg := *host
+	swCfg := *sw
+	if adapter, ok := m.findAdapter(host.Name); ok {
+		hostCfg.CurrentMAC = adapter.MAC
+		hostCfg.HardwarePort = adapter.HardwarePort
+		hostCfg.Addrs = append([]string(nil), adapter.Addrs...)
+	}
+	if adapter, ok := m.findAdapter(sw.Name); ok {
+		swCfg.CurrentMAC = adapter.MAC
+		swCfg.HardwarePort = adapter.HardwarePort
+		swCfg.Addrs = append([]string(nil), adapter.Addrs...)
+	}
+	return hostCfg, swCfg, ""
+}
+
+func (m Model) pendingLocks() []string {
+	if len(m.lockPending) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(m.lockPending))
+	for name, pending := range m.lockPending {
+		if pending {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func startListenCmd(targets []listen.Target, mode string) tea.Cmd {
+	return func() tea.Msg {
+		for _, target := range targets {
+			if err := bringAdapterUp(target.Name); err != nil {
+				return listenStartedMsg{err: err, mode: mode}
+			}
+		}
+		session, err := listen.Start(targets)
+		return listenStartedMsg{session: session, err: err, mode: mode}
+	}
+}
+
+func startBridgeCmd(host, sw profile.AdapterConfig) tea.Cmd {
+	return func() tea.Msg {
+		session, err := bridge.Start(
+			bridge.Adapter{Name: host.Name, Role: host.AdapterRole, HardwarePort: host.HardwarePort, LocalMAC: host.CurrentMAC, TargetMAC: host.MAC},
+			bridge.Adapter{Name: sw.Name, Role: sw.AdapterRole, HardwarePort: sw.HardwarePort, LocalMAC: sw.CurrentMAC},
+			"",
+		)
+		return bridgeStartedMsg{session: session, err: err}
+	}
+}
+
+func stopBridgeCmd(session *bridge.Session) tea.Cmd {
+	return func() tea.Msg {
+		return bridgeStoppedMsg{session: session, err: session.Stop()}
+	}
+}
+
+func waitBridgeEventCmd(session *bridge.Session) tea.Cmd {
+	return func() tea.Msg {
+		event, ok := <-session.Events
+		return bridgeEventMsg{session: session, event: event, ok: ok}
+	}
+}
+
+func (m *Model) stopCapture() {
+	if m.listener != nil {
+		if err := m.listener.Stop(); err != nil {
+			m.print("listen err: stop " + err.Error())
+		}
+	}
+	m.listener = nil
+	m.capMode = ""
+}
+
+func (m *Model) stopBridgeNow() {
+	if m.bridge == nil {
+		return
+	}
+	session := m.bridge
+	m.bridge = nil
+	m.bridgeState = ""
+	if err := session.Stop(); err != nil {
+		m.print("bridge err: stop " + err.Error())
+	}
+}
+
+func (m *Model) handleBridgeEvent(session *bridge.Session, event bridge.Event) tea.Cmd {
+	switch event.Kind {
+	case bridge.KindState:
+		if event.State != "" && event.State != m.bridgeState {
+			m.bridgeState = event.State
+			m.print("bridge state: " + event.State)
+		}
+	case bridge.KindLog, bridge.KindTraffic:
+		m.print(event.Message)
+	case bridge.KindPcap:
+		m.print(fmt.Sprintf("pcap %s/%s: %s", event.Role, event.Adapter, event.Path))
+	case bridge.KindError:
+		if event.Err != nil {
+			m.print("bridge err: " + event.Err.Error())
+		} else if event.Message != "" {
+			m.print("bridge err: " + event.Message)
+		}
+	case bridge.KindDiscovery:
+		m.applyDiscovery(listen.Event{
+			Kind:     "discovery",
+			Adapter:  event.Adapter,
+			Role:     event.Role,
+			Field:    event.Field,
+			Value:    event.Value,
+			Evidence: event.Evidence,
+			Packet:   event.Packet,
+		})
+	case bridge.KindStopped:
+		if event.Message != "" {
+			m.print("bridge: " + event.Message)
+		}
+		m.bridge = nil
+		m.bridgeState = ""
+		m.print("bridge: off")
+		return nil
+	}
+	return waitBridgeEventCmd(session)
+}
+
+func setAdapterStateCmd(name, state string) tea.Cmd {
+	return func() tea.Msg {
+		return adapterStateMsg{name: name, state: state, err: setAdapterState(name, state)}
+	}
+}
+
+func bringAdapterUp(name string) error {
+	return setAdapterState(name, "up")
+}
+
+func setAdapterState(name, state string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ifconfig", name, state)
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		err = fmt.Errorf("ifconfig %s %s timed out", name, state)
+	}
+	if err != nil {
+		err = fmt.Errorf("%w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return err
+}
+
+func (m *Model) restoreLockedAdaptersNow() {
+	for name, state := range m.restoreState {
+		if err := bridge.RestoreInterfaceState(state); err != nil {
+			m.print(fmt.Sprintf("adapter restore warn %s: %v", name, err))
+		}
+		delete(m.restoreState, name)
+	}
+	for name := range m.lockPending {
+		delete(m.lockPending, name)
+	}
+}
+
+func (m *Model) updateAdapterStatus(name string, up bool) {
+	for i := range m.adapters {
+		if strings.EqualFold(m.adapters[i].Name, name) {
+			m.adapters[i].IsUp = up
+			return
+		}
+	}
+}
+
+func waitListenEventCmd(session *listen.Session) tea.Cmd {
+	return func() tea.Msg {
+		event, ok := <-session.Events
+		return listenEventMsg{session: session, event: event, ok: ok}
+	}
+}
+
+func (m *Model) handleListenEvent(event listen.Event) tea.Cmd {
+	mode := m.capMode
+	if mode == "" {
+		mode = "listen"
+	}
+	switch event.Kind {
+	case "pcap":
+		m.print(fmt.Sprintf("pcap %s/%s: %s", event.Role, event.Adapter, event.Path))
+	case "log", "traffic":
+		m.print(event.Message)
+	case "error":
+		m.print(fmt.Sprintf("%s err %s/%s: %v", mode, event.Role, event.Adapter, event.Err))
+	case "stopped":
+		m.print(fmt.Sprintf("%s off %s/%s", mode, event.Role, event.Adapter))
+	case "discovery":
+		m.applyDiscovery(event)
+	}
+	if m.listener == nil {
+		return nil
+	}
+	return waitListenEventCmd(m.listener)
+}
+
+func (m *Model) applyDiscovery(event listen.Event) {
+	bridgeAdded := false
+	if isBridgeObservation(event) {
+		bridgeAdded = m.profile.AddBridgeObservation(event.Adapter, event.Role, event.Field, event.Value, event.Evidence, event.Packet)
+	}
+	if !profile.KnownField(event.Field) {
+		if bridgeAdded {
+			m.print(formatBridgeOutput(event, "saved"))
+		}
+		return
+	}
+
+	cfg, ok := m.profile.ByName(event.Adapter)
+	if !ok {
+		return
+	}
+	added, applied := cfg.AddDiscovery(event.Field, event.Value, event.Evidence, event.Packet)
+	if !added && !applied {
+		return
+	}
+	status := "saved"
+	if applied {
+		status = "auto"
+	}
+	m.print(formatDiscoveryOutput(event, status))
+	m.refreshCompletions()
+}
+
+func isBridgeObservation(event listen.Event) bool {
+	if !profile.KnownField(event.Field) {
+		return true
+	}
+	switch event.Packet {
+	case "ARP", "EAPOL / 802.1X", "VLAN-tagged traffic":
+		return true
+	default:
+		return false
+	}
+}
+
+func formatDiscoveryOutput(event listen.Event, status string) string {
+	return fmt.Sprintf("%s %s/%s %s%s %s/%s %s",
+		styleKey.Render("FOUND"),
+		event.Role,
+		event.Adapter,
+		styleKey.Render(strings.ToUpper(event.Field)+"="),
+		styleValue.Render(event.Value),
+		event.Packet,
+		event.Evidence,
+		styleWarn.Render(status),
+	)
+}
+
+func formatBridgeOutput(event listen.Event, status string) string {
+	return fmt.Sprintf("%s %s/%s %s%s %s/%s %s",
+		styleKey.Render("BRIDGE"),
+		event.Role,
+		event.Adapter,
+		styleKey.Render(strings.ToUpper(event.Field)+"="),
+		styleValue.Render(event.Value),
+		event.Packet,
+		event.Evidence,
+		styleWarn.Render(status),
+	)
+}
+
+func (m *Model) listConfigs() {
+	names, err := configs.List()
+	if err != nil {
+		m.print("load err: " + err.Error())
+		return
+	}
+	if len(names) == 0 {
+		m.print("configs: none")
+		return
+	}
+	m.print("configs:")
+	for _, name := range names {
+		m.print("  " + name)
+	}
+}
+
+func (m *Model) executeConf(args []string) tea.Cmd {
+	if len(args) == 0 {
+		if m.activeAdapter == "" {
+			m.print("ctx: none")
+			return nil
+		}
+		m.print("ctx: " + m.activeAdapter)
+		return nil
+	}
+	if len(args) >= 2 {
+		m.print("use: conf <adapter>")
+		return nil
+	}
+	cfg, ok := m.profile.ByName(args[0])
+	if !ok {
+		m.print("adapter off: " + args[0])
+		m.print("use: set " + args[0] + " <host|switch>")
+		return nil
+	}
+	m.activeAdapter = cfg.Name
+	m.miscScroll = 0
+	m.print("ctx: " + cfg.Name)
+	return nil
+}
+
+func (m *Model) executeActiveAdapterState(state string) tea.Cmd {
+	if m.activeAdapter == "" {
+		m.print("ctx: none; use: conf <adapter>")
+		return nil
+	}
+	cfg, ok := m.profile.ByName(m.activeAdapter)
+	if !ok {
+		m.print("ctx: stale")
+		m.activeAdapter = ""
+		return nil
+	}
+	m.print(fmt.Sprintf("adapter state: %s -> %s", cfg.Name, state))
+	return setAdapterStateCmd(cfg.Name, state)
+}
+
+func (m *Model) showAdapters() {
+	if m.loading {
+		m.print("adapters: loading")
+		return
+	}
+	if m.err != nil {
+		m.print("adapters err: " + m.err.Error())
+		return
+	}
+	if len(m.adapters) == 0 {
+		m.print("adapters: none")
+		return
+	}
+
+	m.print("adapters:")
+	m.print("  name       kind          state  mtu    mac               address")
+	for _, adapter := range m.adapters {
+		marker := " "
+		if _, ok := m.profile.SelectedRole(adapter.Name); ok {
+			marker = "*"
+		}
+		m.print(fmt.Sprintf(" %s %-10s %-13s %-5s %-6d %-17s %s",
+			marker,
+			adapter.Name,
+			adapter.Kind,
+			adapter.Status(),
+			adapter.MTU,
+			adapter.MAC,
+			adapter.PrimaryAddr(),
+		))
+	}
+}
+
+func (m *Model) showConfig() {
+	if len(m.profile.Adapters) == 0 {
+		m.print("staged: none")
+		return
+	}
+	m.print("staged:")
+	for _, cfg := range m.profile.Adapters {
+		m.print(fmt.Sprintf("  %s %s", cfg.AdapterRole, cfg.Name))
+		for _, field := range profile.Fields {
+			m.print("    " + styleKey.Render(fmt.Sprintf("%-7s", field.Key)) + " " + styleValue.Render(cfg.Value(field.Key)))
+		}
+		if len(cfg.Discovered) > 0 {
+			m.print("    discovered")
+			for _, item := range cfg.Discovered {
+				m.print("      " + styleKey.Render(fmt.Sprintf("%-12s", item.Field)) + " " + styleValue.Render(item.Value) + fmt.Sprintf(" %s/%s", item.Packet, item.Evidence))
+			}
+		}
+	}
+}
+
+func (m *Model) showBridge() {
+	if len(m.profile.Bridge.Observations) == 0 {
+		m.print("bridge: none")
+		return
+	}
+	m.print("bridge:")
+	for _, obs := range m.profile.Bridge.Observations {
+		m.print("  " +
+			styleKey.Render(fmt.Sprintf("%-12s", obs.Field)) + " " +
+			styleValue.Render(obs.Value) +
+			fmt.Sprintf(" %s/%s %s/%s x%d", obs.Packet, obs.Evidence, obs.Role, obs.Adapter, obs.Count))
+	}
+}
+
+func (m *Model) showHelp() {
+	lines := []string{
+		"cmd:",
+		"  show adapters",
+		"  show config",
+		"  show bridge",
+		"  set <adapter> <host|switch>",
+		"  conf <name>",
+		"  unset",
+		"  load [name]",
+		"  start listen|bridge",
+		"  stop listen|bridge",
+		"  set ip <value|auto>",
+		"  set mac <value|auto>",
+		"  set state up|down|auto",
+		"  up | down",
+		"  clear",
+		"  tab",
+	}
+	for _, line := range lines {
+		m.print(line)
+	}
+}
+
+func (m *Model) findAdapter(name string) (adapters.Adapter, bool) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, adapter := range m.adapters {
+		if strings.ToLower(adapter.Name) == name || strings.ToLower(adapter.HardwarePort) == name {
+			return adapter, true
+		}
+	}
+	return adapters.Adapter{}, false
+}
+
+func (m *Model) print(line string) {
+	m.output = append(m.output, line)
+	m.outputScroll = 0
+	if len(m.output) > 500 {
+		m.output = m.output[len(m.output)-500:]
+	}
+}
+
+func (c cardFocus) String() string {
+	switch c {
+	case cardOutput:
+		return "output"
+	case cardMisc:
+		return "misc"
+	default:
+		return "cli"
+	}
+}
+
+func (m *Model) recallHistory(delta int) {
+	if len(m.history) == 0 {
+		return
+	}
+	if m.historyIndex == -1 {
+		if delta < 0 {
+			m.historyIndex = len(m.history) - 1
+		} else {
+			return
+		}
+	} else {
+		m.historyIndex += delta
+	}
+	if m.historyIndex < 0 {
+		m.historyIndex = 0
+	}
+	if m.historyIndex >= len(m.history) {
+		m.historyIndex = -1
+		m.input = ""
+		m.refreshCompletions()
+		return
+	}
+	m.input = m.history[m.historyIndex]
+	m.refreshCompletions()
+}
+
+func (m *Model) applyCompletion() {
+	candidates := m.completionCandidates(m.input)
+	if len(candidates) == 0 {
+		candidates = m.allCompletionCandidates(m.input)
+	}
+	candidates = dedupe(candidates)
+	if len(candidates) == 0 {
+		m.completions = nil
+		m.resetCompletionCycle()
+		return
+	}
+
+	context := completionContext(m.input)
+	current := currentCompletionToken(m.input)
+	if m.canContinueCompletionCycle(context, current) {
+		m.cycleIndex = (m.cycleIndex + 1) % len(m.cycleOptions)
+		m.completions = m.cycleOptions
+		m.input = replaceCurrentToken(m.input, m.cycleOptions[m.cycleIndex])
+		return
+	}
+
+	m.completions = candidates
+	m.cycleContext = context
+	m.cycleOptions = candidates
+	m.cycleIndex = 0
+	m.input = replaceCurrentToken(m.input, candidates[0])
+	if len(candidates) == 1 {
+		m.resetCompletionCycle()
+		if shouldAppendSpace(m.input) {
+			m.input += " "
+		}
+		m.refreshCompletions()
+	}
+}
+
+func (m *Model) resetCompletionCycle() {
+	m.cycleContext = ""
+	m.cycleIndex = -1
+	m.cycleOptions = nil
+}
+
+func (m Model) canContinueCompletionCycle(context, current string) bool {
+	if m.cycleIndex < 0 || len(m.cycleOptions) < 2 {
+		return false
+	}
+	if m.cycleContext != context || m.cycleIndex >= len(m.cycleOptions) {
+		return false
+	}
+	return strings.EqualFold(current, m.cycleOptions[m.cycleIndex])
+}
+
+func (m *Model) refreshCompletions() {
+	if m.inputMode == modeSaveName {
+		m.completions = filterPrefix(m.configNames(), strings.ToLower(strings.TrimSpace(m.input)))
+		return
+	}
+	m.completions = m.completionCandidates(m.input)
+}
+
+func (m Model) completionCandidates(input string) []string {
+	candidates, current := m.completionCandidateSet(input)
+	return filterPrefix(candidates, current)
+}
+
+func (m Model) allCompletionCandidates(input string) []string {
+	candidates, _ := m.completionCandidateSet(input)
+	return dedupe(candidates)
+}
+
+func (m Model) completionCandidateSet(input string) ([]string, string) {
+	tokens, trailingSpace := commandTokens(input)
+	if len(tokens) == 0 {
+		return topLevelCommands(), ""
+	}
+
+	lower := lowerTokens(tokens)
+	current := ""
+	if !trailingSpace {
+		current = lower[len(lower)-1]
+	}
+
+	var candidates []string
+	switch {
+	case len(lower) == 1 && !trailingSpace:
+		candidates = topLevelCommands()
+	case lower[0] == "show":
+		if len(lower) <= 2 {
+			candidates = []string{"adapters", "bridge", "config"}
+		}
+	case lower[0] == "set":
+		candidates = m.setCompletions(lower, trailingSpace)
+	case lower[0] == "unset":
+		candidates = m.unsetCompletions(lower, trailingSpace)
+	case lower[0] == "load":
+		if len(lower) <= 2 {
+			candidates = m.configNames()
+		}
+	case lower[0] == "start":
+		if len(lower) <= 2 {
+			candidates = []string{"bridge", "listen"}
+		}
+	case lower[0] == "stop":
+		if len(lower) <= 2 {
+			candidates = []string{"bridge", "listen"}
+		}
+	case isConfCommand(lower[0]):
+		if len(lower) <= 2 {
+			candidates = m.selectedAdapterNames()
+		}
+	default:
+		candidates = topLevelCommands()
+	}
+
+	return candidates, current
+}
+
+func (m Model) setCompletions(tokens []string, trailingSpace bool) []string {
+	if len(tokens) == 1 && !trailingSpace {
+		return []string{"set"}
+	}
+	if len(tokens) == 1 || (len(tokens) == 2 && !trailingSpace) {
+		return append(m.adapterNames(), propertyKeys()...)
+	}
+
+	target := tokens[1]
+	if target == "adapter" {
+		if len(tokens) >= 3 && trailingSpace {
+			return profile.AdapterRoles()
+		}
+		if len(tokens) >= 4 && !trailingSpace {
+			return profile.AdapterRoles()
+		}
+		return m.adapterNames()
+	}
+	if _, ok := m.findAdapter(target); ok {
+		return profile.AdapterRoles()
+	}
+
+	if len(tokens) == 2 && trailingSpace {
+		return m.valueCompletions(target)
+	}
+	if len(tokens) == 3 && !trailingSpace {
+		return m.valueCompletions(target)
+	}
+	return nil
+}
+
+func topLevelCommands() []string {
+	return []string{"show", "set", "unset", "conf", "load", "start", "stop", "clear", "refresh", "help", "up", "down", "quit"}
+}
+
+func (m Model) unsetCompletions(tokens []string, trailingSpace bool) []string {
+	if len(tokens) == 1 && !trailingSpace {
+		return []string{"unset"}
+	}
+	if len(tokens) == 1 || (len(tokens) == 2 && !trailingSpace) {
+		return []string{"adapter"}
+	}
+	if tokens[1] == "adapter" {
+		return m.selectedAdapterNames()
+	}
+	return nil
+}
+
+func propertyKeys() []string {
+	out := make([]string, 0, len(profile.Fields))
+	for _, field := range profile.Fields {
+		out = append(out, field.Key)
+	}
+	return out
+}
+
+func (m Model) valueCompletions(key string) []string {
+	values := baseValueCompletions(key)
+	if cfg, ok := m.profile.ByName(m.activeAdapter); ok {
+		values = append(values, cfg.Values(key)...)
+	}
+	return dedupe(values)
+}
+
+func baseValueCompletions(key string) []string {
+	switch profile.CanonicalKey(key) {
+	case "state":
+		return []string{"auto", "up", "down"}
+	case "dhcp":
+		return []string{"auto", "manual", "off"}
+	case "role":
+		return []string{"auto", "client", "uplink", "mirror", "spare"}
+	default:
+		return []string{"auto"}
+	}
+}
+
+func (m Model) adapterNames() []string {
+	out := make([]string, 0, len(m.adapters))
+	for _, adapter := range m.adapters {
+		out = append(out, adapter.Name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (m Model) selectedAdapterNames() []string {
+	out := make([]string, 0, len(m.profile.Adapters))
+	for _, adapter := range m.profile.Adapters {
+		out = append(out, adapter.Name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (m Model) configNames() []string {
+	names, err := configs.List()
+	if err != nil {
+		return nil
+	}
+	return names
+}
+
+func filterPrefix(values []string, prefix string) []string {
+	if prefix == "" {
+		return dedupe(values)
+	}
+	var out []string
+	for _, value := range values {
+		if strings.HasPrefix(strings.ToLower(value), prefix) {
+			out = append(out, value)
+		}
+	}
+	return dedupe(out)
+}
+
+func dedupe(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func commandTokens(input string) ([]string, bool) {
+	runes := []rune(input)
+	trailingSpace := len(runes) > 0 && unicode.IsSpace(runes[len(runes)-1])
+	return strings.Fields(input), trailingSpace
+}
+
+func lowerTokens(tokens []string) []string {
+	out := make([]string, len(tokens))
+	for i, token := range tokens {
+		out[i] = strings.ToLower(token)
+	}
+	return out
+}
+
+func isConfCommand(value string) bool {
+	switch value {
+	case "conf", "config", "configure":
+		return true
+	default:
+		return false
+	}
+}
+
+func completionContext(input string) string {
+	runes := []rune(input)
+	if len(runes) == 0 {
+		return ""
+	}
+	if unicode.IsSpace(runes[len(runes)-1]) {
+		return input
+	}
+	start := len(runes)
+	for start > 0 && !unicode.IsSpace(runes[start-1]) {
+		start--
+	}
+	return string(runes[:start])
+}
+
+func currentCompletionToken(input string) string {
+	runes := []rune(input)
+	end := len(runes)
+	for end > 0 && unicode.IsSpace(runes[end-1]) {
+		return ""
+	}
+	start := end
+	for start > 0 && !unicode.IsSpace(runes[start-1]) {
+		start--
+	}
+	return string(runes[start:end])
+}
+
+func replaceCurrentToken(input, value string) string {
+	runes := []rune(input)
+	if len(runes) > 0 && unicode.IsSpace(runes[len(runes)-1]) {
+		return input + value
+	}
+	end := len(runes)
+	for end > 0 && unicode.IsSpace(runes[end-1]) {
+		end--
+	}
+	start := end
+	for start > 0 && !unicode.IsSpace(runes[start-1]) {
+		start--
+	}
+	return string(runes[:start]) + value + string(runes[end:])
+}
+
+func shouldAppendSpace(input string) bool {
+	runes := []rune(input)
+	return len(runes) > 0 && !unicode.IsSpace(runes[len(runes)-1])
+}
+
+func appendInput(input string, msg tea.KeyMsg) string {
+	switch msg.Type {
+	case tea.KeyRunes:
+		return input + string(msg.Runes)
+	case tea.KeySpace:
+		return input + " "
+	default:
+		return input
+	}
+}
+
+func trimLastRune(value string) string {
+	runes := []rune(value)
+	if len(runes) == 0 {
+		return value
+	}
+	return string(runes[:len(runes)-1])
+}

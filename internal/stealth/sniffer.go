@@ -22,7 +22,6 @@ type TargetIdentity struct {
 	AuthenticatorMAC net.HardwareAddr // Switch-side MAC sending EAPOL
 	VLANID           uint16           // Primary 802.1Q VLAN tag (first seen, 0 = untagged)
 	VLANs            []uint16         // All VLAN IDs observed on the wire
-	NetworkMap       *NetworkMap      // Populated by observer after bridge UP
 }
 
 // String returns a human readable representation.

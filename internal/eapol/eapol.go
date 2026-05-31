@@ -1,4 +1,4 @@
-// Package eapol provides 802.1X (EAP over LAN) protocol handling for goLAN.
+// Package eapol provides 802.1X (EAP over LAN) protocol handling for golan.
 //
 // It implements EAPOL frame detection, transparent relay between a supplicant
 // (real device) and an authenticator (switch), and MACsec downgrade logic.
