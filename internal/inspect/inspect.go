@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -73,6 +74,20 @@ func (f Finding) Display() string {
 		parts = append(parts, fmt.Sprintf("%s:%d>%s:%d", f.Src, f.Sport, f.Dst, f.Dport))
 	}
 	return strings.Join(parts, " ")
+}
+
+func (f Finding) Encode() string {
+	data, err := json.Marshal(f)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func DecodeFinding(value string) (Finding, error) {
+	var finding Finding
+	err := json.Unmarshal([]byte(value), &finding)
+	return finding, err
 }
 
 type Inspector struct {

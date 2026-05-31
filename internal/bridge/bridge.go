@@ -16,6 +16,7 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/pcapgo"
+	"golan/internal/canvas"
 	"golan/internal/eapol"
 	"golan/internal/inspect"
 	"golan/internal/listen"
@@ -31,6 +32,7 @@ const (
 	KindDiscovery = "discovery"
 	KindTraffic   = "traffic"
 	KindFinding   = "finding"
+	KindCanvas    = canvas.EventKind
 	KindStopped   = "stopped"
 )
 
@@ -555,8 +557,11 @@ func (s *Session) capture(ctx context.Context, adapter Adapter, handle *pcap.Han
 			}
 			if s.inspector != nil {
 				for _, finding := range s.inspector.AnalyzePacket(packet) {
-					s.send(Event{Kind: KindFinding, Adapter: adapter.Name, Role: adapter.Role, Message: finding.Display()})
+					s.send(Event{Kind: KindFinding, Adapter: adapter.Name, Role: adapter.Role, Message: finding.Encode()})
 				}
+			}
+			for _, observation := range canvas.ObservePacket(packet, adapter.Name, adapter.Role) {
+				s.send(Event{Kind: KindCanvas, Adapter: adapter.Name, Role: adapter.Role, Message: observation.Encode()})
 			}
 			for _, discovery := range listen.AnalyzePacket(packet, ignoreMAC) {
 				s.send(Event{

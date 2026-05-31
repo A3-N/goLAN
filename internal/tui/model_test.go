@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -8,7 +9,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"golan/internal/adapters"
 	bridge "golan/internal/bridge"
+	"golan/internal/canvas"
 	"golan/internal/configs"
+	"golan/internal/inspect"
 	"golan/internal/listen"
 	"golan/internal/profile"
 )
@@ -383,6 +386,42 @@ func TestFindingEventsUseBoundedFindingsPane(t *testing.T) {
 	}
 }
 
+func TestFindingEventFeedsCanvasSecretContext(t *testing.T) {
+	m := NewModel()
+	finding := inspect.Finding{
+		Protocol: "HTTP",
+		Kind:     "Basic",
+		User:     "alice",
+		Secret:   "secret123",
+		Src:      "192.168.1.10",
+		Sport:    49152,
+		Dst:      "192.168.1.20",
+		Dport:    80,
+	}
+
+	m.handleListenEvent(listen.Event{
+		Kind:    "finding",
+		Adapter: "en11",
+		Role:    profile.AdapterRoleHost,
+		Message: finding.Encode(),
+	})
+
+	server := m.canvasMap.Hosts["ip:192.168.1.20"]
+	if server == nil {
+		t.Fatalf("server missing: %+v", m.canvasMap.Hosts)
+	}
+	var found bool
+	for _, service := range server.Services {
+		if service.Secrets[finding.Display()] {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("secret not tied to destination service: %+v", server.Services)
+	}
+}
+
 func TestWindowSizeLocksAfterInitialDetection(t *testing.T) {
 	m := NewModel()
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
@@ -603,6 +642,34 @@ func TestCtrlSPromptsForFilename(t *testing.T) {
 	}
 	if len(names) != 1 || names[0] != "from-ctrl-s.json" {
 		t.Fatalf("names = %v", names)
+	}
+}
+
+func TestCanvasEnableWritesSessionCanvas(t *testing.T) {
+	t.Setenv("GOLAN_CONFIG_DIR", t.TempDir())
+	m := NewModel()
+	m.profile.Adapters = append(m.profile.Adapters, adaptersToConfig("en11", profile.AdapterRoleHost))
+	m.profile.Adapters[0].IP = "192.168.1.10"
+	m.profile.Adapters[0].MAC = "02:00:00:00:00:10"
+
+	cmd := m.executeCommand("enable canvas")
+	if cmd != nil {
+		t.Fatal("expected synchronous canvas enable")
+	}
+	if !m.canvasEnabled || m.canvasPath == "" {
+		t.Fatalf("canvas state enabled=%v path=%q", m.canvasEnabled, m.canvasPath)
+	}
+	if _, err := os.Stat(m.canvasPath); err != nil {
+		t.Fatalf("canvas file missing: %v", err)
+	}
+
+	m.applyCanvasObservation(canvas.Observation{Kind: "host", IP: "192.168.1.1", Tag: "gateway"})
+	if _, ok := m.canvasMap.Hosts["ip:192.168.1.1"]; !ok {
+		t.Fatalf("gateway not mapped: %+v", m.canvasMap.Hosts)
+	}
+	m.executeCommand("disable canvas")
+	if m.canvasEnabled {
+		t.Fatal("canvas still enabled")
 	}
 }
 

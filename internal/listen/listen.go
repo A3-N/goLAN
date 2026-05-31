@@ -14,6 +14,7 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/pcapgo"
+	"golan/internal/canvas"
 	"golan/internal/inspect"
 	"golan/internal/paths"
 )
@@ -172,7 +173,10 @@ func runCapture(ctx context.Context, target Target, dir string, events chan<- Ev
 				sendEvent(ctx, events, Event{Kind: "traffic", Adapter: target.Name, Role: target.Role, Message: message})
 			}
 			for _, finding := range inspector.AnalyzePacket(packet) {
-				sendEvent(ctx, events, Event{Kind: "finding", Adapter: target.Name, Role: target.Role, Message: finding.Display()})
+				sendEvent(ctx, events, Event{Kind: "finding", Adapter: target.Name, Role: target.Role, Message: finding.Encode()})
+			}
+			for _, observation := range canvas.ObservePacket(packet, target.Name, target.Role) {
+				sendEvent(ctx, events, Event{Kind: canvas.EventKind, Adapter: target.Name, Role: target.Role, Message: observation.Encode()})
 			}
 			if lockedMAC == nil {
 				if mac, source := targetSourceMAC(packet, ignoreMAC); mac != nil {

@@ -13,7 +13,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"golan/internal/adapters"
 	bridge "golan/internal/bridge"
+	"golan/internal/canvas"
 	"golan/internal/configs"
+	"golan/internal/inspect"
 	"golan/internal/listen"
 	"golan/internal/profile"
 )
@@ -41,6 +43,10 @@ type Model struct {
 	traffic       []string
 	findings      []string
 	signalSeen    map[string]bool
+	canvasMap     *canvas.Map
+	canvasEnabled bool
+	canvasPath    string
+	canvasDirty   bool
 	input         string
 	inputMode     inputMode
 	completions   []string
@@ -137,6 +143,7 @@ func NewModel() Model {
 		restoreState:  make(map[string]bridge.InterfaceRestoreState),
 		lockPending:   make(map[string]bool),
 		signalSeen:    make(map[string]bool),
+		canvasMap:     canvas.NewMap(),
 	}
 }
 
@@ -292,6 +299,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) updateCLI(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
+		m.saveCanvas()
 		m.stopCapture()
 		m.stopBridgeNow()
 		m.restoreLockedAdaptersNow()
@@ -421,6 +429,10 @@ func (m *Model) executeCommand(raw string) tea.Cmd {
 		return m.executeConf(fields[1:])
 	case "load":
 		m.executeLoad(fields[1:])
+	case "enable":
+		return m.executeEnable(fields[1:])
+	case "disable":
+		return m.executeDisable(fields[1:])
 	case "start":
 		return m.executeStart(fields[1:])
 	case "stop":
@@ -437,6 +449,7 @@ func (m *Model) executeCommand(raw string) tea.Cmd {
 		m.print("refresh: adapters")
 		return discoverAdaptersCmd
 	case "quit", "exit":
+		m.saveCanvas()
 		m.stopCapture()
 		m.stopBridgeNow()
 		m.restoreLockedAdaptersNow()
@@ -541,6 +554,7 @@ func (m *Model) executeSet(args []string) tea.Cmd {
 		suffix = " auto"
 	}
 	m.print(fmt.Sprintf("%s %s: %s -> %s%s", cfg.Name, canonical, old, next, suffix))
+	m.syncCanvasProfile()
 	return nil
 }
 
@@ -572,6 +586,7 @@ func (m *Model) stageAdapter(name, roleValue string) tea.Cmd {
 	m.miscScroll = 0
 	m.print(fmt.Sprintf("adapter: %s %s", cfg.AdapterRole, cfg.Name))
 	m.markLockPending(cfg.Name)
+	m.syncCanvasProfile()
 	return tea.Batch(append(m.restoreRemovedAdapterCmds(before), lockdownAdapterCmd(cfg))...)
 }
 
@@ -589,6 +604,7 @@ func (m *Model) stageAdapterNext(name string) tea.Cmd {
 	m.miscScroll = 0
 	m.print(fmt.Sprintf("adapter: %s %s", cfg.AdapterRole, cfg.Name))
 	m.markLockPending(cfg.Name)
+	m.syncCanvasProfile()
 	return lockdownAdapterCmd(cfg)
 }
 
@@ -624,6 +640,7 @@ func (m *Model) unsetAdapter(name string) tea.Cmd {
 	if m.lockPending != nil {
 		delete(m.lockPending, removed.Name)
 	}
+	m.syncCanvasProfile()
 	return m.restoreAdapterCmd(removed.Name)
 }
 
@@ -708,6 +725,7 @@ func (m *Model) executeLoad(args []string) {
 	}
 	m.miscScroll = 0
 	m.print("loaded: " + path)
+	m.syncCanvasProfile()
 }
 
 func (m *Model) executeStart(args []string) tea.Cmd {
@@ -765,6 +783,51 @@ func (m *Model) executeStart(args []string) tea.Cmd {
 		m.print("use: start listen|bridge")
 		return nil
 	}
+}
+
+func (m *Model) executeEnable(args []string) tea.Cmd {
+	if len(args) != 1 || strings.ToLower(args[0]) != "canvas" {
+		m.print("use: enable canvas")
+		return nil
+	}
+	if m.canvasMap == nil {
+		m.canvasMap = canvas.NewMap()
+	}
+	m.syncCanvasProfile()
+	if m.canvasPath == "" {
+		path, err := canvas.SessionPath()
+		if err != nil {
+			m.print("canvas err: " + err.Error())
+			return nil
+		}
+		m.canvasPath = path
+	}
+	m.canvasEnabled = true
+	m.canvasDirty = true
+	if err := m.saveCanvas(); err != nil {
+		m.print("canvas err: " + err.Error())
+		return nil
+	}
+	m.print("canvas: on " + m.canvasPath)
+	return nil
+}
+
+func (m *Model) executeDisable(args []string) tea.Cmd {
+	if len(args) != 1 || strings.ToLower(args[0]) != "canvas" {
+		m.print("use: disable canvas")
+		return nil
+	}
+	if !m.canvasEnabled {
+		m.print("canvas: off")
+		return nil
+	}
+	if err := m.saveCanvas(); err != nil {
+		m.print("canvas err: " + err.Error())
+		return nil
+	}
+	m.canvasEnabled = false
+	m.print("canvas: off " + m.canvasPath)
+	return nil
 }
 
 func (m *Model) executeStop(args []string) tea.Cmd {
@@ -918,7 +981,9 @@ func (m *Model) handleBridgeEvent(session *bridge.Session, event bridge.Event) t
 	case bridge.KindTraffic:
 		m.addTraffic(event.Message)
 	case bridge.KindFinding:
-		m.addFinding(event.Message)
+		m.addFindingEvent(event.Message, event.Adapter, event.Role)
+	case bridge.KindCanvas:
+		m.applyCanvasEvent(event.Message)
 	case bridge.KindPcap:
 		m.print(fmt.Sprintf("pcap %s/%s: %s", event.Role, event.Adapter, event.Path))
 	case bridge.KindError:
@@ -1014,7 +1079,9 @@ func (m *Model) handleListenEvent(event listen.Event) tea.Cmd {
 	case "traffic":
 		m.addTraffic(event.Message)
 	case "finding":
-		m.addFinding(event.Message)
+		m.addFindingEvent(event.Message, event.Adapter, event.Role)
+	case canvas.EventKind:
+		m.applyCanvasEvent(event.Message)
 	case "error":
 		m.print(fmt.Sprintf("%s err %s/%s: %v", mode, event.Role, event.Adapter, event.Err))
 	case "stopped":
@@ -1032,6 +1099,7 @@ func (m *Model) applyDiscovery(event listen.Event) {
 	if isBridgeObservation(event) {
 		m.profile.AddBridgeObservation(event.Adapter, event.Role, event.Field, event.Value, event.Evidence, event.Packet)
 	}
+	m.applyCanvasDiscovery(event)
 	m.printEAPOLDiscoverySignal(event)
 	if !profile.KnownField(event.Field) {
 		return
@@ -1210,6 +1278,8 @@ func (m *Model) showHelp() {
 		"  conf <name>",
 		"  unset",
 		"  load [name]",
+		"  enable canvas",
+		"  disable canvas",
 		"  start listen|bridge",
 		"  stop listen|bridge",
 		"  set ip <value|auto>",
@@ -1275,6 +1345,79 @@ func (m *Model) addFinding(line string) {
 	m.findings = append(m.findings, line)
 	m.trimFindings()
 	m.printSignal("finding\x00"+strings.ToLower(line), line)
+}
+
+func (m *Model) addFindingEvent(encoded, adapter, role string) {
+	finding, err := inspect.DecodeFinding(encoded)
+	if err != nil {
+		m.addFinding(encoded)
+		return
+	}
+	line := finding.Display()
+	m.addFinding(line)
+	m.applyCanvasObservation(canvas.FromFinding(finding, adapter, role))
+}
+
+func (m *Model) applyCanvasEvent(encoded string) {
+	obs, err := canvas.DecodeObservation(encoded)
+	if err != nil {
+		return
+	}
+	m.applyCanvasObservation(obs)
+}
+
+func (m *Model) applyCanvasDiscovery(event listen.Event) {
+	for _, obs := range canvas.FromDiscovery(event.Adapter, event.Role, event.Field, event.Value, event.Evidence, event.Packet) {
+		m.applyCanvasObservation(obs)
+	}
+}
+
+func (m *Model) applyCanvasObservation(obs canvas.Observation) {
+	if m.canvasMap == nil {
+		m.canvasMap = canvas.NewMap()
+	}
+	changed := m.canvasMap.Apply(obs)
+	m.canvasDirty = true
+	if changed && m.canvasEnabled {
+		if err := m.saveCanvas(); err != nil {
+			m.print("canvas err: " + err.Error())
+		}
+	}
+}
+
+func (m *Model) syncCanvasProfile() {
+	if m.canvasMap == nil {
+		m.canvasMap = canvas.NewMap()
+	}
+	if m.canvasMap.ApplyProfile(m.profile) {
+		m.canvasDirty = true
+		if m.canvasEnabled {
+			if err := m.saveCanvas(); err != nil {
+				m.print("canvas err: " + err.Error())
+			}
+		}
+	}
+}
+
+func (m *Model) saveCanvas() error {
+	if !m.canvasEnabled {
+		return nil
+	}
+	if m.canvasMap == nil {
+		m.canvasMap = canvas.NewMap()
+	}
+	if m.canvasPath == "" {
+		path, err := canvas.SessionPath()
+		if err != nil {
+			return err
+		}
+		m.canvasPath = path
+	}
+	if err := m.canvasMap.WriteFile(m.canvasPath); err != nil {
+		return err
+	}
+	m.canvasDirty = false
+	return nil
 }
 
 func (m *Model) trimFindings() {
@@ -1514,6 +1657,10 @@ func (m Model) completionCandidateSet(input string) ([]string, string) {
 		if len(lower) <= 2 {
 			candidates = m.configNames()
 		}
+	case lower[0] == "enable", lower[0] == "disable":
+		if len(lower) <= 2 {
+			candidates = []string{"canvas"}
+		}
 	case lower[0] == "start":
 		if len(lower) <= 2 {
 			candidates = []string{"bridge", "listen"}
@@ -1565,7 +1712,7 @@ func (m Model) setCompletions(tokens []string, trailingSpace bool) []string {
 }
 
 func topLevelCommands() []string {
-	return []string{"show", "set", "unset", "conf", "load", "start", "stop", "clear", "refresh", "help", "up", "down", "quit"}
+	return []string{"show", "set", "unset", "conf", "load", "enable", "disable", "start", "stop", "clear", "refresh", "help", "up", "down", "quit"}
 }
 
 func (m Model) unsetCompletions(tokens []string, trailingSpace bool) []string {
