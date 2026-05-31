@@ -56,7 +56,7 @@ func (f Finding) Key() string {
 }
 
 func (f Finding) Display() string {
-	parts := []string{"FOUND", strings.ToUpper(f.Protocol)}
+	parts := []string{strings.ToUpper(f.Protocol)}
 	if f.Kind != "" {
 		parts = append(parts, f.Kind)
 	}

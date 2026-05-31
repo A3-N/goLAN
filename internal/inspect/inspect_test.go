@@ -16,7 +16,7 @@ func TestHTTPBasicFindingShowsSecret(t *testing.T) {
 		t.Fatalf("findings = %+v", findings)
 	}
 	got := findings[0].Display()
-	if !strings.Contains(got, "FOUND HTTP Basic") || !strings.Contains(got, "user=alice") || !strings.Contains(got, "secret=secret123") {
+	if !strings.Contains(got, "HTTP Basic") || !strings.Contains(got, "user=alice") || !strings.Contains(got, "secret=secret123") {
 		t.Fatalf("display = %q", got)
 	}
 	if strings.Contains(got, "redacted") {
@@ -33,7 +33,7 @@ func TestHTTPPasswordFieldFindingShowsSecret(t *testing.T) {
 		t.Fatalf("findings = %+v", findings)
 	}
 	got := findings[0].Display()
-	if !strings.Contains(got, "FOUND HTTP password") || !strings.Contains(got, "secret=hunter2") {
+	if !strings.Contains(got, "HTTP password") || !strings.Contains(got, "secret=hunter2") {
 		t.Fatalf("display = %q", got)
 	}
 }
@@ -50,7 +50,7 @@ func TestFTPUserPassFindingKeepsFlowUser(t *testing.T) {
 		t.Fatalf("second = %+v", second)
 	}
 	got := second[0].Display()
-	if !strings.Contains(got, "FOUND FTP PASS") || !strings.Contains(got, "user=alice") || !strings.Contains(got, "secret=open-sesame") {
+	if !strings.Contains(got, "FTP PASS") || !strings.Contains(got, "user=alice") || !strings.Contains(got, "secret=open-sesame") {
 		t.Fatalf("display = %q", got)
 	}
 }
@@ -64,7 +64,7 @@ func TestNTLMv2FindingShowsHash(t *testing.T) {
 		t.Fatalf("findings = %+v", findings)
 	}
 	got := findings[0].Display()
-	if !strings.Contains(got, "FOUND NTLM NTLMv2") || !strings.Contains(got, "user=alice") {
+	if !strings.Contains(got, "NTLM NTLMv2") || !strings.Contains(got, "user=alice") {
 		t.Fatalf("display = %q", got)
 	}
 	if !strings.Contains(got, "secret=alice::DOMAIN:1122334455667788:") {
@@ -81,7 +81,7 @@ func TestKerberosFindingShowsHash(t *testing.T) {
 		t.Fatalf("findings = %+v", findings)
 	}
 	got := findings[0].Display()
-	if !strings.Contains(got, "FOUND KERBEROS AS-REQ etype23") || !strings.Contains(got, "user=alice") {
+	if !strings.Contains(got, "KERBEROS AS-REQ etype23") || !strings.Contains(got, "user=alice") {
 		t.Fatalf("display = %q", got)
 	}
 	if !strings.Contains(got, "secret=$krb5pa$23$alice$EXAMPLE$dummy$") {
@@ -97,7 +97,7 @@ func TestCardFindingShowsFullNumber(t *testing.T) {
 		t.Fatalf("findings = %+v", findings)
 	}
 	got := findings[0].Display()
-	if !strings.Contains(got, "FOUND CARD number") || !strings.Contains(got, "secret=4111111111111111") {
+	if !strings.Contains(got, "CARD number") || !strings.Contains(got, "secret=4111111111111111") {
 		t.Fatalf("display = %q", got)
 	}
 }

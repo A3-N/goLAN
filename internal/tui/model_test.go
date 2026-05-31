@@ -68,7 +68,7 @@ func TestClearClearsOutput(t *testing.T) {
 	m := NewModel()
 	m.executeCommand("help")
 	m.addTraffic("packet")
-	m.addFinding("FOUND HTTP Basic user=alice secret=secret")
+	m.addFinding("HTTP Basic user=alice secret=secret")
 	if len(m.output) == 0 {
 		t.Fatal("expected help output")
 	}
@@ -364,19 +364,19 @@ func TestFindingEventsUseBoundedFindingsPane(t *testing.T) {
 		Kind:    "finding",
 		Adapter: "en11",
 		Role:    profile.AdapterRoleHost,
-		Message: "FOUND HTTP Basic user=alice secret=secret",
+		Message: "HTTP Basic user=alice secret=secret",
 	})
 
 	if len(m.findings) != 1 || !strings.Contains(m.findings[0], "secret=secret") {
 		t.Fatalf("findings pane = %v", m.findings)
 	}
-	if !containsOutput(m.output, "FOUND HTTP Basic") {
+	if !containsOutput(m.output, "HTTP Basic") {
 		t.Fatalf("finding signal missing from output: %v", m.output)
 	}
 
 	limit := m.findingsCapacity()
 	for i := 0; i < limit+5; i++ {
-		m.addFinding("FOUND FTP PASS user=alice secret=secret")
+		m.addFinding("FTP PASS user=alice secret=secret")
 	}
 	if len(m.findings) != limit {
 		t.Fatalf("findings retained %d lines, want %d", len(m.findings), limit)

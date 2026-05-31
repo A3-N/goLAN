@@ -1066,15 +1066,14 @@ func isBridgeObservation(event listen.Event) bool {
 }
 
 func formatDiscoveryOutput(event listen.Event, status string) string {
-	return fmt.Sprintf("%s %s/%s %s%s %s/%s %s",
-		styleKey.Render("FOUND"),
+	return fmt.Sprintf("%s/%s %s=%s %s/%s %s",
 		event.Role,
 		event.Adapter,
-		styleKey.Render(strings.ToUpper(event.Field)+"="),
-		styleValue.Render(event.Value),
+		strings.ToUpper(event.Field),
+		event.Value,
 		event.Packet,
 		event.Evidence,
-		styleWarn.Render(status),
+		status,
 	)
 }
 

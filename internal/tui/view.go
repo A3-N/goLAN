@@ -253,7 +253,7 @@ func box(title string, lines []string, width, height int, active bool) string {
 		if len(clean) == innerHeight {
 			break
 		}
-		clean = append(clean, fit(line, innerWidth))
+		clean = append(clean, fit(styleTypedLine(line), innerWidth))
 	}
 	for len(clean) < innerHeight {
 		clean = append(clean, strings.Repeat(" ", innerWidth))
