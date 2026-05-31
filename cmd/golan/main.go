@@ -7,6 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"golan/internal/tui"
+	"golang.org/x/sys/unix"
 )
 
 var version = "dev"
@@ -30,8 +31,17 @@ func main() {
 		opts = append(opts, tea.WithAltScreen())
 	}
 
-	if _, err := tea.NewProgram(tui.NewModel(), opts...).Run(); err != nil {
+	width, height := terminalSize()
+	if _, err := tea.NewProgram(tui.NewModelWithSize(width, height), opts...).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "golan: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func terminalSize() (int, int) {
+	size, err := unix.IoctlGetWinsize(int(os.Stdout.Fd()), unix.TIOCGWINSZ)
+	if err != nil || size == nil {
+		return 0, 0
+	}
+	return int(size.Col), int(size.Row)
 }

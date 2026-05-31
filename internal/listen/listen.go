@@ -14,6 +14,7 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/pcapgo"
+	"golan/internal/inspect"
 	"golan/internal/paths"
 )
 
@@ -147,6 +148,7 @@ func runCapture(ctx context.Context, target Target, dir string, events chan<- Ev
 	defer close(done)
 
 	ignoreMAC, _ := net.ParseMAC(target.LocalMAC)
+	inspector := inspect.New()
 	source := gopacket.NewPacketSource(handle, handle.LinkType())
 	var lockedMAC net.HardwareAddr
 	seenTraffic := make(map[string]bool)
@@ -168,6 +170,9 @@ func runCapture(ctx context.Context, target Target, dir string, events chan<- Ev
 			packetCount++
 			if message := trafficLogMessage(target, packet, packetCount, seenTraffic); message != "" {
 				sendEvent(ctx, events, Event{Kind: "traffic", Adapter: target.Name, Role: target.Role, Message: message})
+			}
+			for _, finding := range inspector.AnalyzePacket(packet) {
+				sendEvent(ctx, events, Event{Kind: "finding", Adapter: target.Name, Role: target.Role, Message: finding.Display()})
 			}
 			if lockedMAC == nil {
 				if mac, source := targetSourceMAC(packet, ignoreMAC); mac != nil {
@@ -368,8 +373,7 @@ func trafficLogMessage(target Target, packet gopacket.Packet, count int, seen ma
 	if summary == "" {
 		return ""
 	}
-	prefix := "traffic " + target.Role + "/" + target.Name + ": "
-	return fmt.Sprintf("%s#%d %s", prefix, count, summary)
+	return fmt.Sprintf("#%d %s/%s %s", count, target.Role, target.Name, summary)
 }
 
 func PacketSummary(packet gopacket.Packet) (string, string) {
@@ -382,36 +386,56 @@ func PacketSummary(packet gopacket.Packet) (string, string) {
 		return "", ""
 	}
 	name := sourcePacketName(packet, eth)
-	details := []string{name, eth.SrcMAC.String() + " > " + eth.DstMAC.String()}
+	details := []string{shortPacketName(name), shortMAC(eth.SrcMAC) + ">" + shortMAC(eth.DstMAC)}
 	keyParts := []string{name, strings.ToLower(eth.SrcMAC.String()), strings.ToLower(eth.DstMAC.String())}
 	if vlanLayer := packet.Layer(layers.LayerTypeDot1Q); vlanLayer != nil {
 		vlan, _ := vlanLayer.(*layers.Dot1Q)
-		details = append(details, fmt.Sprintf("vlan=%d", vlan.VLANIdentifier))
+		details = append(details, fmt.Sprintf("vlan:%d", vlan.VLANIdentifier))
 		keyParts = append(keyParts, fmt.Sprintf("vlan=%d", vlan.VLANIdentifier))
 	}
 	if eapolLayer := packet.Layer(layers.LayerTypeEAPOL); eapolLayer != nil {
 		eapol, _ := eapolLayer.(*layers.EAPOL)
-		details = append(details, "eapol="+eapol.Type.String())
+		details = append(details, "eapol:"+strings.ToLower(eapol.Type.String()))
 		keyParts = append(keyParts, "eapol="+eapol.Type.String())
 	}
 	if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
 		arp, _ := arpLayer.(*layers.ARP)
 		src := net.IP(arp.SourceProtAddress)
 		dst := net.IP(arp.DstProtAddress)
-		details = append(details, fmt.Sprintf("arp=%s %s > %s", arpOperationName(arp.Operation), src, dst))
+		details = append(details, fmt.Sprintf("arp:%s %s>%s", arpOperationName(arp.Operation), src, dst))
 		keyParts = append(keyParts, "arp="+arpOperationName(arp.Operation), src.String(), dst.String())
 	}
 	if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
 		ipv4, _ := ipv4Layer.(*layers.IPv4)
-		details = append(details, fmt.Sprintf("ip=%s>%s", ipv4.SrcIP, ipv4.DstIP))
+		details = append(details, fmt.Sprintf("%s>%s %s", ipv4.SrcIP, ipv4.DstIP, ipv4.Protocol))
 		keyParts = append(keyParts, ipv4.SrcIP.String(), ipv4.DstIP.String(), ipv4.Protocol.String())
 	}
 	if ipv6Layer := packet.Layer(layers.LayerTypeIPv6); ipv6Layer != nil {
 		ipv6, _ := ipv6Layer.(*layers.IPv6)
-		details = append(details, fmt.Sprintf("ip6=%s>%s", ipv6.SrcIP, ipv6.DstIP))
+		details = append(details, fmt.Sprintf("%s>%s %s", ipv6.SrcIP, ipv6.DstIP, ipv6.NextHeader))
 		keyParts = append(keyParts, ipv6.SrcIP.String(), ipv6.DstIP.String(), ipv6.NextHeader.String())
 	}
 	return strings.Join(details, " "), strings.Join(keyParts, "\x00")
+}
+
+func shortPacketName(name string) string {
+	switch name {
+	case "EAPOL / 802.1X":
+		return "EAPOL"
+	case "VLAN-tagged traffic":
+		return "VLAN"
+	case "Ethernet data frame":
+		return "ETH"
+	default:
+		return name
+	}
+}
+
+func shortMAC(mac net.HardwareAddr) string {
+	if len(mac) != 6 {
+		return mac.String()
+	}
+	return fmt.Sprintf("%02x:%02x:%02x", mac[3], mac[4], mac[5])
 }
 
 func validSourceMAC(mac net.HardwareAddr, ignore net.HardwareAddr) bool {

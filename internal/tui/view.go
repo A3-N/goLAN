@@ -3,35 +3,43 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 	"golan/internal/profile"
 )
 
 func (m Model) View() string {
-	width := terminalWidth(m.width)
-	height := terminalHeight(m.height)
+	terminalCols := terminalWidth(m.width)
+	width := renderWidth(terminalCols)
+	terminalRows := terminalHeight(m.height)
+	height := renderHeight(terminalRows)
 
 	footer := m.renderFooter(width)
 	footerHeight := lipgloss.Height(footer)
-	mainHeight := max(8, height-footerHeight-2)
+	mainHeight := mainAreaHeight(height, footerHeight)
 
 	leftWidth, rightWidth := splitWidths(width)
 	cliHeight := clamp(mainHeight/4, 4, 8)
-	if mainHeight-cliHeight-1 < 4 {
-		cliHeight = max(4, mainHeight-5)
+	if mainHeight-cliHeight < 4 {
+		cliHeight = max(4, mainHeight-4)
 	}
-	outputHeight := max(4, mainHeight-cliHeight-1)
+	outputHeight := max(4, mainHeight-cliHeight)
 
 	left := lipgloss.JoinVertical(
 		lipgloss.Left,
 		m.renderOutput(leftWidth, outputHeight),
 		m.renderCLI(leftWidth, cliHeight),
 	)
-	right := m.renderMisc(rightWidth, mainHeight)
+	rightTopHeight, trafficHeight := rightPaneHeights(mainHeight)
+	right := lipgloss.JoinVertical(
+		lipgloss.Left,
+		m.renderRightTop(rightWidth, rightTopHeight),
+		m.renderTraffic(rightWidth, trafficHeight),
+	)
 
 	main := lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
-	return lipgloss.JoinVertical(lipgloss.Left, main, footer)
+	return clampBlock(lipgloss.JoinVertical(lipgloss.Left, main, footer), width, height)
 }
 
 func (m Model) renderOutput(width, height int) string {
@@ -62,6 +70,24 @@ func (m Model) renderCLI(width, height int) string {
 		lines = append(lines, strings.Join(limitStrings(m.completions, 8), "  "))
 	}
 	return box(m.cardTitle("cli", cardCLI), lines, width, height, m.activeCard == cardCLI)
+}
+
+func (m Model) renderRightTop(width, height int) string {
+	available := max(1, height-3)
+	start := len(m.findings) - available
+	if start < 0 {
+		start = 0
+	}
+	return box(m.cardTitle("findings", cardMisc), m.findings[start:], width, height, m.activeCard == cardMisc)
+}
+
+func (m Model) renderTraffic(width, height int) string {
+	available := max(1, height-3)
+	start := len(m.traffic) - available
+	if start < 0 {
+		start = 0
+	}
+	return box(m.cardTitle("traffic", cardMisc), m.traffic[start:], width, height, m.activeCard == cardMisc)
 }
 
 func (m Model) renderMisc(width, height int) string {
@@ -120,6 +146,32 @@ func (m Model) renderMisc(width, height int) string {
 	}
 
 	return box(m.cardTitle("misc", cardMisc), lines[offset:end], width, height, m.activeCard == cardMisc)
+}
+
+func rightPaneHeights(height int) (int, int) {
+	if height < 8 {
+		return 4, 4
+	}
+	top := height / 3
+	if top < 4 {
+		top = 4
+	}
+	bottom := height - top
+	if bottom < 4 {
+		bottom = 4
+		top = height - bottom
+		if top < 4 {
+			top = 4
+		}
+	}
+	if top+bottom > height {
+		bottom = max(4, height-top)
+	}
+	return top, bottom
+}
+
+func mainAreaHeight(height, footerHeight int) int {
+	return max(4, height-footerHeight)
 }
 
 func (m Model) renderFooter(width int) string {
@@ -230,14 +282,66 @@ func fit(value string, width int) string {
 	if visible <= width {
 		return value + strings.Repeat(" ", width-visible)
 	}
-	runes := []rune(value)
 	if width <= 1 {
 		return ""
 	}
-	if len(runes) > width {
-		return string(runes[:width-1]) + "."
+	out := truncateCells(value, width-1) + "."
+	if strings.Contains(out, "\x1b[") {
+		out += "\x1b[0m"
 	}
-	return value
+	if pad := width - lipgloss.Width(out); pad > 0 {
+		out += strings.Repeat(" ", pad)
+	}
+	return out
+}
+
+func clampBlock(value string, width, height int) string {
+	if width <= 0 {
+		return ""
+	}
+	lines := strings.Split(value, "\n")
+	if height > 0 && len(lines) > height {
+		lines = lines[:height]
+	}
+	for i, line := range lines {
+		lines[i] = fit(line, width)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func truncateCells(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	var out strings.Builder
+	cells := 0
+	for i := 0; i < len(value); {
+		if value[i] == '\x1b' && i+1 < len(value) && value[i+1] == '[' {
+			start := i
+			i += 2
+			for i < len(value) {
+				b := value[i]
+				i++
+				if b >= 0x40 && b <= 0x7e {
+					break
+				}
+			}
+			out.WriteString(value[start:i])
+			continue
+		}
+		r, size := rune(value[i]), 1
+		if r >= 0x80 {
+			r, size = utf8.DecodeRuneInString(value[i:])
+		}
+		rw := lipgloss.Width(string(r))
+		if cells+rw > width {
+			break
+		}
+		out.WriteRune(r)
+		cells += rw
+		i += size
+	}
+	return out.String()
 }
 
 func wrapLines(lines []string, width int) []string {
@@ -339,11 +443,25 @@ func terminalWidth(width int) int {
 	return max(20, width)
 }
 
+func renderWidth(width int) int {
+	if width <= 1 {
+		return 1
+	}
+	return width - 1
+}
+
 func terminalHeight(height int) int {
 	if height <= 0 {
-		return 30
+		return 20
 	}
 	return max(8, height)
+}
+
+func renderHeight(height int) int {
+	if height <= 1 {
+		return 1
+	}
+	return height - 1
 }
 
 func splitWidths(width int) (int, int) {

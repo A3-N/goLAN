@@ -17,6 +17,7 @@ import (
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/pcapgo"
 	"golan/internal/eapol"
+	"golan/internal/inspect"
 	"golan/internal/listen"
 	"golan/internal/paths"
 	"golan/internal/stealth"
@@ -29,6 +30,7 @@ const (
 	KindError     = "error"
 	KindDiscovery = "discovery"
 	KindTraffic   = "traffic"
+	KindFinding   = "finding"
 	KindStopped   = "stopped"
 )
 
@@ -76,6 +78,7 @@ type Session struct {
 	eapolDone   chan struct{}
 	origForward string
 	origIPv6Fwd string
+	inspector   *inspect.Inspector
 }
 
 type serviceRestore struct {
@@ -119,14 +122,15 @@ func Start(host, sw Adapter, dir string) (*Session, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	events := make(chan Event, 128)
 	s := &Session{
-		Name:   "kernel-bridge",
-		Host:   host,
-		Switch: sw,
-		Dir:    dir,
-		Events: events,
-		cancel: cancel,
-		done:   make(chan struct{}),
-		events: events,
+		Name:      "kernel-bridge",
+		Host:      host,
+		Switch:    sw,
+		Dir:       dir,
+		Events:    events,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		events:    events,
+		inspector: inspect.New(),
 	}
 	go s.run(ctx)
 	return s, nil
@@ -546,8 +550,13 @@ func (s *Session) capture(ctx context.Context, adapter Adapter, handle *pcap.Han
 					Kind:    KindTraffic,
 					Adapter: adapter.Name,
 					Role:    adapter.Role,
-					Message: fmt.Sprintf("bridge monitor %s/%s: #%d %dB %s", adapter.Role, adapter.Name, packetCount, len(data), summary),
+					Message: fmt.Sprintf("#%d %s/%s %s", packetCount, adapter.Role, adapter.Name, summary),
 				})
+			}
+			if s.inspector != nil {
+				for _, finding := range s.inspector.AnalyzePacket(packet) {
+					s.send(Event{Kind: KindFinding, Adapter: adapter.Name, Role: adapter.Role, Message: finding.Display()})
+				}
 			}
 			for _, discovery := range listen.AnalyzePacket(packet, ignoreMAC) {
 				s.send(Event{

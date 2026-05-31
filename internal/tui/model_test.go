@@ -67,12 +67,14 @@ func TestUpdateCLIExecutesCommand(t *testing.T) {
 func TestClearClearsOutput(t *testing.T) {
 	m := NewModel()
 	m.executeCommand("help")
+	m.addTraffic("packet")
+	m.addFinding("FOUND HTTP Basic user=alice secret=secret")
 	if len(m.output) == 0 {
 		t.Fatal("expected help output")
 	}
 	m.executeCommand("clear")
-	if len(m.output) != 0 {
-		t.Fatalf("output = %v", m.output)
+	if len(m.output) != 0 || len(m.traffic) != 0 || len(m.findings) != 0 {
+		t.Fatalf("output=%v traffic=%v findings=%v", m.output, m.traffic, m.findings)
 	}
 }
 
@@ -329,6 +331,133 @@ func TestBridgeStoresNonAdapterObservations(t *testing.T) {
 	}
 }
 
+func TestTrafficEventsUseBoundedTrafficPane(t *testing.T) {
+	m := NewModel()
+	m.height = 18
+	m.handleListenEvent(listen.Event{
+		Kind:    "traffic",
+		Adapter: "en11",
+		Role:    profile.AdapterRoleHost,
+		Message: "#1 host/en11 IPv4 00:00:11>00:00:22 192.0.2.10>192.0.2.1 TCP",
+	})
+
+	if len(m.output) != 0 {
+		t.Fatalf("traffic leaked into main output: %v", m.output)
+	}
+	if len(m.traffic) != 1 || !strings.Contains(m.traffic[0], "IPv4") {
+		t.Fatalf("traffic pane = %v", m.traffic)
+	}
+
+	limit := m.trafficCapacity()
+	for i := 0; i < limit+5; i++ {
+		m.addTraffic("packet")
+	}
+	if len(m.traffic) != limit {
+		t.Fatalf("traffic retained %d lines, want %d", len(m.traffic), limit)
+	}
+}
+
+func TestFindingEventsUseBoundedFindingsPane(t *testing.T) {
+	m := NewModel()
+	m.height = 18
+	m.handleListenEvent(listen.Event{
+		Kind:    "finding",
+		Adapter: "en11",
+		Role:    profile.AdapterRoleHost,
+		Message: "FOUND HTTP Basic user=alice secret=secret",
+	})
+
+	if len(m.findings) != 1 || !strings.Contains(m.findings[0], "secret=secret") {
+		t.Fatalf("findings pane = %v", m.findings)
+	}
+	if !containsOutput(m.output, "FOUND HTTP Basic") {
+		t.Fatalf("finding signal missing from output: %v", m.output)
+	}
+
+	limit := m.findingsCapacity()
+	for i := 0; i < limit+5; i++ {
+		m.addFinding("FOUND FTP PASS user=alice secret=secret")
+	}
+	if len(m.findings) != limit {
+		t.Fatalf("findings retained %d lines, want %d", len(m.findings), limit)
+	}
+}
+
+func TestWindowSizeLocksAfterInitialDetection(t *testing.T) {
+	m := NewModel()
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = next.(Model)
+	next, _ = m.Update(tea.WindowSizeMsg{Width: 200, Height: 60})
+	m = next.(Model)
+
+	if m.width != 80 || m.height != 24 {
+		t.Fatalf("size = %dx%d, want 80x24", m.width, m.height)
+	}
+}
+
+func TestSeededWindowSizeLocksBeforeFirstMessage(t *testing.T) {
+	m := NewModelWithSize(90, 26)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 80})
+	m = next.(Model)
+
+	if m.width != 90 || m.height != 26 {
+		t.Fatalf("size = %dx%d, want 90x26", m.width, m.height)
+	}
+}
+
+func TestDiscoveryOnlyPrintsFoundAndEAPOLSignals(t *testing.T) {
+	m := NewModel()
+	m.profile.Adapters = append(m.profile.Adapters, adaptersToConfig("en11", profile.AdapterRoleHost))
+
+	m.applyDiscovery(listen.Event{
+		Kind:     "discovery",
+		Adapter:  "en11",
+		Role:     profile.AdapterRoleHost,
+		Field:    "arp_who_has",
+		Value:    "192.0.2.1",
+		Evidence: "who-has target ip",
+		Packet:   "ARP",
+	})
+	if len(m.output) != 0 {
+		t.Fatalf("bridge-only observation printed: %v", m.output)
+	}
+
+	m.applyDiscovery(listen.Event{
+		Kind:     "discovery",
+		Adapter:  "en11",
+		Role:     profile.AdapterRoleHost,
+		Field:    "eapol",
+		Value:    "Start",
+		Evidence: "type",
+		Packet:   "EAPOL / 802.1X",
+	})
+	m.applyDiscovery(listen.Event{
+		Kind:     "discovery",
+		Adapter:  "en11",
+		Role:     profile.AdapterRoleHost,
+		Field:    "eapol",
+		Value:    "Start",
+		Evidence: "type",
+		Packet:   "EAPOL / 802.1X",
+	})
+	m.applyDiscovery(listen.Event{
+		Kind:     "discovery",
+		Adapter:  "en11",
+		Role:     profile.AdapterRoleHost,
+		Field:    "eap_code",
+		Value:    "success",
+		Evidence: "code",
+		Packet:   "EAPOL / 802.1X",
+	})
+
+	if countOutput(m.output, "EAPOL start") != 1 {
+		t.Fatalf("EAPOL start output = %v", m.output)
+	}
+	if !containsOutput(m.output, "EAPOL success") {
+		t.Fatalf("EAPOL success missing: %v", m.output)
+	}
+}
+
 func TestBridgeStartRequiresHostAndSwitch(t *testing.T) {
 	m := NewModel()
 	cmd := m.executeCommand("start bridge")
@@ -496,11 +625,61 @@ func TestViewUsesContextPromptAndRealBorders(t *testing.T) {
 	if strings.Contains(view, "try:") || strings.Contains(view, "complete:") {
 		t.Fatalf("old completion labels still present:\n%s", view)
 	}
+	if strings.Contains(view, "golan init") {
+		t.Fatalf("right top pane is not blank:\n%s", view)
+	}
+	if !strings.Contains(view, "findings") {
+		t.Fatalf("findings pane missing:\n%s", view)
+	}
+	if !strings.Contains(view, "traffic") {
+		t.Fatalf("traffic pane missing:\n%s", view)
+	}
 	if !strings.Contains(view, "tab autocomplete") {
 		t.Fatalf("footer hints missing:\n%s", view)
 	}
 	if got := lipgloss.Height(view); got > m.height {
 		t.Fatalf("view height = %d, terminal height = %d\n%s", got, m.height, view)
+	}
+	assertViewWidth(t, view, m.width)
+	assertViewHeightBelow(t, view, m.height)
+}
+
+func TestTrafficCannotExpandRenderedView(t *testing.T) {
+	m := NewModel()
+	m.width = 72
+	m.height = 18
+	m.addTraffic("host/en11 " + strings.Repeat("0123456789abcdef:", 20) + " 2001:db8::1>2001:db8::2 TCP")
+
+	view := m.View()
+	assertViewWidth(t, view, m.width)
+	assertNoFullWidthLines(t, view, m.width)
+	assertViewHeightBelow(t, view, m.height)
+	if !strings.Contains(view, "traffic") {
+		t.Fatalf("traffic pane missing:\n%s", view)
+	}
+}
+
+func TestPanelBottomBorderStaysFixedWithTraffic(t *testing.T) {
+	m := NewModel()
+	m.width = 90
+	m.height = 24
+	empty := m.View()
+	emptyBottom := lastBorderLine(empty)
+	if emptyBottom < 0 {
+		t.Fatalf("no bottom border in empty view:\n%s", empty)
+	}
+
+	for i := 0; i < 200; i++ {
+		m.addTraffic(strings.Repeat("traffic-line-", 20))
+	}
+	full := m.View()
+	fullBottom := lastBorderLine(full)
+	if fullBottom != emptyBottom {
+		t.Fatalf("bottom border moved from %d to %d\nempty:\n%s\nfull:\n%s", emptyBottom, fullBottom, empty, full)
+	}
+	wantBottom := renderHeight(terminalHeight(m.height)) - lipgloss.Height(m.renderFooter(renderWidth(terminalWidth(m.width)))) - 1
+	if fullBottom != wantBottom {
+		t.Fatalf("bottom border = %d, want %d\n%s", fullBottom, wantBottom, full)
 	}
 }
 
@@ -545,6 +724,8 @@ func TestOutputWrapsBeforeClipping(t *testing.T) {
 	if got := lipgloss.Height(view); got > m.height {
 		t.Fatalf("view height = %d, terminal height = %d\n%s", got, m.height, view)
 	}
+	assertViewWidth(t, view, m.width)
+	assertViewHeightBelow(t, view, m.height)
 	if strings.Contains(view, "…") {
 		t.Fatalf("output was truncated instead of wrapped:\n%s", view)
 	}
@@ -566,6 +747,51 @@ func containsOutput(output []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func assertViewWidth(t *testing.T, view string, width int) {
+	t.Helper()
+	for i, line := range strings.Split(view, "\n") {
+		if got := lipgloss.Width(line); got > width {
+			t.Fatalf("line %d width = %d, terminal width = %d:\n%s", i, got, width, view)
+		}
+	}
+}
+
+func assertNoFullWidthLines(t *testing.T, view string, width int) {
+	t.Helper()
+	for i, line := range strings.Split(view, "\n") {
+		if got := lipgloss.Width(line); got >= width {
+			t.Fatalf("line %d width = %d; expected below terminal width %d to avoid autowrap:\n%s", i, got, width, view)
+		}
+	}
+}
+
+func assertViewHeightBelow(t *testing.T, view string, height int) {
+	t.Helper()
+	if got := lipgloss.Height(view); got >= height {
+		t.Fatalf("view height = %d; expected below terminal height %d to avoid vertical scroll:\n%s", got, height, view)
+	}
+}
+
+func lastBorderLine(view string) int {
+	lines := strings.Split(view, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.Contains(lines[i], "╰") {
+			return i
+		}
+	}
+	return -1
+}
+
+func countOutput(output []string, want string) int {
+	var count int
+	for _, line := range output {
+		if strings.Contains(line, want) {
+			count++
+		}
+	}
+	return count
 }
 
 func containsString(values []string, want string) bool {

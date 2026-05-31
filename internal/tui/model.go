@@ -10,6 +10,7 @@ import (
 	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"golan/internal/adapters"
 	bridge "golan/internal/bridge"
 	"golan/internal/configs"
@@ -37,6 +38,9 @@ type Model struct {
 	outputScroll  int
 	miscScroll    int
 	output        []string
+	traffic       []string
+	findings      []string
+	signalSeen    map[string]bool
 	input         string
 	inputMode     inputMode
 	completions   []string
@@ -132,7 +136,19 @@ func NewModel() Model {
 		historyIndex:  -1,
 		restoreState:  make(map[string]bridge.InterfaceRestoreState),
 		lockPending:   make(map[string]bool),
+		signalSeen:    make(map[string]bool),
 	}
+}
+
+func NewModelWithSize(width, height int) Model {
+	m := NewModel()
+	if width > 0 {
+		m.width = width
+	}
+	if height > 0 {
+		m.height = height
+	}
+	return m
 }
 
 func (m Model) Init() tea.Cmd {
@@ -162,8 +178,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshCompletions()
 		return m, nil
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
+		if m.width == 0 || m.height == 0 {
+			m.width = msg.Width
+			m.height = msg.Height
+			m.trimTraffic()
+			m.trimFindings()
+		}
 		return m, nil
 	case cursorBlinkMsg:
 		m.cursorVisible = !m.cursorVisible
@@ -370,7 +390,7 @@ func (m *Model) handleVerticalMove(delta int) {
 	case cardOutput:
 		m.outputScroll = max(0, m.outputScroll-delta)
 	case cardMisc:
-		m.miscScroll = max(0, m.miscScroll+delta)
+		return
 	default:
 		m.recallHistory(delta)
 	}
@@ -390,6 +410,8 @@ func (m *Model) executeCommand(raw string) tea.Cmd {
 		m.executeShow(fields[1:])
 	case "clear", "cls":
 		m.output = nil
+		m.traffic = nil
+		m.findings = nil
 		m.outputScroll = 0
 	case "set":
 		return m.executeSet(fields[1:])
@@ -891,8 +913,12 @@ func (m *Model) handleBridgeEvent(session *bridge.Session, event bridge.Event) t
 			m.bridgeState = event.State
 			m.print("bridge state: " + event.State)
 		}
-	case bridge.KindLog, bridge.KindTraffic:
-		m.print(event.Message)
+	case bridge.KindLog:
+		m.printEAPOLLogSignal(event.Message)
+	case bridge.KindTraffic:
+		m.addTraffic(event.Message)
+	case bridge.KindFinding:
+		m.addFinding(event.Message)
 	case bridge.KindPcap:
 		m.print(fmt.Sprintf("pcap %s/%s: %s", event.Role, event.Adapter, event.Path))
 	case bridge.KindError:
@@ -983,8 +1009,12 @@ func (m *Model) handleListenEvent(event listen.Event) tea.Cmd {
 	switch event.Kind {
 	case "pcap":
 		m.print(fmt.Sprintf("pcap %s/%s: %s", event.Role, event.Adapter, event.Path))
-	case "log", "traffic":
-		m.print(event.Message)
+	case "log":
+		m.printEAPOLLogSignal(event.Message)
+	case "traffic":
+		m.addTraffic(event.Message)
+	case "finding":
+		m.addFinding(event.Message)
 	case "error":
 		m.print(fmt.Sprintf("%s err %s/%s: %v", mode, event.Role, event.Adapter, event.Err))
 	case "stopped":
@@ -999,14 +1029,11 @@ func (m *Model) handleListenEvent(event listen.Event) tea.Cmd {
 }
 
 func (m *Model) applyDiscovery(event listen.Event) {
-	bridgeAdded := false
 	if isBridgeObservation(event) {
-		bridgeAdded = m.profile.AddBridgeObservation(event.Adapter, event.Role, event.Field, event.Value, event.Evidence, event.Packet)
+		m.profile.AddBridgeObservation(event.Adapter, event.Role, event.Field, event.Value, event.Evidence, event.Packet)
 	}
+	m.printEAPOLDiscoverySignal(event)
 	if !profile.KnownField(event.Field) {
-		if bridgeAdded {
-			m.print(formatBridgeOutput(event, "saved"))
-		}
 		return
 	}
 
@@ -1041,19 +1068,6 @@ func isBridgeObservation(event listen.Event) bool {
 func formatDiscoveryOutput(event listen.Event, status string) string {
 	return fmt.Sprintf("%s %s/%s %s%s %s/%s %s",
 		styleKey.Render("FOUND"),
-		event.Role,
-		event.Adapter,
-		styleKey.Render(strings.ToUpper(event.Field)+"="),
-		styleValue.Render(event.Value),
-		event.Packet,
-		event.Evidence,
-		styleWarn.Render(status),
-	)
-}
-
-func formatBridgeOutput(event listen.Event, status string) string {
-	return fmt.Sprintf("%s %s/%s %s%s %s/%s %s",
-		styleKey.Render("BRIDGE"),
 		event.Role,
 		event.Adapter,
 		styleKey.Render(strings.ToUpper(event.Field)+"="),
@@ -1229,12 +1243,150 @@ func (m *Model) print(line string) {
 	}
 }
 
+func (m *Model) addTraffic(line string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+	m.traffic = append(m.traffic, line)
+	m.trimTraffic()
+}
+
+func (m *Model) trimTraffic() {
+	limit := m.trafficCapacity()
+	if len(m.traffic) > limit {
+		m.traffic = m.traffic[len(m.traffic)-limit:]
+	}
+}
+
+func (m Model) trafficCapacity() int {
+	height := renderHeight(terminalHeight(m.height))
+	width := renderWidth(terminalWidth(m.width))
+	footerHeight := lipgloss.Height(m.renderFooter(width))
+	mainHeight := mainAreaHeight(height, footerHeight)
+	_, trafficHeight := rightPaneHeights(mainHeight)
+	return max(1, trafficHeight-3)
+}
+
+func (m *Model) addFinding(line string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+	m.findings = append(m.findings, line)
+	m.trimFindings()
+	m.printSignal("finding\x00"+strings.ToLower(line), line)
+}
+
+func (m *Model) trimFindings() {
+	limit := m.findingsCapacity()
+	if len(m.findings) > limit {
+		m.findings = m.findings[len(m.findings)-limit:]
+	}
+}
+
+func (m Model) findingsCapacity() int {
+	height := renderHeight(terminalHeight(m.height))
+	width := renderWidth(terminalWidth(m.width))
+	footerHeight := lipgloss.Height(m.renderFooter(width))
+	mainHeight := mainAreaHeight(height, footerHeight)
+	findingsHeight, _ := rightPaneHeights(mainHeight)
+	return max(1, findingsHeight-3)
+}
+
+func (m *Model) printSignal(key, line string) {
+	key = strings.TrimSpace(strings.ToLower(key))
+	line = strings.TrimSpace(line)
+	if key == "" || line == "" {
+		return
+	}
+	if m.signalSeen == nil {
+		m.signalSeen = make(map[string]bool)
+	}
+	if m.signalSeen[key] {
+		return
+	}
+	m.signalSeen[key] = true
+	m.print(line)
+}
+
+func (m *Model) printEAPOLDiscoverySignal(event listen.Event) {
+	key, label, ok := eapolDiscoverySignal(event)
+	if !ok {
+		return
+	}
+	location := strings.Trim(strings.Join([]string{event.Role, event.Adapter}, "/"), "/")
+	if location != "" {
+		label += " " + location
+	}
+	m.printSignal(key+"\x00"+location, styleKey.Render(label))
+}
+
+func (m *Model) printEAPOLLogSignal(message string) {
+	key, label, ok := eapolLogSignal(message)
+	if !ok {
+		return
+	}
+	m.printSignal(key, styleKey.Render(label))
+}
+
+func eapolDiscoverySignal(event listen.Event) (string, string, bool) {
+	if event.Packet != "EAPOL / 802.1X" {
+		return "", "", false
+	}
+	value := strings.ToLower(event.Value)
+	switch event.Field {
+	case "eapol":
+		switch {
+		case strings.Contains(value, "start"):
+			return "eapol-start", "EAPOL start", true
+		case strings.Contains(value, "logoff"):
+			return "eapol-logoff", "EAPOL logoff", true
+		}
+	case "eap_code":
+		switch value {
+		case "success":
+			return "eap-success", "EAPOL success", true
+		case "failure":
+			return "eap-failure", "EAPOL failure", true
+		}
+	}
+	return "", "", false
+}
+
+func eapolLogSignal(message string) (string, string, bool) {
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "eapol-start"):
+		return "eapol-start", "EAPOL start", true
+	case strings.Contains(lower, "eap-success") || strings.Contains(lower, "port authorized"):
+		return "eap-success", "EAPOL success", true
+	case strings.Contains(lower, "eap-failure") || strings.Contains(lower, "authentication rejected"):
+		return "eap-failure", "EAPOL failure", true
+	case strings.Contains(lower, "eap method negotiated"):
+		return "eap-method", compactEAPOLLog(message), true
+	default:
+		return "", "", false
+	}
+}
+
+func compactEAPOLLog(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return "EAPOL"
+	}
+	if idx := strings.LastIndex(message, ":"); idx >= 0 && idx+1 < len(message) {
+		message = strings.TrimSpace(message[idx+1:])
+	}
+	return "EAPOL " + message
+}
+
 func (c cardFocus) String() string {
 	switch c {
 	case cardOutput:
 		return "output"
 	case cardMisc:
-		return "misc"
+		return "right"
 	default:
 		return "cli"
 	}
