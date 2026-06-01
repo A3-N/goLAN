@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"sort"
@@ -162,6 +163,38 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(discoverAdaptersCmd, blinkCursorCmd())
 }
 
+// Shutdown synchronously persists and tears down runtime resources held by a
+// returned Bubble Tea model. It is safe to call after normal quits and signal
+// interruptions; repeated calls are harmless.
+func Shutdown(model tea.Model) error {
+	switch model := model.(type) {
+	case Model:
+		return model.shutdown()
+	case *Model:
+		return model.shutdown()
+	default:
+		return nil
+	}
+}
+
+func (m *Model) shutdown() error {
+	var errs []error
+	if err := m.saveCanvas(); err != nil {
+		m.print("canvas err: " + err.Error())
+		errs = append(errs, fmt.Errorf("save canvas: %w", err))
+	}
+	if err := m.stopCapture(); err != nil {
+		errs = append(errs, fmt.Errorf("stop listen: %w", err))
+	}
+	if err := m.stopBridgeNow(); err != nil {
+		errs = append(errs, fmt.Errorf("stop bridge: %w", err))
+	}
+	if err := m.restoreLockedAdaptersNow(); err != nil {
+		errs = append(errs, fmt.Errorf("restore adapters: %w", err))
+	}
+	return errors.Join(errs...)
+}
+
 func blinkCursorCmd() tea.Cmd {
 	return tea.Tick(cursorBlinkInterval, func(time.Time) tea.Msg {
 		return cursorBlinkMsg{}
@@ -299,10 +332,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) updateCLI(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
-		m.saveCanvas()
-		m.stopCapture()
-		m.stopBridgeNow()
-		m.restoreLockedAdaptersNow()
+		_ = m.shutdown()
 		return m, tea.Quit
 	case "ctrl+s":
 		m.startSavePrompt()
@@ -449,10 +479,7 @@ func (m *Model) executeCommand(raw string) tea.Cmd {
 		m.print("refresh: adapters")
 		return discoverAdaptersCmd
 	case "quit", "exit":
-		m.saveCanvas()
-		m.stopCapture()
-		m.stopBridgeNow()
-		m.restoreLockedAdaptersNow()
+		_ = m.shutdown()
 		return tea.Quit
 	default:
 		m.print("unknown: " + fields[0])
@@ -842,7 +869,7 @@ func (m *Model) executeStop(args []string) tea.Cmd {
 			m.print("listen: off")
 			return nil
 		}
-		m.stopCapture()
+		_ = m.stopCapture()
 		m.print("listen: stop")
 		return nil
 	case "bridge":
@@ -947,26 +974,30 @@ func waitBridgeEventCmd(session *bridge.Session) tea.Cmd {
 	}
 }
 
-func (m *Model) stopCapture() {
+func (m *Model) stopCapture() error {
+	var err error
 	if m.listener != nil {
-		if err := m.listener.Stop(); err != nil {
+		if err = m.listener.Stop(); err != nil {
 			m.print("listen err: stop " + err.Error())
 		}
 	}
 	m.listener = nil
 	m.capMode = ""
+	return err
 }
 
-func (m *Model) stopBridgeNow() {
+func (m *Model) stopBridgeNow() error {
 	if m.bridge == nil {
-		return
+		return nil
 	}
 	session := m.bridge
 	m.bridge = nil
 	m.bridgeState = ""
 	if err := session.Stop(); err != nil {
 		m.print("bridge err: stop " + err.Error())
+		return err
 	}
+	return nil
 }
 
 func (m *Model) handleBridgeEvent(session *bridge.Session, event bridge.Event) tea.Cmd {
@@ -1038,16 +1069,19 @@ func setAdapterState(name, state string) error {
 	return err
 }
 
-func (m *Model) restoreLockedAdaptersNow() {
+func (m *Model) restoreLockedAdaptersNow() error {
+	var errs []error
 	for name, state := range m.restoreState {
 		if err := bridge.RestoreInterfaceState(state); err != nil {
 			m.print(fmt.Sprintf("adapter restore warn %s: %v", name, err))
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
 		}
 		delete(m.restoreState, name)
 	}
 	for name := range m.lockPending {
 		delete(m.lockPending, name)
 	}
+	return errors.Join(errs...)
 }
 
 func (m *Model) updateAdapterStatus(name string, up bool) {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -32,8 +33,18 @@ func main() {
 	}
 
 	width, height := terminalSize()
-	if _, err := tea.NewProgram(tui.NewModelWithSize(width, height), opts...).Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "golan: %v\n", err)
+	finalModel, err := tea.NewProgram(tui.NewModelWithSize(width, height), opts...).Run()
+	cleanupErr := tui.Shutdown(finalModel)
+	if errors.Is(err, tea.ErrInterrupted) {
+		err = nil
+	}
+	if err != nil || cleanupErr != nil {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "golan: %v\n", err)
+		}
+		if cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "golan cleanup: %v\n", cleanupErr)
+		}
 		os.Exit(1)
 	}
 }

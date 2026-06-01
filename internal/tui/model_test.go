@@ -599,6 +599,24 @@ func TestCtrlCStopsActiveCapture(t *testing.T) {
 	}
 }
 
+func TestCtrlCStopsActiveBridge(t *testing.T) {
+	m := NewModel()
+	m.bridge = &bridge.Session{}
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	got := next.(Model)
+	if got.bridge != nil || got.bridgeState != "" {
+		t.Fatalf("bridge state = bridge:%v state:%q", got.bridge, got.bridgeState)
+	}
+}
+
+func TestShutdownStopsReturnedBridgeModel(t *testing.T) {
+	m := NewModel()
+	m.bridge = &bridge.Session{}
+	if err := Shutdown(m); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
 func TestARPKnownFieldsAlsoGoToBridge(t *testing.T) {
 	m := NewModel()
 	m.profile.Adapters = append(m.profile.Adapters, adaptersToConfig("en11", profile.AdapterRoleHost))

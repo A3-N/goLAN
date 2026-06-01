@@ -143,7 +143,12 @@ func (s *Session) Stop() error {
 	if s == nil {
 		return nil
 	}
-	s.cancel()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.done == nil {
+		return nil
+	}
 	select {
 	case <-s.done:
 		return nil
