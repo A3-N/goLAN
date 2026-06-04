@@ -563,10 +563,16 @@ func eapTypeName(eapType layers.EAPType) string {
 		return "notification"
 	case layers.EAPTypeNACK:
 		return "nak"
-	case layers.EAPTypeOTP:
+	case layers.EAPType(4):
+		return "md5-challenge"
+	case layers.EAPType(5):
 		return "otp"
-	case layers.EAPTypeTokenCard:
-		return "token-card"
+	case layers.EAPType(6):
+		return "generic-token-card"
+	case layers.EAPType(17):
+		return "leap"
+	case layers.EAPType(26):
+		return "mschapv2"
 	default:
 		return fmt.Sprintf("%d", eapType)
 	}

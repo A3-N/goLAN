@@ -94,6 +94,9 @@ type Inspector struct {
 	mu             sync.Mutex
 	flowUsers      map[flowKey]string
 	ntlmChallenges map[flowKey]string
+	eapChallenges  map[eapChallengeKey]eapChallenge
+	eapIdentities  map[string]string
+	eapLatest      map[string]Finding
 	seen           map[string]bool
 }
 
@@ -108,16 +111,26 @@ func New() *Inspector {
 	return &Inspector{
 		flowUsers:      make(map[flowKey]string),
 		ntlmChallenges: make(map[flowKey]string),
+		eapChallenges:  make(map[eapChallengeKey]eapChallenge),
+		eapIdentities:  make(map[string]string),
+		eapLatest:      make(map[string]Finding),
 		seen:           make(map[string]bool),
 	}
 }
 
 func (i *Inspector) AnalyzePacket(packet gopacket.Packet) []Finding {
+	i.mu.Lock()
+	var findings []Finding
+	i.extractEAP(packet, func(f Finding) {
+		i.addFinding(&findings, f)
+	})
+	i.mu.Unlock()
+
 	src, dst, sport, dport, payload, ok := packetFlow(packet)
 	if !ok {
-		return nil
+		return findings
 	}
-	return i.AnalyzeFlow(src, sport, dst, dport, payload, packet.Data())
+	return append(findings, i.AnalyzeFlow(src, sport, dst, dport, payload, packet.Data())...)
 }
 
 func (i *Inspector) AnalyzeFlow(src string, sport uint16, dst string, dport uint16, payload []byte, raw []byte) []Finding {
@@ -127,12 +140,7 @@ func (i *Inspector) AnalyzeFlow(src string, sport uint16, dst string, dport uint
 	var findings []Finding
 	add := func(f Finding) {
 		f.Src, f.Sport, f.Dst, f.Dport = src, sport, dst, dport
-		key := f.Key()
-		if i.seen[key] {
-			return
-		}
-		i.seen[key] = true
-		findings = append(findings, f)
+		i.addFinding(&findings, f)
 	}
 
 	i.extractNTLM(payload, src, sport, dst, dport, add)
@@ -147,6 +155,15 @@ func (i *Inspector) AnalyzeFlow(src string, sport uint16, dst string, dport uint
 	i.extractCards(payload, add)
 
 	return findings
+}
+
+func (i *Inspector) addFinding(findings *[]Finding, f Finding) {
+	key := f.Key()
+	if i.seen[key] {
+		return
+	}
+	i.seen[key] = true
+	*findings = append(*findings, f)
 }
 
 func (i *Inspector) extractHTTP(payload []byte, add func(Finding)) {

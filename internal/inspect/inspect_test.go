@@ -1,10 +1,15 @@
 package inspect
 
 import (
+	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"strings"
 	"testing"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 )
 
 func TestHTTPBasicFindingShowsSecret(t *testing.T) {
@@ -102,6 +107,122 @@ func TestCardFindingShowsFullNumber(t *testing.T) {
 	}
 }
 
+func TestEAPMD5FindingShowsHashcat4800(t *testing.T) {
+	inspector := New()
+	auth := "02:00:00:00:00:02"
+	peer := "02:00:00:00:00:01"
+	challenge := bytesOf(0x11, 16)
+	response, _ := hex.DecodeString("63588113b10df3f656ddd7d8133bda4c")
+
+	request := eapPacket(auth, peer, 1, 0x02, 4, append([]byte{16}, append(challenge, []byte("server")...)...))
+	if findings := inspector.AnalyzePacket(request); len(findings) != 0 {
+		t.Fatalf("request findings = %+v", findings)
+	}
+	responseData := append([]byte{16}, append(response, []byte("test")...)...)
+	findings := inspector.AnalyzePacket(eapPacket(peer, auth, 2, 0x02, 4, responseData))
+	if len(findings) != 1 {
+		t.Fatalf("response findings = %+v", findings)
+	}
+	got := findings[0].Display()
+	responseHex := hex.EncodeToString(response)
+	challengeHex := hex.EncodeToString(challenge)
+	wantSecret := "test:$02$" + challengeHex + "$" + responseHex
+	wantHashcat := responseHex + ":" + challengeHex + ":02"
+	if !strings.Contains(got, "EAP EAP-MD5 hashcat-4800") ||
+		!strings.Contains(got, "user=test") ||
+		!strings.Contains(got, "secret="+wantSecret) ||
+		!strings.Contains(got, "mode=4800 status=crackable valid=tuple") ||
+		!strings.Contains(got, "hashcat="+wantHashcat) {
+		t.Fatalf("display = %q", got)
+	}
+
+	status := inspector.AnalyzePacket(eapStatusPacket(auth, peer, 4, 0x02))
+	if len(status) != 1 || !strings.Contains(status[0].Display(), "status=rejected valid=eap-failure") || !strings.Contains(status[0].Display(), "hashcat="+wantHashcat) {
+		t.Fatalf("status findings = %+v", status)
+	}
+}
+
+func TestEAPMSCHAPv2FindingShowsHashcat5500(t *testing.T) {
+	inspector := New()
+	auth := "02:00:00:00:00:12"
+	peer := "02:00:00:00:00:11"
+	authChallenge := bytesOf(0x55, 16)
+	peerChallenge := bytesOf(0x77, 16)
+	ntResponse := bytesOf(0xcc, 24)
+	user := "test"
+
+	inspector.AnalyzePacket(eapPacket(auth, peer, 1, 7, 26, mschapv2Challenge(9, authChallenge, "server")))
+	findings := inspector.AnalyzePacket(eapPacket(peer, auth, 2, 7, 26, mschapv2Response(9, peerChallenge, ntResponse, user)))
+	if len(findings) != 1 {
+		t.Fatalf("findings = %+v", findings)
+	}
+	chalHash := sha1.Sum(append(append(append([]byte{}, peerChallenge...), authChallenge...), []byte(user)...))
+	ntResponseHex := hex.EncodeToString(ntResponse)
+	wantSecret := user + "::::" + ntResponseHex + ":" + hex.EncodeToString(peerChallenge) + ":" + hex.EncodeToString(authChallenge)
+	wantHashcat := user + "::::" + ntResponseHex + ":" + hex.EncodeToString(chalHash[:8])
+	got := findings[0].Display()
+	if !strings.Contains(got, "EAP EAP-MSCHAPv2 hashcat-5500") ||
+		!strings.Contains(got, "user="+user) ||
+		!strings.Contains(got, "secret="+wantSecret) ||
+		!strings.Contains(got, "mode=5500 status=crackable valid=tuple") ||
+		!strings.Contains(got, "hashcat="+wantHashcat) {
+		t.Fatalf("display = %q", got)
+	}
+}
+
+func TestCiscoLEAPFindingShowsHashcat5500(t *testing.T) {
+	inspector := New()
+	auth := "02:00:00:00:00:22"
+	peer := "02:00:00:00:00:21"
+	challenge := bytesOf(0x33, 8)
+	response := bytesOf(0xaa, 24)
+
+	inspector.AnalyzePacket(eapPacket(auth, peer, 1, 3, 17, leapData(challenge, "server")))
+	findings := inspector.AnalyzePacket(eapPacket(peer, auth, 2, 3, 17, leapData(response, "test")))
+	if len(findings) != 1 {
+		t.Fatalf("findings = %+v", findings)
+	}
+	responseHex := hex.EncodeToString(response)
+	challengeHex := hex.EncodeToString(challenge)
+	wantSecret := "test:" + challengeHex + ":" + responseHex
+	wantHashcat := "test::::" + responseHex + ":" + challengeHex
+	got := findings[0].Display()
+	if !strings.Contains(got, "EAP Cisco LEAP hashcat-5500") ||
+		!strings.Contains(got, "user=test") ||
+		!strings.Contains(got, "secret="+wantSecret) ||
+		!strings.Contains(got, "hashcat="+wantHashcat) {
+		t.Fatalf("display = %q", got)
+	}
+}
+
+func TestEAPResponseUsesRequestMethodForClassification(t *testing.T) {
+	inspector := New()
+	auth := "02:00:00:00:00:32"
+	peer := "02:00:00:00:00:31"
+
+	inspector.AnalyzePacket(eapPacket(auth, peer, 1, 5, 17, leapData(bytesOf(0x44, 8), "server")))
+	findings := inspector.AnalyzePacket(eapPacket(peer, auth, 2, 5, 4, leapData(bytesOf(0xbb, 24), "test")))
+	if len(findings) != 1 {
+		t.Fatalf("LEAP findings = %+v", findings)
+	}
+	if got := findings[0].Display(); !strings.Contains(got, "Cisco LEAP hashcat-5500") || strings.Contains(got, "hashcat-4800") {
+		t.Fatalf("LEAP display = %q", got)
+	}
+
+	inspector = New()
+	authChallenge := bytesOf(0x55, 16)
+	peerChallenge := bytesOf(0x77, 16)
+	ntResponse := bytesOf(0xcc, 24)
+	inspector.AnalyzePacket(eapPacket(auth, peer, 1, 6, 26, mschapv2Challenge(9, authChallenge, "server")))
+	findings = inspector.AnalyzePacket(eapPacket(peer, auth, 2, 6, 4, mschapv2Response(9, peerChallenge, ntResponse, "test")))
+	if len(findings) != 1 {
+		t.Fatalf("MSCHAPv2 findings = %+v", findings)
+	}
+	if got := findings[0].Display(); !strings.Contains(got, "EAP-MSCHAPv2 hashcat-5500") || strings.Contains(got, "hashcat-4800") {
+		t.Fatalf("MSCHAPv2 display = %q", got)
+	}
+}
+
 func ntlmType2(challenge []byte) []byte {
 	payload := make([]byte, 32)
 	copy(payload[:8], []byte("NTLMSSP\x00"))
@@ -152,6 +273,72 @@ func bytesOf(value byte, count int) []byte {
 	out := make([]byte, count)
 	for i := range out {
 		out[i] = value
+	}
+	return out
+}
+
+func eapPacket(src, dst string, code, id, eapType byte, typeData []byte) gopacket.Packet {
+	eapLen := 5 + len(typeData)
+	eap := make([]byte, eapLen)
+	eap[0] = code
+	eap[1] = id
+	binary.BigEndian.PutUint16(eap[2:4], uint16(eapLen))
+	eap[4] = eapType
+	copy(eap[5:], typeData)
+	return eapolPacket(src, dst, eap)
+}
+
+func eapStatusPacket(src, dst string, code, id byte) gopacket.Packet {
+	eap := make([]byte, 4)
+	eap[0] = code
+	eap[1] = id
+	binary.BigEndian.PutUint16(eap[2:4], 4)
+	return eapolPacket(src, dst, eap)
+}
+
+func eapolPacket(src, dst string, eap []byte) gopacket.Packet {
+	frame := make([]byte, 14+4+len(eap))
+	copy(frame[0:6], mustMAC(dst))
+	copy(frame[6:12], mustMAC(src))
+	frame[12], frame[13] = 0x88, 0x8e
+	frame[14], frame[15] = 0x01, 0x00
+	binary.BigEndian.PutUint16(frame[16:18], uint16(len(eap)))
+	copy(frame[18:], eap)
+	return gopacket.NewPacket(frame, layers.LayerTypeEthernet, gopacket.Default)
+}
+
+func leapData(value []byte, user string) []byte {
+	out := []byte{1, 0, byte(len(value))}
+	out = append(out, value...)
+	out = append(out, []byte(user)...)
+	return out
+}
+
+func mschapv2Challenge(id byte, challenge []byte, name string) []byte {
+	data := []byte{1, id, 0, 0, byte(len(challenge))}
+	data = append(data, challenge...)
+	data = append(data, []byte(name)...)
+	binary.BigEndian.PutUint16(data[2:4], uint16(len(data)))
+	return data
+}
+
+func mschapv2Response(id byte, peerChallenge, ntResponse []byte, user string) []byte {
+	data := []byte{2, id, 0, 0, 49}
+	data = append(data, peerChallenge...)
+	data = append(data, bytesOf(0, 8)...)
+	data = append(data, ntResponse...)
+	data = append(data, 0)
+	data = append(data, []byte(user)...)
+	binary.BigEndian.PutUint16(data[2:4], uint16(len(data)))
+	return data
+}
+
+func mustMAC(value string) []byte {
+	parts := strings.Split(value, ":")
+	out := make([]byte, 6)
+	for i, part := range parts {
+		decoded, _ := hex.DecodeString(part)
+		out[i] = decoded[0]
 	}
 	return out
 }

@@ -1,12 +1,6 @@
 # todo
 - send command 
-- secrets add eap/eapol 
-
-| EAP Method               | Hashcat Mode  |
-| ------------------------ | ------------- |
-| EAP-MD5                  | 4800          |
-| Cisco LEAP               | 5500          |
-| MSCHAPv2 (PEAP-MSCHAPv2) | 5500          |
+- own identity improve 
 
 # golan
 

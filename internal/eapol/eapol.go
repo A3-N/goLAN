@@ -72,7 +72,7 @@ const (
 	MethodTTLS     EAPMethod = "EAP-TTLS"
 	MethodFAST     EAPMethod = "EAP-FAST"
 	MethodLEAP     EAPMethod = "LEAP"
-	MethodMSCHAPv2 EAPMethod = "MSCHAPv2"
+	MethodMSCHAPv2 EAPMethod = "EAP-MSCHAPv2"
 )
 
 // eapTypeToMethod maps the EAP Type field (from RFC) to our method names.
@@ -93,7 +93,7 @@ func eapTypeToMethod(eapType uint8) EAPMethod {
 		return MethodFAST
 	case 17:
 		return MethodLEAP
-	case 29:
+	case 26:
 		return MethodMSCHAPv2
 	default:
 		return MethodUnknown
