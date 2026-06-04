@@ -35,6 +35,9 @@ func main() {
 	width, height := terminalSize()
 	finalModel, err := tea.NewProgram(tui.NewModelWithSize(width, height), opts...).Run()
 	cleanupErr := tui.Shutdown(finalModel)
+	for _, dir := range tui.PcapDirs(finalModel) {
+		fmt.Fprintf(os.Stdout, "pcaps: %s\n", dir)
+	}
 	if errors.Is(err, tea.ErrInterrupted) {
 		err = nil
 	}

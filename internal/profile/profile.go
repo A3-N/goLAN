@@ -76,6 +76,7 @@ type DiscoveredValue struct {
 
 // BridgeConfig holds passive observations that describe the link/bridge view.
 type BridgeConfig struct {
+	Config       AdapterConfig       `json:"config"`
 	Observations []BridgeObservation `json:"observations,omitempty"`
 }
 
@@ -225,6 +226,18 @@ func (p *Profile) Reset() {
 	p.Bridge = BridgeConfig{}
 }
 
+// BridgeAdapter returns the editable bridge-level takeover config.
+func (p *Profile) BridgeAdapter() *AdapterConfig {
+	ensureBridgeAdapterDefaults(&p.Bridge.Config)
+	return &p.Bridge.Config
+}
+
+// BridgeAdapterSnapshot returns a copy of the editable bridge-level config.
+func (p Profile) BridgeAdapterSnapshot() AdapterConfig {
+	ensureBridgeAdapterDefaults(&p.Bridge.Config)
+	return p.Bridge.Config
+}
+
 // AddBridgeObservation records passive link-level evidence.
 func (p *Profile) AddBridgeObservation(adapter, role, field, value, evidence, packet string) bool {
 	field = canonicalKey(field)
@@ -301,6 +314,23 @@ func ValidAdapterRole(adapterRole string) bool {
 
 func AdapterRoles() []string {
 	return []string{AdapterRoleHost, AdapterRoleSwitch}
+}
+
+func ensureBridgeAdapterDefaults(cfg *AdapterConfig) {
+	if strings.TrimSpace(cfg.AdapterRole) == "" {
+		cfg.AdapterRole = "bridge"
+	}
+	if strings.TrimSpace(cfg.Name) == "" {
+		cfg.Name = "bridge"
+	}
+	if strings.TrimSpace(cfg.Kind) == "" {
+		cfg.Kind = "bridge"
+	}
+	for _, field := range Fields {
+		if strings.TrimSpace(cfg.Value(field.Key)) == "" {
+			_, _ = cfg.Set(field.Key, "auto")
+		}
+	}
 }
 
 func roleRank(adapterRole string) int {

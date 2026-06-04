@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	ethernetTypeEAPOL = layers.EthernetType(0x888e)
-	arpRequestOp      = 1
+	ethernetTypeEAPOL  = layers.EthernetType(0x888e)
+	ethernetTypeMACsec = layers.EthernetType(0x88e5)
+	arpRequestOp       = 1
 )
 
 // Target describes one staged adapter to passively capture.
@@ -302,6 +303,13 @@ func AnalyzePacket(packet gopacket.Packet, ignoreMAC net.HardwareAddr) []Event {
 		}
 		for _, option := range dhcp.Options {
 			switch option.Type {
+			case layers.DHCPOptSubnetMask:
+				if len(option.Data) >= 4 {
+					mask := net.IPMask(option.Data[:4])
+					if ones, bits := mask.Size(); bits == 32 && ones >= 0 {
+						events = append(events, discovery("cidr", fmt.Sprintf("%d", ones), "dhcp subnet mask option", "DHCP"))
+					}
+				}
 			case layers.DHCPOptRouter:
 				for i := 0; i+3 < len(option.Data); i += 4 {
 					ip := net.IP(option.Data[i : i+4])
@@ -323,7 +331,11 @@ func AnalyzePacket(packet gopacket.Packet, ignoreMAC net.HardwareAddr) []Event {
 	if layer := packet.Layer(layers.LayerTypeEAPOL); layer != nil {
 		eapol, _ := layer.(*layers.EAPOL)
 		events = append(events, discovery("eapol", eapol.Type.String(), "type", "EAPOL / 802.1X"))
+		events = append(events, discovery("eapol_type", fmt.Sprintf("%d", eapol.Type), "type number", "EAPOL / 802.1X"))
 		events = append(events, discovery("eapol_version", fmt.Sprintf("%d", eapol.Version), "version", "EAPOL / 802.1X"))
+	}
+	if eth != nil && eth.EthernetType == ethernetTypeMACsec {
+		events = append(events, discovery("macsec", "0x88e5", "ether type", "MACsec"))
 	}
 
 	if layer := packet.Layer(layers.LayerTypeEAP); layer != nil {
@@ -341,6 +353,8 @@ func sourcePacketName(packet gopacket.Packet, eth *layers.Ethernet) string {
 	switch {
 	case eth != nil && eth.EthernetType == ethernetTypeEAPOL:
 		return "EAPOL / 802.1X"
+	case eth != nil && eth.EthernetType == ethernetTypeMACsec:
+		return "MACsec"
 	case packet.Layer(layers.LayerTypeDHCPv4) != nil:
 		return "DHCP"
 	case packet.Layer(layers.LayerTypeARP) != nil:
@@ -402,6 +416,10 @@ func PacketSummary(packet gopacket.Packet) (string, string) {
 		details = append(details, "eapol:"+strings.ToLower(eapol.Type.String()))
 		keyParts = append(keyParts, "eapol="+eapol.Type.String())
 	}
+	if eth.EthernetType == ethernetTypeMACsec {
+		details = append(details, "ether:0x88e5")
+		keyParts = append(keyParts, "macsec=0x88e5")
+	}
 	if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
 		arp, _ := arpLayer.(*layers.ARP)
 		src := net.IP(arp.SourceProtAddress)
@@ -426,6 +444,8 @@ func shortPacketName(name string) string {
 	switch name {
 	case "EAPOL / 802.1X":
 		return "EAPOL"
+	case "MACsec":
+		return "MACSEC"
 	case "VLAN-tagged traffic":
 		return "VLAN"
 	case "Ethernet data frame":

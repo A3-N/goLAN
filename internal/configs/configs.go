@@ -21,6 +21,22 @@ type Snapshot struct {
 	SavedAt       time.Time       `json:"saved_at"`
 	ActiveAdapter string          `json:"active_adapter"`
 	Profile       profile.Profile `json:"profile"`
+	Settings      *Settings       `json:"settings,omitempty"`
+}
+
+// Settings is persisted TUI/runtime feature state.
+type Settings struct {
+	CanvasEnabled        bool   `json:"canvas_enabled"`
+	CanvasPath           string `json:"canvas_path,omitempty"`
+	EAPOLLogoffDrop      bool   `json:"eapol_logoff_drop"`
+	EAPOLDowngradeMACsec bool   `json:"eapol_downgrade_macsec"`
+}
+
+func DefaultSettings() Settings {
+	return Settings{
+		EAPOLLogoffDrop:      true,
+		EAPOLDowngradeMACsec: true,
+	}
 }
 
 // ConfigDir returns the directory used for golan JSON configs.

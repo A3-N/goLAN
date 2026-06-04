@@ -2,6 +2,7 @@ package listen
 
 import (
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/google/gopacket"
@@ -100,6 +101,19 @@ func TestAnalyzePacketDiscoversVLANAndEAPOL(t *testing.T) {
 	}
 	if !hasEvent(eapolEvents, "eapol", "EAP", "EAPOL / 802.1X") {
 		t.Fatalf("missing EAPOL type observation: %+v", eapolEvents)
+	}
+	if !hasEvent(eapolEvents, "eapol_type", "0", "EAPOL / 802.1X") {
+		t.Fatalf("missing EAPOL numeric type observation: %+v", eapolEvents)
+	}
+
+	macsecPacket := decode(ethernet(src, mac(t, "02:00:00:00:00:56"), 0x88e5, []byte{0, 1, 2, 3, 4}))
+	macsecEvents := AnalyzePacket(macsecPacket, nil)
+	if !hasEvent(macsecEvents, "macsec", "0x88e5", "MACsec") {
+		t.Fatalf("missing MACsec observation: %+v", macsecEvents)
+	}
+	summary, _ := PacketSummary(macsecPacket)
+	if !strings.Contains(summary, "MACSEC") || !strings.Contains(summary, "ether:0x88e5") {
+		t.Fatalf("MACsec summary = %q", summary)
 	}
 }
 

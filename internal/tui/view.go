@@ -12,6 +12,7 @@ import (
 func (m Model) View() string {
 	terminalCols := terminalWidth(m.width)
 	width := renderWidth(terminalCols)
+	margin := horizontalMargin(terminalCols)
 	terminalRows := terminalHeight(m.height)
 	height := renderHeight(terminalRows)
 
@@ -39,12 +40,12 @@ func (m Model) View() string {
 	)
 
 	main := lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
-	return clampBlock(lipgloss.JoinVertical(lipgloss.Left, main, footer), width, height)
+	return insetBlock(clampBlock(lipgloss.JoinVertical(lipgloss.Left, main, footer), width, height), margin)
 }
 
 func (m Model) renderOutput(width, height int) string {
 	available := max(1, height-3)
-	rows := wrapLines(m.output, max(1, width-4))
+	rows := wrapOutputLines(m.output, m.outputMuted, max(1, width-4))
 	maxOffset := max(0, len(rows)-available)
 	offset := clamp(m.outputScroll, 0, maxOffset)
 	end := len(rows) - offset
@@ -55,7 +56,7 @@ func (m Model) renderOutput(width, height int) string {
 	if start < 0 {
 		start = 0
 	}
-	return box(m.cardTitle("output", cardOutput), rows[start:end], width, height, m.activeCard == cardOutput)
+	return box(m.cardTitle("output", cardOutput), styledOutputRows(rows[start:end]), width, height, m.activeCard == cardOutput)
 }
 
 func (m Model) renderCLI(width, height int) string {
@@ -64,12 +65,26 @@ func (m Model) renderCLI(width, height int) string {
 		cursor = "|"
 	}
 	lines := []string{
-		m.prompt() + m.input + cursor,
+		styleCLILine(m.prompt() + m.input + cursor),
 	}
 	if len(m.completions) > 0 {
-		lines = append(lines, strings.Join(limitStrings(m.completions, 8), "  "))
+		lines = append(lines, styleAutocompleteLine(strings.Join(limitStrings(m.completions, 8), "  ")))
 	}
 	return box(m.cardTitle("cli", cardCLI), lines, width, height, m.activeCard == cardCLI)
+}
+
+func styleCLILine(line string) string {
+	if line == "" {
+		return line
+	}
+	return styleText.Render(line)
+}
+
+func styleAutocompleteLine(line string) string {
+	if line == "" {
+		return line
+	}
+	return styleMuted.Render(line)
 }
 
 func (m Model) renderRightTop(width, height int) string {
@@ -103,12 +118,18 @@ func (m Model) renderMisc(width, height int) string {
 		"commands",
 		"show adapters",
 		"show bridge",
+		"show secrets",
 		"set <adapter> <role>",
-		"conf <name>",
+		"conf <name|bridge>",
 		"unset",
 		"load <name>",
-		"start listen|bridge",
-		"stop listen|bridge",
+		"start listen|bridge|nat",
+		"stop listen|bridge|nat",
+		"send eapol start",
+		"enable eapol drop-logoff",
+		"disable eapol drop-logoff",
+		"enable eapol macsec-downgrade",
+		"disable eapol macsec-downgrade",
 		"set ip <value|auto>",
 		"set mac <value|auto>",
 		"set state up|down|auto",
@@ -117,11 +138,13 @@ func (m Model) renderMisc(width, height int) string {
 		"properties",
 	}
 
-	if cfg, ok := m.profile.ByName(m.activeAdapter); ok {
+	if isBridgeContext(m.activeAdapter) {
+		lines = append(lines, m.renderConfigLines(m.profile.BridgeAdapterSnapshot())...)
+	} else if cfg, ok := m.profile.ByName(m.activeAdapter); ok {
 		lines = append(lines, m.renderConfigLines(*cfg)...)
 	} else if len(m.profile.Adapters) > 0 {
 		lines = append(lines, "no active context")
-		lines = append(lines, "run: conf <adapter>")
+		lines = append(lines, "run: conf <adapter|bridge>")
 	} else {
 		lines = append(lines, "none staged")
 	}
@@ -135,6 +158,11 @@ func (m Model) renderMisc(width, height int) string {
 			}
 			lines = append(lines, fmt.Sprintf("%s %s %s", marker, cfg.AdapterRole, cfg.Name))
 		}
+		bridgeMarker := " "
+		if isBridgeContext(m.activeAdapter) {
+			bridgeMarker = "*"
+		}
+		lines = append(lines, fmt.Sprintf("%s bridge bridge", bridgeMarker))
 	}
 
 	available := max(1, height-3)
@@ -175,8 +203,46 @@ func mainAreaHeight(height, footerHeight int) int {
 }
 
 func (m Model) renderFooter(width int) string {
-	footer := fmt.Sprintf("card %s   left/right card   up/down scroll/history   tab autocomplete   enter run   ctrl+s save   ctrl+c quit", m.activeCard.String())
-	return styleMuted.Render(fit(footer, width))
+	footer := spacedFooter(width, []string{
+		"left/right card",
+		"up/down scroll/history",
+		"ctrl+s save",
+		"ctrl+c quit",
+	})
+	return styleMuted.Render(footer)
+}
+
+func spacedFooter(width int, items []string) string {
+	if width <= 0 {
+		return ""
+	}
+	if len(items) == 0 {
+		return strings.Repeat(" ", width)
+	}
+	total := 0
+	for _, item := range items {
+		total += lipgloss.Width(item)
+	}
+	gaps := len(items) - 1
+	if gaps <= 0 || total+gaps > width {
+		return fit(strings.Join(items, "   "), width)
+	}
+
+	spaces := width - total
+	base := spaces / gaps
+	remainder := spaces % gaps
+	var out strings.Builder
+	for i, item := range items {
+		if i > 0 {
+			gap := base
+			if i <= remainder {
+				gap++
+			}
+			out.WriteString(strings.Repeat(" ", gap))
+		}
+		out.WriteString(item)
+	}
+	return fit(out.String(), width)
 }
 
 func (m Model) cardTitle(title string, card cardFocus) string {
@@ -225,6 +291,9 @@ func (m Model) activeStatus() string {
 }
 
 func (m Model) captureStatus() string {
+	if m.natActive {
+		return "nat"
+	}
 	if m.bridge != nil {
 		return "bridge"
 	}
@@ -266,7 +335,7 @@ func box(title string, lines []string, width, height int, active bool) string {
 
 	content := strings.Join(clean, "\n")
 	return lipgloss.NewStyle().
-		Width(innerWidth).
+		Width(width-2).
 		Height(innerHeight).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(borderColor).
@@ -305,6 +374,18 @@ func clampBlock(value string, width, height int) string {
 	}
 	for i, line := range lines {
 		lines[i] = fit(line, width)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func insetBlock(value string, margin int) string {
+	if margin <= 0 || value == "" {
+		return value
+	}
+	prefix := strings.Repeat(" ", margin)
+	lines := strings.Split(value, "\n")
+	for i, line := range lines {
+		lines[i] = prefix + line
 	}
 	return strings.Join(lines, "\n")
 }
@@ -351,6 +432,36 @@ func wrapLines(lines []string, width int) []string {
 	var out []string
 	for _, line := range lines {
 		out = append(out, wrapLine(line, width)...)
+	}
+	return out
+}
+
+type outputRow struct {
+	line  string
+	muted bool
+}
+
+func wrapOutputLines(lines []string, muted []bool, width int) []outputRow {
+	if width <= 0 {
+		return nil
+	}
+	var out []outputRow
+	for i, line := range lines {
+		lineMuted := isCommandLevelOutput(line)
+		if i < len(muted) {
+			lineMuted = muted[i]
+		}
+		for _, wrapped := range wrapLine(line, width) {
+			out = append(out, outputRow{line: wrapped, muted: lineMuted})
+		}
+	}
+	return out
+}
+
+func styledOutputRows(rows []outputRow) []string {
+	out := make([]string, len(rows))
+	for i, row := range rows {
+		out[i] = styleOutputLine(row.line, row.muted)
 	}
 	return out
 }
@@ -444,10 +555,7 @@ func terminalWidth(width int) int {
 }
 
 func renderWidth(width int) int {
-	if width <= 1 {
-		return 1
-	}
-	return width - 1
+	return max(1, width-horizontalMargin(width)*2)
 }
 
 func terminalHeight(height int) int {
@@ -458,10 +566,14 @@ func terminalHeight(height int) int {
 }
 
 func renderHeight(height int) int {
-	if height <= 1 {
-		return 1
+	return max(1, height)
+}
+
+func horizontalMargin(width int) int {
+	if width <= 2 {
+		return 0
 	}
-	return height - 1
+	return 1
 }
 
 func splitWidths(width int) (int, int) {

@@ -78,6 +78,12 @@ type Session struct {
 	macRestore  []adapterMACRestore
 	eapolCancel context.CancelFunc
 	eapolDone   chan struct{}
+	eapolRelay  *eapol.Relay
+	authSession *eapol.AuthSession
+	eapolPolicy EAPOLPolicy
+	targetMAC   net.HardwareAddr
+	nat         *NATState
+	controlMu   sync.Mutex
 	origForward string
 	origIPv6Fwd string
 	inspector   *inspect.Inspector
@@ -94,10 +100,52 @@ type adapterMACRestore struct {
 	MAC  string
 }
 
+// EAPOLPolicy controls transparent 802.1X passthrough behavior.
+type EAPOLPolicy struct {
+	SuppressLogoff  bool
+	DowngradeMACsec bool
+}
+
+// DefaultEAPOLPolicy keeps sessions alive and drops MACsec MKA type 5 by default.
+func DefaultEAPOLPolicy() EAPOLPolicy {
+	return EAPOLPolicy{SuppressLogoff: true, DowngradeMACsec: true}
+}
+
+// NATConfig describes bridge takeover settings. The command is named NAT in
+// the TUI, but this config makes the bridge interface act as the authenticated
+// host rather than configuring pf NAT.
+type NATConfig struct {
+	MAC     string
+	IP      string
+	CIDR    string
+	Gateway string
+	DNS     string
+	DHCP    string
+}
+
+// NATState records the reversible state changed by StartNAT.
+type NATState struct {
+	BridgeName   string
+	MAC          string
+	IP           string
+	CIDR         string
+	DHCP         bool
+	OrigMAC      string
+	Gateway      string
+	RouteAdded   bool
+	StaticIPSet  bool
+	HostDetached bool
+}
+
 // Start begins a transparent macOS bridge run using a kernel bridge for normal
 // Ethernet forwarding and a userspace EAPOL relay for 802.1X frames the kernel
 // bridge does not reliably pass.
 func Start(host, sw Adapter, dir string) (*Session, error) {
+	return StartWithPolicy(host, sw, dir, DefaultEAPOLPolicy())
+}
+
+// StartWithPolicy begins a bridge run with the requested EAPOL policy.
+func StartWithPolicy(host, sw Adapter, dir string, policy EAPOLPolicy) (*Session, error) {
 	if strings.TrimSpace(host.Name) == "" {
 		return nil, fmt.Errorf("host adapter is required")
 	}
@@ -124,15 +172,16 @@ func Start(host, sw Adapter, dir string) (*Session, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	events := make(chan Event, 128)
 	s := &Session{
-		Name:      "kernel-bridge",
-		Host:      host,
-		Switch:    sw,
-		Dir:       dir,
-		Events:    events,
-		cancel:    cancel,
-		done:      make(chan struct{}),
-		events:    events,
-		inspector: inspect.New(),
+		Name:        "kernel-bridge",
+		Host:        host,
+		Switch:      sw,
+		Dir:         dir,
+		Events:      events,
+		cancel:      cancel,
+		done:        make(chan struct{}),
+		events:      events,
+		inspector:   inspect.New(),
+		eapolPolicy: policy,
 	}
 	go s.run(ctx)
 	return s, nil
@@ -175,6 +224,9 @@ func (s *Session) run(ctx context.Context) {
 			case <-time.After(2 * time.Second):
 				s.log("warn: EAPOL passthrough stop timed out")
 			}
+		}
+		if err := s.StopNAT(); err != nil {
+			s.log(fmt.Sprintf("warn: nat cleanup failed: %v", err))
 		}
 		s.destroyBridge()
 		s.restoreSysctls()
@@ -308,6 +360,10 @@ func (s *Session) createBridgeInterface(ctx context.Context) (string, error) {
 }
 
 func (s *Session) activateBridge(ctx context.Context, bridgeName string, targetMAC net.HardwareAddr, firstFrame []byte) error {
+	s.controlMu.Lock()
+	s.targetMAC = append(net.HardwareAddr(nil), targetMAC...)
+	s.controlMu.Unlock()
+
 	if out, err := runCommand(ctx, 5*time.Second, "ifconfig", bridgeName, "ether", targetMAC.String()); err != nil {
 		s.log(fmt.Sprintf("warn: bridge mac set failed: %v (%s)", err, strings.TrimSpace(out)))
 	} else {
@@ -366,25 +422,70 @@ func (s *Session) startEAPOLPassthrough(ctx context.Context, targetMAC net.Hardw
 	s.eapolDone = make(chan struct{})
 
 	session := eapol.NewAuthSession(append(net.HardwareAddr(nil), targetMAC...))
+	s.controlMu.Lock()
+	s.authSession = session
+	s.controlMu.Unlock()
+
 	relay := eapol.NewRelay(s.Host.Name, s.Switch.Name, session, func(message string) {
 		s.log(message)
 	})
+	s.controlMu.Lock()
+	policy := s.eapolPolicy
+	s.controlMu.Unlock()
+
 	relay.SetModeName("transparent EAPOL passthrough")
 	relay.SetInjectStart(false)
-	relay.SetSuppressLogoff(false)
+	relay.SetSuppressLogoff(policy.SuppressLogoff)
 	relay.SetStrictAuthenticator(false)
 	relay.SetStrictVLAN(false)
+	relay.SetDowngrade(policy.DowngradeMACsec)
 	if len(firstFrame) > 0 {
 		relay.SetInitialFrame(firstFrame)
 	}
+	s.controlMu.Lock()
+	s.eapolRelay = relay
+	s.controlMu.Unlock()
 
 	go func() {
 		defer close(s.eapolDone)
+		defer func() {
+			s.controlMu.Lock()
+			if s.eapolRelay == relay {
+				s.eapolRelay = nil
+			}
+			s.controlMu.Unlock()
+		}()
 		s.log(fmt.Sprintf("EAPOL passthrough active: %s <-> %s", s.Host.Name, s.Switch.Name))
 		if err := relay.Start(relayCtx); err != nil && relayCtx.Err() == nil {
 			s.send(Event{Kind: KindError, Err: fmt.Errorf("eapol relay: %w", err)})
 		}
 	}()
+}
+
+// SetEAPOLPolicy updates passthrough behavior for future relay frames.
+func (s *Session) SetEAPOLPolicy(policy EAPOLPolicy) {
+	if s == nil {
+		return
+	}
+	s.controlMu.Lock()
+	s.eapolPolicy = policy
+	relay := s.eapolRelay
+	s.controlMu.Unlock()
+
+	if relay != nil {
+		relay.SetSuppressLogoff(policy.SuppressLogoff)
+		relay.SetDowngrade(policy.DowngradeMACsec)
+	}
+	if policy.SuppressLogoff {
+		s.log("eapol drop-logoff: enable")
+	} else {
+		s.log("eapol drop-logoff: disable")
+	}
+	if policy.DowngradeMACsec {
+		s.log("eapol macsec-downgrade: enable")
+	} else {
+		s.log("eapol macsec-downgrade: disable")
+	}
 }
 
 func (s *Session) spoofSwitchAdapterMAC(ctx context.Context, targetMAC net.HardwareAddr, phase string) bool {

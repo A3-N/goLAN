@@ -7,8 +7,8 @@ import (
 	"github.com/google/gopacket/layers"
 )
 
-// Downgrader selectively drops EAPOL-Key frames that carry MACsec Key Agreement
-// (MKA) data. By stripping these frames, the authenticator may fall back to
+// Downgrader selectively drops EAPOL-MKA frames that carry MACsec Key Agreement
+// data. By stripping these frames, the authenticator may fall back to
 // standard (unencrypted) 802.1X, allowing transparent bridging.
 //
 // This only works on switches that don't hard-require MACsec. If the switch

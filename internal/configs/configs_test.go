@@ -15,6 +15,12 @@ func TestSaveListLoad(t *testing.T) {
 		Profile: profile.Profile{
 			Adapters: []profile.AdapterConfig{{AdapterRole: profile.AdapterRoleHost, Name: "en11", IP: "auto"}},
 		},
+		Settings: &Settings{
+			CanvasEnabled:        true,
+			CanvasPath:           "/tmp/lab.canvas",
+			EAPOLLogoffDrop:      false,
+			EAPOLDowngradeMACsec: true,
+		},
 	})
 	if err != nil {
 		t.Fatalf("Save: %v", err)
@@ -40,6 +46,9 @@ func TestSaveListLoad(t *testing.T) {
 	}
 	if len(snapshot.Profile.Adapters) != 1 {
 		t.Fatalf("Adapters = %+v", snapshot.Profile.Adapters)
+	}
+	if snapshot.Settings == nil || !snapshot.Settings.CanvasEnabled || snapshot.Settings.CanvasPath != "/tmp/lab.canvas" || snapshot.Settings.EAPOLLogoffDrop || !snapshot.Settings.EAPOLDowngradeMACsec {
+		t.Fatalf("Settings = %+v", snapshot.Settings)
 	}
 }
 

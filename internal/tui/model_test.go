@@ -157,12 +157,17 @@ func TestUnsetDeselectsActiveAdapter(t *testing.T) {
 }
 
 func TestSaveAndLoadConfig(t *testing.T) {
-	t.Setenv("GOLAN_CONFIG_DIR", t.TempDir())
+	dir := t.TempDir()
+	t.Setenv("GOLAN_CONFIG_DIR", dir)
 	m := NewModel()
 	m.adapters = []adapters.Adapter{{Name: "en11"}}
 	m.executeCommand("set en11 host")
 	m.executeCommand("conf en11")
 	m.executeCommand("set ip 192.0.2.10")
+	m.canvasEnabled = true
+	m.canvasPath = dir + "/lab.canvas"
+	m.eapolSuppressLogoff = false
+	m.eapolDowngradeMACsec = true
 	m.saveConfig("lab")
 
 	loaded := NewModel()
@@ -177,6 +182,9 @@ func TestSaveAndLoadConfig(t *testing.T) {
 	cfg, ok := loaded.profile.ByName("en11")
 	if !ok || cfg.IP != "192.0.2.10" {
 		t.Fatalf("loaded config = %+v ok=%v", cfg, ok)
+	}
+	if !loaded.canvasEnabled || loaded.canvasPath != dir+"/lab.canvas" || loaded.eapolSuppressLogoff || !loaded.eapolDowngradeMACsec {
+		t.Fatalf("loaded settings canvas=%v path=%q logoff=%v downgrade=%v", loaded.canvasEnabled, loaded.canvasPath, loaded.eapolSuppressLogoff, loaded.eapolDowngradeMACsec)
 	}
 }
 
@@ -217,6 +225,86 @@ func TestStopCommandAutocomplete(t *testing.T) {
 	m.refreshCompletions()
 	if !containsString(m.completions, "listen") || !containsString(m.completions, "bridge") {
 		t.Fatalf("stop completions = %v", m.completions)
+	}
+}
+
+func TestEAPOLToggleCommands(t *testing.T) {
+	m := NewModel()
+	if !m.eapolSuppressLogoff || !m.eapolDowngradeMACsec {
+		t.Fatalf("defaults = logoff:%v downgrade:%v", m.eapolSuppressLogoff, m.eapolDowngradeMACsec)
+	}
+
+	m.executeCommand("disable eapol drop-logoff")
+	if m.eapolSuppressLogoff {
+		t.Fatal("expected logoff drop disabled")
+	}
+	if !containsOutput(m.output, "eapol drop-logoff: disable") {
+		t.Fatalf("output = %v", m.output)
+	}
+
+	m.executeCommand("disable eapol macsec-downgrade")
+	if m.eapolDowngradeMACsec {
+		t.Fatal("expected downgrade disabled")
+	}
+	if !containsOutput(m.output, "eapol macsec-downgrade: disable") {
+		t.Fatalf("output = %v", m.output)
+	}
+	m.executeCommand("enable eapol macsec-downgrade")
+	if !m.eapolDowngradeMACsec {
+		t.Fatal("expected downgrade enabled")
+	}
+}
+
+func TestEAPOLToggleAliasesAreRejected(t *testing.T) {
+	for _, command := range []string{
+		"disable eapol logoff",
+		"disable macsec",
+		"disable eapol downgrade",
+		"disable eapol downgarde",
+	} {
+		m := NewModel()
+		m.executeCommand(command)
+		if !m.eapolSuppressLogoff || !m.eapolDowngradeMACsec {
+			t.Fatalf("%q changed toggles: logoff=%v downgrade=%v", command, m.eapolSuppressLogoff, m.eapolDowngradeMACsec)
+		}
+		if !containsOutput(m.output, "use: disable eapol drop-logoff|eapol macsec-downgrade") &&
+			!containsOutput(m.output, "use: disable canvas|eapol drop-logoff|eapol macsec-downgrade") {
+			t.Fatalf("%q did not print strict usage: %v", command, m.output)
+		}
+	}
+}
+
+func TestShowConfigPrintsSettings(t *testing.T) {
+	m := NewModel()
+	m.canvasEnabled = true
+	m.canvasPath = "/tmp/lab.canvas"
+	m.eapolSuppressLogoff = false
+	m.eapolDowngradeMACsec = true
+
+	m.executeCommand("show config")
+	for _, want := range []string{
+		"settings:",
+		"canvas: on",
+		"canvas path: /tmp/lab.canvas",
+		"eapol drop-logoff: disable",
+		"eapol macsec-downgrade: enable",
+	} {
+		if !containsOutput(m.output, want) {
+			t.Fatalf("show config missing %q: %v", want, m.output)
+		}
+	}
+}
+
+func TestConfBridgeSetsBridgeConfigContext(t *testing.T) {
+	m := NewModel()
+	m.executeCommand("conf bridge")
+	m.executeCommand("set ip 192.0.2.145")
+	m.executeCommand("set cidr 24")
+	m.executeCommand("set gateway 192.0.2.1")
+
+	cfg := m.profile.BridgeAdapterSnapshot()
+	if m.activeAdapter != "bridge" || cfg.IP != "192.0.2.145" || cfg.CIDR != "24" || cfg.Gateway != "192.0.2.1" {
+		t.Fatalf("active=%q bridge cfg=%+v", m.activeAdapter, cfg)
 	}
 }
 
@@ -386,6 +474,22 @@ func TestFindingEventsUseBoundedFindingsPane(t *testing.T) {
 	}
 }
 
+func TestShowSecretsPrintsFindingsToOutput(t *testing.T) {
+	m := NewModel()
+	m.executeCommand("show secrets")
+	if !containsOutput(m.output, "secrets: none") {
+		t.Fatalf("empty secrets output = %v", m.output)
+	}
+
+	m.output = nil
+	m.outputMuted = nil
+	m.addFinding("HTTP Basic user=alice secret=secret")
+	m.executeCommand("show secrets")
+	if !containsOutput(m.output, "secrets:") || !containsOutput(m.output, "HTTP Basic user=alice secret=secret") {
+		t.Fatalf("secrets output = %v", m.output)
+	}
+}
+
 func TestFindingEventFeedsCanvasSecretContext(t *testing.T) {
 	m := NewModel()
 	finding := inspect.Finding{
@@ -497,6 +601,104 @@ func TestDiscoveryOnlyPrintsFoundAndEAPOLSignals(t *testing.T) {
 	}
 }
 
+func TestEAPOLDiscoverySignalsIncludeMACsec(t *testing.T) {
+	m := NewModel()
+	m.applyDiscovery(listen.Event{
+		Kind:     "discovery",
+		Adapter:  "en12",
+		Role:     profile.AdapterRoleSwitch,
+		Field:    "macsec",
+		Value:    "0x88e5",
+		Evidence: "ether type",
+		Packet:   "MACsec",
+	})
+
+	if !containsOutput(m.output, "MACsec 0x88e5 detected") {
+		t.Fatalf("MACsec signal missing: %v", m.output)
+	}
+
+	m.applyDiscovery(listen.Event{
+		Kind:     "discovery",
+		Adapter:  "en12",
+		Role:     profile.AdapterRoleSwitch,
+		Field:    "eapol_type",
+		Value:    "5",
+		Evidence: "type number",
+		Packet:   "EAPOL / 802.1X",
+	})
+	if !containsOutput(m.output, "MACsec MKA detected") {
+		t.Fatalf("MKA signal missing: %v", m.output)
+	}
+}
+
+func TestEAPOLLogSignalsAreDistinct(t *testing.T) {
+	cases := []struct {
+		message string
+		key     string
+		label   string
+	}{
+		{"[RELAY] device->switch: EAPOL-Start from 02:00:00:00:00:01", "eapol-start", "EAPOL start"},
+		{"[EAPOL] drop-logoff enabled: EAPOL-Logoff frames will be dropped.", "eapol-drop-logoff-enable", "EAPOL drop-logoff enable"},
+		{"[!][RELAY] device->switch: EAPOL-Logoff received from 02:00:00:00:00:01", "eapol-logoff-dropped", "EAPOL-Logoff dropped"},
+		{"[RELAY] switch->device: EAP-Request Type=Identity ID=7 from 02:00:00:00:00:02", "eap-request-identity", "EAP request Identity ID=7"},
+		{"[RELAY] device->switch: EAP-Response Type=Identity ID=8 Identity=test from 02:00:00:00:00:01", "eap-response-identity-test", "EAP response identity: test ID=8"},
+		{"[+][802.1X] EAP-Success received (ID=7) port AUTHORIZED", "eap-success", "EAPOL success ID=7"},
+		{"[!][802.1X] EAP-Failure received (ID=8) - authentication REJECTED", "eap-failure", "EAPOL failure ID=8"},
+		{"[!][MACSEC] device->switch: MACsec (EAPOL Type 5) discovered. DROPPING PACKET to force downgrade", "macsec-drop", "MACsec drop"},
+		{"[MACSEC] macsec-downgrade enabled: EAPOL-MKA type 5 frames will be dropped.", "eapol-macsec-downgrade-enable", "EAPOL macsec-downgrade enable"},
+	}
+	for _, tc := range cases {
+		key, label, ok := eapolLogSignal(tc.message)
+		if !ok || key != tc.key || label != tc.label {
+			t.Fatalf("eapolLogSignal(%q) = %q, %q, %v; want %q, %q, true", tc.message, key, label, ok, tc.key, tc.label)
+		}
+	}
+}
+
+func TestEAPOLLogSignalsAreAlwaysPrinted(t *testing.T) {
+	m := NewModel()
+	message := "[+][802.1X] EAP-Success received (ID=7) port AUTHORIZED"
+	m.printEAPOLLogSignal(message)
+	m.printEAPOLLogSignal(message)
+	if len(m.output) != 2 {
+		t.Fatalf("output entries = %d: %v", len(m.output), m.output)
+	}
+	for i, line := range m.output {
+		if line != "EAPOL success ID=7" {
+			t.Fatalf("line %d = %q", i, line)
+		}
+		if m.outputMuted[i] {
+			t.Fatalf("line %d was muted: %v", i, m.outputMuted)
+		}
+	}
+}
+
+func TestEAPOLSetupLogsAreNotPrintedAsTraffic(t *testing.T) {
+	m := NewModel()
+	for _, message := range []string{
+		"warn: native EAPOL suppression degraded: ifconfig: bad value)",
+		"EAPOL passthrough active: en11 <-> en12",
+		"802.1X EAPOL passthrough relay active",
+		"           DROPPING PACKET to keep session alive",
+	} {
+		m.printEAPOLLogSignal(message)
+	}
+	if len(m.output) != 0 {
+		t.Fatalf("setup logs were printed as traffic: %v", m.output)
+	}
+}
+
+func TestEAPOLKeyAndMalformedEAPFramesAreLogged(t *testing.T) {
+	m := NewModel()
+	m.printEAPOLLogSignal("[RELAY] device->switch: EAPOL-Key frame from 02:00:00:00:00:01 - forwarding")
+	m.printEAPOLLogSignal("[RELAY] switch->device: EAPOL-EAP frame (no EAP layer parsed) from 02:00:00:00:00:02")
+	for _, want := range []string{"EAPOL key forwarded", "EAPOL-EAP frame"} {
+		if !containsOutput(m.output, want) {
+			t.Fatalf("missing %q: %v", want, m.output)
+		}
+	}
+}
+
 func TestBridgeStartRequiresHostAndSwitch(t *testing.T) {
 	m := NewModel()
 	cmd := m.executeCommand("start bridge")
@@ -576,6 +778,34 @@ func TestBridgeStartRefusesActiveListen(t *testing.T) {
 	}
 }
 
+func TestStartNATRequiresActiveBridge(t *testing.T) {
+	m := NewModel()
+	if cmd := m.executeCommand("start nat"); cmd != nil {
+		t.Fatal("expected no command without active bridge")
+	}
+	if !containsOutput(m.output, "nat err: bridge") {
+		t.Fatalf("output = %v", m.output)
+	}
+
+	m.bridge = &bridge.Session{}
+	if cmd := m.executeCommand("start nat"); cmd == nil {
+		t.Fatal("expected nat command with active bridge")
+	}
+}
+
+func TestStopBridgeRefusesActiveNAT(t *testing.T) {
+	m := NewModel()
+	m.bridge = &bridge.Session{}
+	m.natActive = true
+
+	if cmd := m.executeCommand("stop bridge"); cmd != nil {
+		t.Fatal("expected no bridge stop command while nat active")
+	}
+	if !containsOutput(m.output, "bridge err: nat; use: stop nat") {
+		t.Fatalf("output = %v", m.output)
+	}
+}
+
 func TestListenStartRefusesActiveBridge(t *testing.T) {
 	m := NewModel()
 	m.bridge = &bridge.Session{}
@@ -588,24 +818,43 @@ func TestListenStartRefusesActiveBridge(t *testing.T) {
 	}
 }
 
+func TestListenStartRefusesActiveNAT(t *testing.T) {
+	m := NewModel()
+	m.bridge = &bridge.Session{}
+	m.natActive = true
+
+	if cmd := m.executeCommand("start listen"); cmd != nil {
+		t.Fatal("expected no listen command while nat active")
+	}
+	if !containsOutput(m.output, "listen err: nat") {
+		t.Fatalf("output = %v", m.output)
+	}
+}
+
 func TestCtrlCStopsActiveCapture(t *testing.T) {
 	m := NewModel()
-	m.listener = &listen.Session{}
+	m.listener = &listen.Session{Dir: "/tmp/golan-pcaps/listen"}
 	m.capMode = "bridge"
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
 	got := next.(Model)
 	if got.listener != nil || got.capMode != "" {
 		t.Fatalf("capture state = listener:%v mode:%q", got.listener, got.capMode)
 	}
+	if dirs := PcapDirs(got); len(dirs) != 1 || dirs[0] != "/tmp/golan-pcaps/listen" {
+		t.Fatalf("pcap dirs = %v", dirs)
+	}
 }
 
 func TestCtrlCStopsActiveBridge(t *testing.T) {
 	m := NewModel()
-	m.bridge = &bridge.Session{}
+	m.bridge = &bridge.Session{Dir: "/tmp/golan-pcaps/bridge"}
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
 	got := next.(Model)
 	if got.bridge != nil || got.bridgeState != "" {
 		t.Fatalf("bridge state = bridge:%v state:%q", got.bridge, got.bridgeState)
+	}
+	if dirs := PcapDirs(got); len(dirs) != 1 || dirs[0] != "/tmp/golan-pcaps/bridge" {
+		t.Fatalf("pcap dirs = %v", dirs)
 	}
 }
 
@@ -614,6 +863,18 @@ func TestShutdownStopsReturnedBridgeModel(t *testing.T) {
 	m.bridge = &bridge.Session{}
 	if err := Shutdown(m); err != nil {
 		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+func TestPcapDirsDedupSessionAndFilePaths(t *testing.T) {
+	m := NewModel()
+	m.rememberPcapDir("/tmp/golan-pcaps/run")
+	m.rememberPcapPath("/tmp/golan-pcaps/run/host-en11.pcap")
+	m.rememberPcapDir("/tmp/golan-pcaps/other")
+
+	dirs := PcapDirs(m)
+	if len(dirs) != 2 || dirs[0] != "/tmp/golan-pcaps/run" || dirs[1] != "/tmp/golan-pcaps/other" {
+		t.Fatalf("pcap dirs = %v", dirs)
 	}
 }
 
@@ -719,14 +980,66 @@ func TestViewUsesContextPromptAndRealBorders(t *testing.T) {
 	if !strings.Contains(view, "traffic") {
 		t.Fatalf("traffic pane missing:\n%s", view)
 	}
-	if !strings.Contains(view, "tab autocomplete") {
-		t.Fatalf("footer hints missing:\n%s", view)
+	for _, want := range []string{"left/right card", "up/down scroll/history", "ctrl+s save", "ctrl+c quit"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("footer hint %q missing:\n%s", want, view)
+		}
+	}
+	for _, removed := range []string{"card cli", "tab autocomplete", "enter run"} {
+		if strings.Contains(view, removed) {
+			t.Fatalf("removed footer hint %q still present:\n%s", removed, view)
+		}
 	}
 	if got := lipgloss.Height(view); got > m.height {
 		t.Fatalf("view height = %d, terminal height = %d\n%s", got, m.height, view)
 	}
 	assertViewWidth(t, view, m.width)
-	assertViewHeightBelow(t, view, m.height)
+	assertViewHorizontalInset(t, view, m.width)
+	assertViewHeightWithin(t, view, m.height)
+}
+
+func TestAutocompleteLineUsesMutedStyle(t *testing.T) {
+	line := "auto  192.0.2.10"
+	styled := styleAutocompleteLine(line)
+	if styled != styleMuted.Render(line) {
+		t.Fatalf("autocomplete style = %q, want muted %q", styled, styleMuted.Render(line))
+	}
+	if got := lipgloss.Width(styled); got != lipgloss.Width(line) {
+		t.Fatalf("styled width = %d, want %d", got, lipgloss.Width(line))
+	}
+}
+
+func TestCLIInputDoesNotProtocolColorEAPOL(t *testing.T) {
+	line := "> enable eapol drop-logoff|"
+	styled := styleCLILine(line)
+	if styled != styleText.Render(line) {
+		t.Fatalf("cli style = %q, want normal text %q", styled, styleText.Render(line))
+	}
+	if got := styleTypedLine(styled); got != styled {
+		t.Fatalf("cli line was re-tokenized: %q -> %q", styled, got)
+	}
+}
+
+func TestEAPOLTrafficTokenColors(t *testing.T) {
+	cases := []struct {
+		line  string
+		token string
+		style lipgloss.Style
+	}{
+		{"EAPOL-Logoff dropped", "EAPOL-Logoff", styleWarn},
+		{"EAPOL drop-logoff enable", "drop-logoff", styleWarn},
+		{"EAPOL macsec-downgrade enable", "macsec-downgrade", styleWarn},
+		{"EAPOL start", "start", styleSuccess},
+		{"EAPOL success", "success", styleSuccess},
+		{"EAPOL failure", "failure", styleError},
+		{"EAP request Identity", "request", styleProtocol},
+	}
+	for _, tc := range cases {
+		styled := styleTypedLine(tc.line)
+		if !strings.Contains(styled, tc.style.Render(tc.token)) {
+			t.Fatalf("styled %q = %q; missing styled token %q", tc.line, styled, tc.token)
+		}
+	}
 }
 
 func TestTrafficCannotExpandRenderedView(t *testing.T) {
@@ -738,7 +1051,8 @@ func TestTrafficCannotExpandRenderedView(t *testing.T) {
 	view := m.View()
 	assertViewWidth(t, view, m.width)
 	assertNoFullWidthLines(t, view, m.width)
-	assertViewHeightBelow(t, view, m.height)
+	assertViewHorizontalInset(t, view, m.width)
+	assertViewHeightWithin(t, view, m.height)
 	if !strings.Contains(view, "traffic") {
 		t.Fatalf("traffic pane missing:\n%s", view)
 	}
@@ -810,9 +1124,61 @@ func TestOutputWrapsBeforeClipping(t *testing.T) {
 		t.Fatalf("view height = %d, terminal height = %d\n%s", got, m.height, view)
 	}
 	assertViewWidth(t, view, m.width)
-	assertViewHeightBelow(t, view, m.height)
+	assertViewHorizontalInset(t, view, m.width)
+	assertViewHeightWithin(t, view, m.height)
 	if strings.Contains(view, "…") {
 		t.Fatalf("output was truncated instead of wrapped:\n%s", view)
+	}
+}
+
+func TestCommandLevelOutputClassification(t *testing.T) {
+	muted := []string{
+		"> start nat",
+		"bridge: start",
+		"bridge state: active",
+		"nat err: bridge",
+		"pcap switch/en12: /tmp/switch.pcap",
+		"expected: host adapter",
+	}
+	for _, line := range muted {
+		if !isCommandLevelOutput(line) {
+			t.Fatalf("expected muted command output for %q", line)
+		}
+	}
+
+	plain := []string{
+		"host/en11 IP=192.0.2.10 MAC=a0:ad:9f:1c:3c:a5",
+		"  en11 ethernet up 1500 a0:ad:9f:1c:3c:a5 192.0.2.10",
+		"ARP arp_who_has=192.0.2.1 arp_tell=192.0.2.10",
+	}
+	for _, line := range plain {
+		if isCommandLevelOutput(line) {
+			t.Fatalf("expected plain output for %q", line)
+		}
+	}
+}
+
+func TestCommandOutputWrapKeepsContinuationRowsMuted(t *testing.T) {
+	line := "nat err: " + strings.Repeat("ifconfig bridge1 rule bad value ", 4)
+	rows := wrapOutputLines([]string{line}, []bool{isCommandLevelOutput(line)}, 28)
+	if len(rows) < 2 {
+		t.Fatalf("expected wrapped command output, got %v", rows)
+	}
+	for i, row := range rows {
+		if !row.muted {
+			t.Fatalf("row %d was not muted: %v", i, rows)
+		}
+	}
+}
+
+func TestMutedCommandOutputHighlightsErrToken(t *testing.T) {
+	line := "nat err: bridge"
+	styled := styleOutputLine(line, true)
+	if !strings.Contains(styled, "err:") {
+		t.Fatalf("styled output lost err token: %q", styled)
+	}
+	if got := lipgloss.Width(styled); got != lipgloss.Width(line) {
+		t.Fatalf("styled width = %d, want %d: %q", got, lipgloss.Width(line), styled)
 	}
 }
 
@@ -852,10 +1218,40 @@ func assertNoFullWidthLines(t *testing.T, view string, width int) {
 	}
 }
 
-func assertViewHeightBelow(t *testing.T, view string, height int) {
+func assertViewHorizontalInset(t *testing.T, view string, width int) {
 	t.Helper()
-	if got := lipgloss.Height(view); got >= height {
-		t.Fatalf("view height = %d; expected below terminal height %d to avoid vertical scroll:\n%s", got, height, view)
+	margin := horizontalMargin(terminalWidth(width))
+	if margin <= 0 {
+		return
+	}
+	prefix := strings.Repeat(" ", margin)
+	for i, line := range strings.Split(view, "\n") {
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, prefix) {
+			t.Fatalf("line %d missing left inset %q:\n%s", i, prefix, view)
+		}
+		if got := lipgloss.Width(line); got > terminalWidth(width)-margin {
+			t.Fatalf("line %d width = %d; expected right inset of at least %d in terminal width %d:\n%s", i, got, margin, terminalWidth(width), view)
+		}
+		if containsBorderRune(line) {
+			wantRightEdge := terminalWidth(width) - margin
+			if got := lipgloss.Width(strings.TrimRight(line, " ")); got != wantRightEdge {
+				t.Fatalf("line %d visible right edge = %d, want %d:\n%s", i, got, wantRightEdge, view)
+			}
+		}
+	}
+}
+
+func containsBorderRune(line string) bool {
+	return strings.ContainsAny(line, "╭╮╰╯│")
+}
+
+func assertViewHeightWithin(t *testing.T, view string, height int) {
+	t.Helper()
+	if got := lipgloss.Height(view); got > height {
+		t.Fatalf("view height = %d; terminal height = %d:\n%s", got, height, view)
 	}
 }
 
