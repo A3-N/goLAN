@@ -10,37 +10,96 @@ import (
 )
 
 var (
-	colorText   = lipgloss.Color("#d7dce2")
-	colorMuted  = lipgloss.Color("#7d8793")
-	colorAccent = lipgloss.Color("#62d2a2")
-	colorInfo   = lipgloss.Color("#8ec8ff")
-	colorWarn   = lipgloss.Color("#e5b95c")
-	colorError  = lipgloss.Color("#ef6f6c")
-	colorErrDim = lipgloss.Color("#c98282")
-	colorPanel  = lipgloss.Color("#3a4450")
-	colorSecret = lipgloss.Color("#ff8bd1")
-	colorIP     = colorInfo
-	colorMAC    = lipgloss.Color("#e5b95c")
-	colorUser   = lipgloss.Color("#bda8ff")
+	colorCanvas    = lipgloss.Color("#0b1018")
+	colorChrome    = lipgloss.Color("#111827")
+	colorSurface   = lipgloss.Color("#172131")
+	colorRaised    = lipgloss.Color("#202d40")
+	colorSelection = lipgloss.Color("#293a52")
+	colorBrand     = lipgloss.Color("#8b7cf6")
+	colorOnBrand   = lipgloss.Color("#090c13")
+	colorText      = lipgloss.Color("#dce5f2")
+	colorMuted     = lipgloss.Color("#8190a5")
+	colorAccent    = lipgloss.Color("#4fd1c5")
+	colorInfo      = lipgloss.Color("#78a9ff")
+	colorWarn      = lipgloss.Color("#d9ae62")
+	colorError     = lipgloss.Color("#ff7185")
+	colorErrDim    = lipgloss.Color("#c67b89")
+	colorPanel     = lipgloss.Color("#46566d")
+	colorSecret    = lipgloss.Color("#dc8cff")
+	colorIP        = colorInfo
+	colorMAC       = lipgloss.Color("#dfb96f")
+	colorUser      = lipgloss.Color("#aea2ff")
 
-	styleTitle    = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
-	styleMuted    = lipgloss.NewStyle().Foreground(colorMuted)
-	styleKey      = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
-	styleWarn     = lipgloss.NewStyle().Foreground(colorWarn)
-	styleError    = lipgloss.NewStyle().Foreground(colorError).Bold(true)
-	styleErrDim   = lipgloss.NewStyle().Foreground(colorErrDim)
-	styleText     = lipgloss.NewStyle().Foreground(colorText)
-	styleValue    = lipgloss.NewStyle().Foreground(colorText).Bold(true)
-	styleHeader   = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
-	stylePanel    = lipgloss.NewStyle().Foreground(colorPanel)
-	styleProtocol = lipgloss.NewStyle().Foreground(colorInfo).Bold(true)
-	styleSuccess  = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
-	styleSecret   = lipgloss.NewStyle().Foreground(colorSecret).Bold(true)
-	styleIP       = lipgloss.NewStyle().Foreground(colorIP).Bold(true)
-	styleMAC      = lipgloss.NewStyle().Foreground(colorMAC)
-	styleUser     = lipgloss.NewStyle().Foreground(colorUser).Bold(true)
-	styleField    = lipgloss.NewStyle().Foreground(colorMuted)
+	styleCanvas          = lipgloss.NewStyle().Background(colorCanvas)
+	styleMuted           = lipgloss.NewStyle().Foreground(colorMuted).Background(colorCanvas)
+	styleKey             = lipgloss.NewStyle().Foreground(colorAccent).Background(colorCanvas).Bold(true)
+	styleWarn            = lipgloss.NewStyle().Foreground(colorWarn).Background(colorCanvas)
+	styleError           = lipgloss.NewStyle().Foreground(colorError).Background(colorCanvas).Bold(true)
+	styleErrDim          = lipgloss.NewStyle().Foreground(colorErrDim).Background(colorCanvas)
+	styleText            = lipgloss.NewStyle().Foreground(colorText).Background(colorCanvas)
+	styleValue           = lipgloss.NewStyle().Foreground(colorText).Background(colorCanvas).Bold(true)
+	styleHeader          = lipgloss.NewStyle().Foreground(colorAccent).Background(colorCanvas).Bold(true)
+	styleProtocol        = lipgloss.NewStyle().Foreground(colorInfo).Background(colorCanvas).Bold(true)
+	styleSuccess         = lipgloss.NewStyle().Foreground(colorAccent).Background(colorCanvas).Bold(true)
+	styleSecret          = lipgloss.NewStyle().Foreground(colorSecret).Background(colorCanvas).Bold(true)
+	styleIP              = lipgloss.NewStyle().Foreground(colorIP).Background(colorCanvas).Bold(true)
+	styleMAC             = lipgloss.NewStyle().Foreground(colorMAC).Background(colorCanvas)
+	styleUser            = lipgloss.NewStyle().Foreground(colorUser).Background(colorCanvas).Bold(true)
+	styleField           = lipgloss.NewStyle().Foreground(colorMuted).Background(colorCanvas)
+	styleFocus           = lipgloss.NewStyle().Foreground(colorCanvas).Background(colorAccent).Bold(true)
+	styleTab             = lipgloss.NewStyle().Foreground(colorMuted).Background(colorChrome)
+	styleShortcut        = lipgloss.NewStyle().Foreground(colorAccent).Background(colorCanvas).Bold(true)
+	styleCommand         = lipgloss.NewStyle().Foreground(colorInfo).Background(colorCanvas).Bold(true)
+	styleContext         = lipgloss.NewStyle().Foreground(colorWarn).Background(colorCanvas)
+	styleContextSelected = lipgloss.NewStyle().Foreground(colorWarn).Background(colorSelection).Bold(true)
+	styleButton          = lipgloss.NewStyle().Foreground(colorText).Background(colorRaised).Bold(true)
+	styleButtonActive    = lipgloss.NewStyle().Foreground(colorCanvas).Background(colorAccent).Bold(true)
+	styleButtonPrimary   = lipgloss.NewStyle().Foreground(colorOnBrand).Background(colorBrand).Bold(true)
+	styleButtonDanger    = lipgloss.NewStyle().Foreground(colorError).Background(colorRaised).Bold(true)
+	styleButtonDisabled  = lipgloss.NewStyle().Foreground(colorMuted).Background(colorChrome)
+
+	styleTopBar           = lipgloss.NewStyle().Foreground(colorText).Background(colorChrome)
+	styleBrand            = lipgloss.NewStyle().Foreground(colorOnBrand).Background(colorBrand).Bold(true)
+	styleProduct          = lipgloss.NewStyle().Foreground(colorText).Background(colorChrome).Bold(true)
+	styleStatusLabel      = lipgloss.NewStyle().Foreground(colorMuted).Background(colorChrome)
+	styleStatusValue      = lipgloss.NewStyle().Foreground(colorText).Background(colorChrome).Bold(true)
+	styleStatusOnline     = lipgloss.NewStyle().Foreground(colorAccent).Background(colorChrome).Bold(true)
+	styleTabBar           = lipgloss.NewStyle().Foreground(colorMuted).Background(colorChrome)
+	styleTabActive        = lipgloss.NewStyle().Foreground(colorAccent).Background(colorSurface).Bold(true).Underline(true)
+	stylePaneHeader       = lipgloss.NewStyle().Foreground(colorMuted).Background(colorSurface).Bold(true)
+	stylePaneHeaderActive = lipgloss.NewStyle().Foreground(colorText).Background(colorRaised).Bold(true)
+	stylePaneBody         = lipgloss.NewStyle().Foreground(colorText).Background(colorCanvas)
+	styleCLIInput         = lipgloss.NewStyle().Foreground(colorText).Background(colorSurface)
+	styleAutocomplete     = lipgloss.NewStyle().Foreground(colorMuted).Background(colorSurface)
+	styleSelectedRow      = lipgloss.NewStyle().Foreground(colorText).Background(colorSelection).Bold(true)
+	stylePaneRule         = lipgloss.NewStyle().Foreground(colorPanel).Background(colorCanvas)
+	stylePaneRuleActive   = lipgloss.NewStyle().Foreground(colorAccent).Background(colorCanvas)
+	styleFooterBar        = lipgloss.NewStyle().Foreground(colorMuted).Background(colorChrome)
 )
+
+const ansiFullReset = "\x1b[0m"
+
+// renderStyleLayer keeps a row's base style active across nested Lip Gloss
+// fragments. Each nested fragment emits a full SGR reset, which otherwise
+// cancels the outer background for every cell that follows it.
+func renderStyleLayer(style lipgloss.Style, value string) string {
+	prefix, suffix, ok := styleEnvelope(style)
+	if !ok || prefix == "" {
+		return style.Render(value)
+	}
+	value = strings.ReplaceAll(value, ansiFullReset, ansiFullReset+prefix)
+	return prefix + value + suffix
+}
+
+func styleEnvelope(style lipgloss.Style) (string, string, bool) {
+	const marker = "\ue000"
+	rendered := style.Render(marker)
+	index := strings.Index(rendered, marker)
+	if index < 0 {
+		return "", "", false
+	}
+	return rendered[:index], rendered[index+len(marker):], true
+}
 
 var (
 	ipv4TokenPattern     = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b`)
@@ -110,6 +169,12 @@ func isCommandLevelOutput(line string) bool {
 	if line == "" || strings.Contains(line, "\x1b[") {
 		return false
 	}
+	// Doctor rows own their status styling. Classifying a FAIL detail such as
+	// "probe failed" as a muted command log would paint over the red badge
+	// before paneLine can apply typed status colors.
+	if isDoctorStatusOutput(line) {
+		return false
+	}
 	lower := strings.ToLower(line)
 	if strings.HasPrefix(lower, ">") {
 		return true
@@ -128,6 +193,16 @@ func isCommandLevelOutput(line string) bool {
 	switch first {
 	case "adapter", "adapters", "bridge", "canvas", "configs", "ctx", "eapol", "err", "error", "expected", "listen", "load", "loaded", "macsec", "nat", "pcap", "refresh", "role", "save", "saved", "send", "set", "staged", "unknown", "use":
 		return true
+	}
+	return false
+}
+
+func isDoctorStatusOutput(line string) bool {
+	line = strings.TrimSpace(line)
+	for _, status := range []string{"PASS", "WARN", "FAIL", "SKIP"} {
+		if strings.HasPrefix(line, "["+status+"] ") {
+			return true
+		}
 	}
 	return false
 }
@@ -157,14 +232,16 @@ func styleTypedToken(token string) string {
 	}
 	upper := strings.ToUpper(strings.Trim(token, ":,;()[]"))
 	switch upper {
-	case "HTTP", "NTLM", "KERBEROS", "SMTP", "FTP", "POP3", "IMAP", "IRC", "LDAP", "SNMP", "MSSQL", "CARD", "EAPOL", "EAP", "EAPOL-MKA", "REQUEST", "RESPONSE", "IDENTITY", "MKA", "DETECTED", "DROP", "DROPPED", "DROPPING", "DOWNGRADE", "FORWARDED", "FORWARDING", "ENABLE", "DISABLE", "ENABLED", "DISABLED", "PASS", "TYPE", "ARP", "IPV4", "IPV6", "VLAN", "ETH", "DHCP", "TCP", "UDP", "ICMPV4", "ICMPV6":
+	case "HTTP", "NTLM", "KERBEROS", "SMTP", "FTP", "POP3", "IMAP", "IRC", "LDAP", "SNMP", "MSSQL", "CARD", "EAPOL", "EAP", "EAPOL-MKA", "REQUEST", "RESPONSE", "IDENTITY", "MKA", "DETECTED", "DROP", "DROPPED", "DROPPING", "DOWNGRADE", "FORWARDED", "FORWARDING", "ENABLE", "DISABLE", "ENABLED", "DISABLED", "TYPE", "ARP", "IPV4", "IPV6", "VLAN", "ETH", "DHCP", "TCP", "UDP", "ICMPV4", "ICMPV6":
 		return styleProtocol.Render(token)
-	case "MACSEC", "LOGOFF", "EAPOL-LOGOFF", "DROP-LOGOFF", "MACSEC-DOWNGRADE":
+	case "WARN", "WARNING", "MACSEC", "LOGOFF", "EAPOL-LOGOFF", "DROP-LOGOFF", "MACSEC-DOWNGRADE":
 		return styleWarn.Render(token)
-	case "START", "EAPOL-START", "SUCCESS", "EAPOL-SUCCESS", "AUTHORIZED":
+	case "PASS", "START", "EAPOL-START", "SUCCESS", "EAPOL-SUCCESS", "AUTHORIZED":
 		return styleSuccess.Render(token)
-	case "ERROR", "ERR", "FAILURE", "EAPOL-FAILURE", "FAILED", "REJECTED":
+	case "FAIL", "ERROR", "ERR", "FAILURE", "EAPOL-FAILURE", "FAILED", "REJECTED":
 		return styleError.Render(token)
+	case "SKIP":
+		return styleMuted.Render(token)
 	}
 	return styleAddresses(token)
 }

@@ -24,11 +24,6 @@ type TargetIdentity struct {
 	VLANs            []uint16         // All VLAN IDs observed on the wire
 }
 
-// String returns a human readable representation.
-func (t TargetIdentity) String() string {
-	return fmt.Sprintf("MAC: %s | IP: %s | Mask: %s | GW: %s", t.MAC, t.IP, t.Netmask, t.Gateway)
-}
-
 // Sniffer intercepts raw packets on a given interface.
 type Sniffer struct {
 	iface string
@@ -43,11 +38,20 @@ func NewSniffer(iface string) *Sniffer {
 // It relies on ARPs, IP headers, and DHCP configurations.
 // The eventLog callback streams internal discoveries dynamically.
 func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog func(string), onMacFound func(mac net.HardwareAddr, firstFrame []byte)) (*TargetIdentity, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("discovery context is required")
+	}
+	if s == nil || strings.TrimSpace(s.iface) == "" {
+		return nil, fmt.Errorf("discovery interface is required")
+	}
 	if eventLog == nil {
 		eventLog = func(string) {}
 	}
 
-	ignoreMAC, _ := net.ParseMAC(ignoreMACStr)
+	ignoreMAC, err := optionalMAC(ignoreMACStr)
+	if err != nil {
+		return nil, fmt.Errorf("ignore MAC: %w", err)
+	}
 
 	eventLog(fmt.Sprintf("[*] Initializing Pcap handle on interface: %s", s.iface))
 	handle, err := pcap.OpenLive(s.iface, 65535, true, pcap.BlockForever)
@@ -70,14 +74,14 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 	hasTriggeredMacCallback := false
 	linkLocalLogged := false
 	lockTarget := func(mac net.HardwareAddr, source string, firstFrame []byte) {
-		if len(id.MAC) != 0 || len(mac) == 0 {
+		if len(id.MAC) != 0 || !validUnicastMAC(mac) {
 			return
 		}
 		id.MAC = copyMAC(mac)
 		eventLog(fmt.Sprintf("[+] Discovered Target MAC via %s: %s", source, id.MAC.String()))
 		if onMacFound != nil && !hasTriggeredMacCallback {
 			hasTriggeredMacCallback = true
-			onMacFound(id.MAC, append([]byte(nil), firstFrame...))
+			onMacFound(copyMAC(id.MAC), append([]byte(nil), firstFrame...))
 		}
 	}
 
@@ -85,15 +89,17 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case packet := <-packets:
+		case packet, ok := <-packets:
+			if !ok {
+				return nil, fmt.Errorf("capture on %s stopped", s.iface)
+			}
 			if packet == nil {
 				continue
 			}
 
 			// 1. Process Layer 2 to deduce Target MAC if unknown.
-			ethLayer := packet.Layer(layers.LayerTypeEthernet)
-			if ethLayer != nil {
-				eth, _ := ethLayer.(*layers.Ethernet)
+			eth, hasEthernet := packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet)
+			if hasEthernet {
 
 				// 1a. Detect 802.1X EAPOL frames (EtherType 0x888E).
 				//     These are valid Layer 2 evidence: the first supplicant-side
@@ -104,7 +110,7 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 					}
 					if !id.EAPOLDetected {
 						id.EAPOLDetected = true
-						if len(id.MAC) > 0 && !macEqual(eth.SrcMAC, id.MAC) {
+						if len(id.MAC) > 0 && validUnicastMAC(eth.SrcMAC) && !macEqual(eth.SrcMAC, id.MAC) {
 							id.AuthenticatorMAC = copyMAC(eth.SrcMAC)
 						}
 						eventLog(fmt.Sprintf("[*][802.1X] EAPOL frame detected from %s — 802.1X is active on this port", eth.SrcMAC))
@@ -117,7 +123,7 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 				}
 
 				// Skip broadcast/multicast sources
-				if eth.SrcMAC[0]&1 != 0 {
+				if !validUnicastMAC(eth.SrcMAC) {
 					continue
 				}
 
@@ -138,9 +144,7 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 			// 1b. Detect 802.1Q VLAN tags.
 			// gopacket automatically decodes Dot1Q headers. If present, record the VLAN ID.
 			// This is critical for post-802.1X RADIUS-assigned VLANs.
-			dot1qLayer := packet.Layer(layers.LayerTypeDot1Q)
-			if dot1qLayer != nil {
-				dot1q, _ := dot1qLayer.(*layers.Dot1Q)
+			if dot1q, ok := packet.Layer(layers.LayerTypeDot1Q).(*layers.Dot1Q); ok {
 				if dot1q.VLANIdentifier != 0 {
 					if id.VLANID == 0 {
 						id.VLANID = dot1q.VLANIdentifier
@@ -165,17 +169,14 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 
 			// 2. Process IPv4 to deduce IP.
 			var srcIP net.IP
-			ipLayer := packet.Layer(layers.LayerTypeIPv4)
-			if ipLayer != nil {
-				ipv4, _ := ipLayer.(*layers.IPv4)
+			if ipv4, ok := packet.Layer(layers.LayerTypeIPv4).(*layers.IPv4); ok {
 				srcIP = ipv4.SrcIP
 
-				if ethLayer != nil {
-					eth, _ := ethLayer.(*layers.Ethernet)
+				if hasEthernet {
 					if macEqual(eth.SrcMAC, id.MAC) && len(id.IP) == 0 {
 						// The target is transmitting with this IP.
 						if !srcIP.IsUnspecified() && !srcIP.IsLoopback() && !srcIP.IsMulticast() && !strings.HasPrefix(srcIP.String(), "169.254") {
-							id.IP = srcIP
+							id.IP = copyIP(srcIP)
 							eventLog(fmt.Sprintf("[+] Passive inference extracted Target IP: %s", id.IP.String()))
 						}
 					}
@@ -183,9 +184,7 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 			}
 
 			// 3. Process ARP to deduce Gateway or IPs quicker.
-			arpLayer := packet.Layer(layers.LayerTypeARP)
-			if arpLayer != nil {
-				arp, _ := arpLayer.(*layers.ARP)
+			if arp, ok := packet.Layer(layers.LayerTypeARP).(*layers.ARP); ok {
 				if arp.Operation == layers.ARPRequest {
 					senderMAC := net.HardwareAddr(arp.SourceHwAddress)
 					senderIP := net.IP(arp.SourceProtAddress)
@@ -201,7 +200,7 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 									linkLocalLogged = true
 								}
 							} else {
-								id.IP = senderIP
+								id.IP = copyIP(senderIP)
 								eventLog(fmt.Sprintf("[+] Discovered Target Real IP: %s", id.IP.String()))
 							}
 						}
@@ -215,7 +214,7 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 						if len(id.Gateway) == 0 && len(id.IP) > 0 && targetIP.Equal(id.IP) && !senderIP.IsUnspecified() {
 							// Filter out link-local (169.254.x.x) — these are self-assigned, not gateways.
 							if !strings.HasPrefix(senderIP.String(), "169.254") {
-								id.Gateway = senderIP
+								id.Gateway = copyIP(senderIP)
 								eventLog(fmt.Sprintf("[+] ARP Request revealed possible Gateway IP: %s", id.Gateway.String()))
 							}
 						}
@@ -227,14 +226,14 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 
 					if macEqual(senderMAC, id.MAC) {
 						if len(id.IP) == 0 && !senderIP.IsUnspecified() {
-							id.IP = senderIP
+							id.IP = copyIP(senderIP)
 							eventLog(fmt.Sprintf("[+] ARP Reply revealed Target IP: %s", id.IP.String()))
 						}
 					} else {
 						// Reply directed specifically to our target MAC is likely from the gateway.
 						if len(id.Gateway) == 0 && len(id.IP) > 0 && macEqual(targetMAC, id.MAC) {
 							if !senderIP.IsUnspecified() && !strings.HasPrefix(senderIP.String(), "169.254") {
-								id.Gateway = senderIP
+								id.Gateway = copyIP(senderIP)
 								eventLog(fmt.Sprintf("[+] ARP Reply revealed Gateway IP: %s", id.Gateway.String()))
 							}
 						}
@@ -243,28 +242,24 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 			}
 
 			// 4. Process DHCP (UDP 67/68) to get exact metadata (Gateway, Subnet).
-			udpLayer := packet.Layer(layers.LayerTypeUDP)
-			if udpLayer != nil {
-				udp, _ := udpLayer.(*layers.UDP)
+			if udp, ok := packet.Layer(layers.LayerTypeUDP).(*layers.UDP); ok {
 				if udp.SrcPort == 67 || udp.DstPort == 67 {
-					dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4)
-					if dhcpLayer != nil {
-						dhcp, _ := dhcpLayer.(*layers.DHCPv4)
+					if dhcp, ok := packet.Layer(layers.LayerTypeDHCPv4).(*layers.DHCPv4); ok {
 						if macEqual(dhcp.ClientHWAddr, id.MAC) {
 							// It's a DHCP ACK meant for our Target
 							if dhcp.Operation == layers.DHCPOpReply && dhcp.YourClientIP != nil {
-								id.IP = dhcp.YourClientIP
+								id.IP = copyIP(dhcp.YourClientIP)
 								eventLog(fmt.Sprintf("[+] DHCP ACK assigned Target IP: %s", id.IP.String()))
 
 								// Parse options for Subnet and Router
 								for _, opt := range dhcp.Options {
 									if opt.Type == layers.DHCPOptSubnetMask {
-										id.Netmask = net.IPMask(opt.Data)
+										id.Netmask = append(net.IPMask(nil), opt.Data...)
 										id.NetmaskObserved = true
 										eventLog(fmt.Sprintf("[+] DHCP ACK revealed Subnet Mask: %s", id.Netmask.String()))
 									} else if opt.Type == layers.DHCPOptRouter {
 										if len(opt.Data) >= 4 {
-											id.Gateway = net.IP(opt.Data[:4])
+											id.Gateway = copyIP(net.IP(opt.Data[:4]))
 											eventLog(fmt.Sprintf("[+] DHCP ACK revealed Router/Gateway: %s", id.Gateway.String()))
 										}
 									}
@@ -289,7 +284,8 @@ func (s *Sniffer) Discover(ctx context.Context, ignoreMACStr string, eventLog fu
 					id.Netmask = id.IP.DefaultMask()
 					eventLog(fmt.Sprintf("[*] Falling back to default subnet mask: %s", id.Netmask.String()))
 				}
-				return id, nil
+				result := copyIdentity(*id)
+				return &result, nil
 			}
 		}
 	}
@@ -302,163 +298,9 @@ func (t TargetIdentity) IsComplete() bool {
 	return len(t.MAC) > 0
 }
 
-// HasGateway returns whether the gateway has been discovered (needed for NAT proxy).
+// HasGateway returns whether the gateway has been discovered for routed NAT.
 func (t TargetIdentity) HasGateway() bool {
 	return len(t.Gateway) > 0
-}
-
-// ObserveIdentity keeps learning optional target attributes after the Layer 2
-// bridge is already active. It never gates forwarding; it only enriches the
-// TargetIdentity with IP, gateway, VLAN, and 802.1X metadata as evidence appears.
-func (s *Sniffer) ObserveIdentity(ctx context.Context, targetMAC net.HardwareAddr, ignoreMACStr string, eventLog func(string), onUpdate func(TargetIdentity)) error {
-	if eventLog == nil {
-		eventLog = func(string) {}
-	}
-	if onUpdate == nil {
-		onUpdate = func(TargetIdentity) {}
-	}
-
-	ignoreMAC, _ := net.ParseMAC(ignoreMACStr)
-
-	handle, err := pcap.OpenLive(s.iface, 65535, true, pcap.BlockForever)
-	if err != nil {
-		return err
-	}
-	defer handle.Close()
-
-	eventLog(fmt.Sprintf("[*][RECON] Identity observer active on %s. Layer 3 details are optional.", s.iface))
-
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	packets := packetSource.Packets()
-
-	id := TargetIdentity{MAC: copyMAC(targetMAC)}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case packet := <-packets:
-			if packet == nil {
-				continue
-			}
-
-			ethLayer := packet.Layer(layers.LayerTypeEthernet)
-			if ethLayer == nil {
-				continue
-			}
-			eth, _ := ethLayer.(*layers.Ethernet)
-
-			if ignoreMAC != nil && macEqual(eth.SrcMAC, ignoreMAC) {
-				continue
-			}
-
-			isTargetFrame := macEqual(eth.SrcMAC, targetMAC) || macEqual(eth.DstMAC, targetMAC)
-			if !isTargetFrame && eth.EthernetType != 0x888E {
-				continue
-			}
-
-			changed := false
-
-			if eth.EthernetType == 0x888E {
-				if !id.EAPOLDetected {
-					id.EAPOLDetected = true
-					changed = true
-				}
-				if !macEqual(eth.SrcMAC, targetMAC) && len(id.AuthenticatorMAC) == 0 && eth.SrcMAC[0]&1 == 0 {
-					id.AuthenticatorMAC = copyMAC(eth.SrcMAC)
-					changed = true
-				}
-			}
-
-			if dot1qLayer := packet.Layer(layers.LayerTypeDot1Q); dot1qLayer != nil {
-				dot1q, _ := dot1qLayer.(*layers.Dot1Q)
-				if dot1q.VLANIdentifier != 0 && !containsVLAN(id.VLANs, dot1q.VLANIdentifier) {
-					if id.VLANID == 0 {
-						id.VLANID = dot1q.VLANIdentifier
-					}
-					id.VLANs = append(id.VLANs, dot1q.VLANIdentifier)
-					changed = true
-				}
-			}
-
-			if ipLayer := packet.Layer(layers.LayerTypeIPv4); ipLayer != nil && macEqual(eth.SrcMAC, targetMAC) {
-				ipv4, _ := ipLayer.(*layers.IPv4)
-				if isUsableIPv4(ipv4.SrcIP) && !ipv4.SrcIP.Equal(id.IP) {
-					id.IP = copyIP(ipv4.SrcIP)
-					changed = true
-				}
-			}
-
-			if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
-				arp, _ := arpLayer.(*layers.ARP)
-				senderMAC := net.HardwareAddr(arp.SourceHwAddress)
-				senderIP := net.IP(arp.SourceProtAddress)
-				targetIP := net.IP(arp.DstProtAddress)
-				targetARPmac := net.HardwareAddr(arp.DstHwAddress)
-
-				switch {
-				case macEqual(senderMAC, targetMAC):
-					if isUsableIPv4(senderIP) && !senderIP.Equal(id.IP) {
-						id.IP = copyIP(senderIP)
-						changed = true
-					}
-					if arp.Operation == layers.ARPRequest && len(id.Gateway) == 0 && isUsableIPv4(targetIP) && !targetIP.Equal(senderIP) {
-						id.Gateway = copyIP(targetIP)
-						changed = true
-					}
-
-				case arp.Operation == layers.ARPReply && macEqual(targetARPmac, targetMAC):
-					if len(id.Gateway) == 0 && isUsableIPv4(senderIP) {
-						id.Gateway = copyIP(senderIP)
-						changed = true
-					}
-
-				case len(id.IP) > 0 && targetIP.Equal(id.IP):
-					if len(id.Gateway) == 0 && isUsableIPv4(senderIP) {
-						id.Gateway = copyIP(senderIP)
-						changed = true
-					}
-				}
-			}
-
-			if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-				udp, _ := udpLayer.(*layers.UDP)
-				if udp.SrcPort == 67 || udp.DstPort == 67 {
-					if dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4); dhcpLayer != nil {
-						dhcp, _ := dhcpLayer.(*layers.DHCPv4)
-						if macEqual(dhcp.ClientHWAddr, targetMAC) && dhcp.Operation == layers.DHCPOpReply {
-							if isUsableIPv4(dhcp.YourClientIP) && !dhcp.YourClientIP.Equal(id.IP) {
-								id.IP = copyIP(dhcp.YourClientIP)
-								changed = true
-							}
-							for _, opt := range dhcp.Options {
-								switch opt.Type {
-								case layers.DHCPOptSubnetMask:
-									if len(opt.Data) == 4 && string(id.Netmask) != string(net.IPMask(opt.Data)) {
-										id.Netmask = net.IPMask(copyIP(net.IP(opt.Data)))
-										id.NetmaskObserved = true
-										changed = true
-									}
-								case layers.DHCPOptRouter:
-									if len(opt.Data) >= 4 {
-										gw := net.IP(opt.Data[:4])
-										if isUsableIPv4(gw) && !gw.Equal(id.Gateway) {
-											id.Gateway = copyIP(gw)
-											changed = true
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-
-			if changed {
-				onUpdate(id)
-			}
-		}
-	}
 }
 
 func macEqual(a, b net.HardwareAddr) bool {
@@ -491,9 +333,37 @@ func copyIP(ip net.IP) net.IP {
 	return dup
 }
 
-func containsVLAN(vlans []uint16, vlan uint16) bool {
-	for _, existing := range vlans {
-		if existing == vlan {
+func copyIdentity(identity TargetIdentity) TargetIdentity {
+	identity.MAC = copyMAC(identity.MAC)
+	identity.IP = copyIP(identity.IP)
+	identity.Netmask = append(net.IPMask(nil), identity.Netmask...)
+	identity.Gateway = copyIP(identity.Gateway)
+	identity.AuthenticatorMAC = copyMAC(identity.AuthenticatorMAC)
+	identity.VLANs = append([]uint16(nil), identity.VLANs...)
+	return identity
+}
+
+func optionalMAC(value string) (net.HardwareAddr, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	mac, err := net.ParseMAC(value)
+	if err != nil {
+		return nil, err
+	}
+	if !validUnicastMAC(mac) {
+		return nil, fmt.Errorf("must be a 48-bit unicast address")
+	}
+	return copyMAC(mac), nil
+}
+
+func validUnicastMAC(mac net.HardwareAddr) bool {
+	if len(mac) != 6 || mac[0]&1 != 0 {
+		return false
+	}
+	for _, octet := range mac {
+		if octet != 0 {
 			return true
 		}
 	}

@@ -3,7 +3,9 @@
 #
 # Build output
 bin/
-golan
+/golan
+build/
+dist/
 # Binaries for programs and plugins
 *.exe
 *.exe~
@@ -69,7 +71,23 @@ session-*.json
 *.p12
 *.pfx
 *.kdbx
+.netrc
+.npmrc
+.pypirc
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# macOS, editor, and temporary metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.idea/
+.vscode/
+.history/
+*.swp
+*.swo
+*~
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej

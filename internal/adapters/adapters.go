@@ -2,6 +2,7 @@ package adapters
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os/exec"
@@ -15,19 +16,25 @@ import (
 type Adapter struct {
 	Name         string
 	HardwarePort string
-	Kind         string
-	MAC          string
-	MTU          int
-	IsUp         bool
-	Addrs        []string
-	Flags        []string
+	// NetworkService is the separately renameable macOS service accepted by
+	// networksetup. It is empty on non-macOS platforms or when no mapping exists.
+	NetworkService string
+	Kind           string
+	MAC            string
+	MTU            int
+	IsUp           bool
+	Addrs          []string
+	Flags          []string
 }
 
-// HardwarePort describes the platform-specific hardware service mapping.
+// HardwarePort describes a physical macOS port and the separately named
+// network service that owns it. Network services can be renamed independently
+// of their hardware-port label.
 type HardwarePort struct {
-	Name   string
-	Device string
-	MAC    string
+	Name           string
+	Device         string
+	MAC            string
+	NetworkService string
 }
 
 // Status returns a compact link state label for display.
@@ -47,7 +54,8 @@ func (a Adapter) PrimaryAddr() string {
 }
 
 // Discover returns network adapters with stable, portable metadata first and
-// optional platform enrichment second.
+// optional platform enrichment second. It may return a partial adapter list
+// with an error when enrichment or one interface address lookup fails.
 func Discover(ctx context.Context) ([]Adapter, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -58,8 +66,12 @@ func Discover(ctx context.Context) ([]Adapter, error) {
 		return nil, fmt.Errorf("list interfaces: %w", err)
 	}
 
-	hardware := discoverHardwarePorts(ctx)
+	hardware, hardwareErr := discoverHardwarePorts(ctx)
 	out := make([]Adapter, 0, len(netIfaces))
+	var discoverErrs []error
+	if hardwareErr != nil {
+		discoverErrs = append(discoverErrs, hardwareErr)
+	}
 
 	for _, iface := range netIfaces {
 		if iface.Flags&net.FlagLoopback != 0 {
@@ -75,16 +87,20 @@ func Discover(ctx context.Context) ([]Adapter, error) {
 			continue
 		}
 
-		addrs, _ := iface.Addrs()
+		addrs, err := iface.Addrs()
+		if err != nil {
+			discoverErrs = append(discoverErrs, fmt.Errorf("list addresses for %s: %w", iface.Name, err))
+		}
 		out = append(out, Adapter{
-			Name:         iface.Name,
-			HardwarePort: hw.Name,
-			Kind:         classifyKind(hw.Name, iface.Name),
-			MAC:          mac,
-			MTU:          iface.MTU,
-			IsUp:         iface.Flags&net.FlagUp != 0,
-			Addrs:        addrStrings(addrs),
-			Flags:        flagStrings(iface.Flags),
+			Name:           iface.Name,
+			HardwarePort:   hw.Name,
+			NetworkService: hw.NetworkService,
+			Kind:           classifyKind(hw.Name, iface.Name),
+			MAC:            mac,
+			MTU:            iface.MTU,
+			IsUp:           iface.Flags&net.FlagUp != 0,
+			Addrs:          addrStrings(addrs),
+			Flags:          flagStrings(iface.Flags),
 		})
 	}
 
@@ -97,22 +113,46 @@ func Discover(ctx context.Context) ([]Adapter, error) {
 		return out[i].Name < out[j].Name
 	})
 
-	return out, nil
+	return out, errors.Join(discoverErrs...)
 }
 
-func discoverHardwarePorts(ctx context.Context) map[string]HardwarePort {
+func discoverHardwarePorts(ctx context.Context) (map[string]HardwarePort, error) {
 	if runtime.GOOS != "darwin" {
-		return map[string]HardwarePort{}
+		return map[string]HardwarePort{}, nil
 	}
 
+	out, err := runNetworkSetup(ctx, "-listallhardwareports")
+	if err != nil {
+		output := strings.TrimSpace(string(out))
+		if output == "" {
+			return map[string]HardwarePort{}, fmt.Errorf("list macOS hardware ports: %w", err)
+		}
+		return map[string]HardwarePort{}, fmt.Errorf("list macOS hardware ports: %w (%s)", err, output)
+	}
+	ports := ParseHardwarePorts(string(out))
+	serviceOutput, serviceErr := runNetworkSetup(ctx, "-listnetworkserviceorder")
+	if serviceErr != nil {
+		output := strings.TrimSpace(string(serviceOutput))
+		if output == "" {
+			return ports, fmt.Errorf("list macOS network services: %w", serviceErr)
+		}
+		return ports, fmt.Errorf("list macOS network services: %w (%s)", serviceErr, output)
+	}
+	for device, service := range ParseNetworkServiceOrder(string(serviceOutput)) {
+		port, ok := ports[device]
+		if !ok {
+			continue
+		}
+		port.NetworkService = service
+		ports[device] = port
+	}
+	return ports, nil
+}
+
+func runNetworkSetup(ctx context.Context, args ...string) ([]byte, error) {
 	runCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-
-	out, err := exec.CommandContext(runCtx, "networksetup", "-listallhardwareports").CombinedOutput()
-	if err != nil {
-		return map[string]HardwarePort{}
-	}
-	return ParseHardwarePorts(string(out))
+	return exec.CommandContext(runCtx, "networksetup", args...).CombinedOutput()
 }
 
 // ParseHardwarePorts parses the macOS networksetup hardware-port listing.
@@ -142,6 +182,44 @@ func ParseHardwarePorts(output string) map[string]HardwarePort {
 	flush()
 
 	return ports
+}
+
+// ParseNetworkServiceOrder maps each macOS interface device to the network
+// service name that networksetup accepts for enable/disable operations.
+func ParseNetworkServiceOrder(output string) map[string]string {
+	services := make(map[string]string)
+	current := ""
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "(") && !strings.HasPrefix(line, "(Hardware Port:") {
+			if closeIndex := strings.IndexByte(line, ')'); closeIndex >= 0 {
+				current = strings.TrimSpace(line[closeIndex+1:])
+			}
+			continue
+		}
+		if current == "" || !strings.HasPrefix(line, "(Hardware Port:") {
+			continue
+		}
+		deviceIndex := strings.Index(line, "Device:")
+		if deviceIndex < 0 {
+			current = ""
+			continue
+		}
+		device := strings.TrimSpace(line[deviceIndex+len("Device:"):])
+		device = strings.TrimSuffix(device, ")")
+		if commaIndex := strings.IndexByte(device, ','); commaIndex >= 0 {
+			device = device[:commaIndex]
+		}
+		device = strings.TrimSpace(device)
+		if device != "" {
+			services[device] = current
+		}
+		current = ""
+	}
+	return services
 }
 
 func classifyKind(hardwarePort, name string) string {

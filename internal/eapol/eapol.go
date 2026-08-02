@@ -7,6 +7,7 @@ package eapol
 import (
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,9 +16,8 @@ import (
 
 // ─── EAPOL Protocol Constants ───────────────────────────────────────────────
 
-// PAEGroupAddr is the IEEE 802.1X PAE (Port Access Entity) multicast address.
-// All EAPOL frames are sent to this well-known destination.
-var PAEGroupAddr = net.HardwareAddr{0x01, 0x80, 0xc2, 0x00, 0x00, 0x03}
+// All EAPOL frames use the IEEE 802.1X PAE multicast destination.
+var paeGroupAddress = [6]byte{0x01, 0x80, 0xc2, 0x00, 0x00, 0x03}
 
 // BPFFilter captures all EAPOL frames on a raw interface.
 const BPFFilter = "(ether proto 0x888e) or (vlan and ether proto 0x888e)"
@@ -27,6 +27,7 @@ const BPFFilter = "(ether proto 0x888e) or (vlan and ether proto 0x888e)"
 // State represents the current 802.1X authentication state.
 type State int
 
+// EAPOL session states run from idle detection through optional downgrade.
 const (
 	StateIdle           State = iota // No 802.1X activity detected
 	StateDetecting                   // Listening for EAPOL frames
@@ -63,6 +64,7 @@ func (s State) String() string {
 // EAPMethod represents the detected EAP authentication method.
 type EAPMethod string
 
+// EAP method constants identify the authentication method observed on the wire.
 const (
 	MethodUnknown  EAPMethod = "Unknown"
 	MethodIdentity EAPMethod = "Identity"
@@ -106,33 +108,31 @@ func eapTypeToMethod(eapType uint8) EAPMethod {
 type AuthSession struct {
 	mu sync.Mutex
 
-	State            State
-	SupplicantMAC    net.HardwareAddr // MAC of the real device (supplicant)
-	AuthenticatorMAC net.HardwareAddr // MAC of the switch (authenticator)
-	VLANID           uint16           // Optional VLAN context for tagged EAPOL
-	Method           EAPMethod        // Detected EAP method
-	MACsecDetected   bool             // Whether MACsec key negotiation was seen
+	state            State
+	supplicantMAC    net.HardwareAddr
+	authenticatorMAC net.HardwareAddr
+	vlanID           uint16
+	method           EAPMethod
+	macsecDetected   bool
 
-	// Counters
-	FramesRelayed int // Total EAPOL frames forwarded
-	FramesDropped int // Frames dropped (e.g. MACsec downgrade)
-	ReauthCount   int // Number of re-authentications handled
-	LastEAPID     uint8
-	LastActivity  time.Time
+	framesRelayed int
+	framesDropped int
+	reauthCount   int
+	lastEAPID     uint8
+	lastActivity  time.Time
 
-	// Timing
-	StartedAt       time.Time
-	AuthenticatedAt time.Time
+	startedAt       time.Time
+	authenticatedAt time.Time
 }
 
 // NewAuthSession creates a fresh session for the given supplicant.
 func NewAuthSession(supplicantMAC net.HardwareAddr) *AuthSession {
 	return &AuthSession{
-		State:         StateIdle,
-		SupplicantMAC: supplicantMAC,
-		Method:        MethodUnknown,
-		StartedAt:     time.Now(),
-		LastActivity:  time.Now(),
+		state:         StateIdle,
+		supplicantMAC: copyMAC(supplicantMAC),
+		method:        MethodUnknown,
+		startedAt:     time.Now(),
+		lastActivity:  time.Now(),
 	}
 }
 
@@ -140,48 +140,48 @@ func NewAuthSession(supplicantMAC net.HardwareAddr) *AuthSession {
 func (s *AuthSession) SetState(state State) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.State = state
-	s.LastActivity = time.Now()
+	s.state = state
+	s.lastActivity = time.Now()
 }
 
 // GetState returns the current state thread-safely.
 func (s *AuthSession) GetState() State {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.State
+	return s.state
 }
 
 // RecordRelay increments the relay counter.
 func (s *AuthSession) RecordRelay() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.FramesRelayed++
-	s.LastActivity = time.Now()
+	s.framesRelayed++
+	s.lastActivity = time.Now()
 }
 
 // RecordDrop increments the drop counter.
 func (s *AuthSession) RecordDrop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.FramesDropped++
-	s.LastActivity = time.Now()
+	s.framesDropped++
+	s.lastActivity = time.Now()
 }
 
 // MarkAuthenticated transitions to authenticated state.
 func (s *AuthSession) MarkAuthenticated() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.State = StateAuthenticated
-	s.AuthenticatedAt = time.Now()
-	s.LastActivity = time.Now()
+	s.state = StateAuthenticated
+	s.authenticatedAt = time.Now()
+	s.lastActivity = time.Now()
 }
 
 // MarkFailed transitions to failed state.
 func (s *AuthSession) MarkFailed() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.State = StateFailed
-	s.LastActivity = time.Now()
+	s.state = StateFailed
+	s.lastActivity = time.Now()
 }
 
 // Snapshot returns a thread-safe copy of the session status.
@@ -189,17 +189,19 @@ func (s *AuthSession) Snapshot() AuthSessionSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return AuthSessionSnapshot{
-		State:            s.State,
-		SupplicantMAC:    s.SupplicantMAC,
-		AuthenticatorMAC: s.AuthenticatorMAC,
-		VLANID:           s.VLANID,
-		Method:           s.Method,
-		MACsecDetected:   s.MACsecDetected,
-		FramesRelayed:    s.FramesRelayed,
-		FramesDropped:    s.FramesDropped,
-		ReauthCount:      s.ReauthCount,
-		StartedAt:        s.StartedAt,
-		AuthenticatedAt:  s.AuthenticatedAt,
+		State:            s.state,
+		SupplicantMAC:    copyMAC(s.supplicantMAC),
+		AuthenticatorMAC: copyMAC(s.authenticatorMAC),
+		VLANID:           s.vlanID,
+		Method:           s.method,
+		MACsecDetected:   s.macsecDetected,
+		FramesRelayed:    s.framesRelayed,
+		FramesDropped:    s.framesDropped,
+		ReauthCount:      s.reauthCount,
+		LastEAPID:        s.lastEAPID,
+		LastActivity:     s.lastActivity,
+		StartedAt:        s.startedAt,
+		AuthenticatedAt:  s.authenticatedAt,
 	}
 }
 
@@ -214,6 +216,8 @@ type AuthSessionSnapshot struct {
 	FramesRelayed    int
 	FramesDropped    int
 	ReauthCount      int
+	LastEAPID        uint8
+	LastActivity     time.Time
 	StartedAt        time.Time
 	AuthenticatedAt  time.Time
 }
@@ -240,26 +244,19 @@ func (r AuthResult) String() string {
 
 // ─── EAPOL-Start Injection ──────────────────────────────────────────────────
 
-// InjectEAPOLStart crafts and injects a synthetic EAPOL-Start frame on the given
-// interface using the provided supplicant MAC. This "pokes" the authenticator
-// (switch) into sending an EAP-Request/Identity if it's waiting for an
-// EAPOL-Start before initiating authentication.
-//
-// Frame format:
-//
-//	Dst: 01:80:c2:00:00:03 (PAE group address)
-//	Src: supplicantMAC
-//	EtherType: 0x888E (EAPOL)
-//	EAPOL Version: 2
-//	EAPOL Type: 1 (Start)
-//	EAPOL Length: 0
-func InjectEAPOLStart(iface string, supplicantMAC net.HardwareAddr, logFunc func(string)) error {
-	return InjectEAPOLStartWithVLAN(iface, supplicantMAC, 0, logFunc)
-}
-
 // InjectEAPOLStartWithVLAN crafts and injects an EAPOL-Start frame. If vlanID
 // is non-zero, the Ethernet frame includes an 802.1Q tag.
 func InjectEAPOLStartWithVLAN(iface string, supplicantMAC net.HardwareAddr, vlanID uint16, logFunc func(string)) error {
+	iface = strings.TrimSpace(iface)
+	if iface == "" {
+		return fmt.Errorf("EAPOL-Start interface is required")
+	}
+	if !validUnicastMAC(supplicantMAC) {
+		return fmt.Errorf("EAPOL-Start requires a 48-bit unicast supplicant MAC")
+	}
+	if vlanID > 4094 {
+		return fmt.Errorf("EAPOL-Start VLAN %d is outside 1-4094", vlanID)
+	}
 	if logFunc == nil {
 		logFunc = func(string) {}
 	}
@@ -276,7 +273,7 @@ func InjectEAPOLStartWithVLAN(iface string, supplicantMAC net.HardwareAddr, vlan
 	}
 	frame := make([]byte, frameLen)
 
-	copy(frame[0:6], PAEGroupAddr)
+	copy(frame[0:6], paeGroupAddress[:])
 	copy(frame[6:12], supplicantMAC)
 
 	offset := 12

@@ -5,47 +5,192 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"golan/internal/policy"
+
 	"github.com/charmbracelet/lipgloss"
-	"golan/internal/profile"
 )
 
+// View renders the current model without side effects.
 func (m Model) View() string {
-	terminalCols := terminalWidth(m.width)
-	width := renderWidth(terminalCols)
-	margin := horizontalMargin(terminalCols)
-	terminalRows := terminalHeight(m.height)
-	height := renderHeight(terminalRows)
-
-	footer := m.renderFooter(width)
-	footerHeight := lipgloss.Height(footer)
-	mainHeight := mainAreaHeight(height, footerHeight)
-
-	leftWidth, rightWidth := splitWidths(width)
-	cliHeight := clamp(mainHeight/4, 4, 8)
-	if mainHeight-cliHeight < 4 {
-		cliHeight = max(4, mainHeight-4)
+	if m.help.open {
+		return m.renderHelp()
 	}
-	outputHeight := max(4, mainHeight-cliHeight)
-
-	left := lipgloss.JoinVertical(
-		lipgloss.Left,
-		m.renderOutput(leftWidth, outputHeight),
-		m.renderCLI(leftWidth, cliHeight),
+	if m.commandPalette.open {
+		return m.renderCommandPalette()
+	}
+	if m.settingsEditor.open {
+		return m.renderSettingsEditor()
+	}
+	if m.startup.open {
+		return m.renderStartupChooser()
+	}
+	if m.bundleExport.open {
+		return m.renderBundleExport()
+	}
+	if m.ruleEditor.open {
+		return m.renderRuleEditor()
+	}
+	geometry := m.workbenchGeometry()
+	status := m.renderStatus(geometry.ContentWidth)
+	tabs := m.renderTabs(geometry.ContentWidth)
+	main := m.renderWorkbenchMain(geometry)
+	footer := m.renderFooter(geometry.ContentWidth)
+	return insetBlock(
+		clampBlock(
+			lipgloss.JoinVertical(lipgloss.Left, status, tabs, main, footer),
+			geometry.ContentWidth,
+			geometry.Height,
+		),
+		geometry.Margin,
 	)
-	rightTopHeight, trafficHeight := rightPaneHeights(mainHeight)
-	right := lipgloss.JoinVertical(
-		lipgloss.Left,
-		m.renderRightTop(rightWidth, rightTopHeight),
-		m.renderTraffic(rightWidth, trafficHeight),
-	)
+}
 
-	main := lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
-	return insetBlock(clampBlock(lipgloss.JoinVertical(lipgloss.Left, main, footer), width, height), margin)
+func (m Model) renderWorkbenchMain(geometry workbenchGeometry) string {
+	renderPane := func(pane paneCell) string {
+		switch pane.Card {
+		case cardCLI:
+			return m.renderCLI(pane.Rect.Width, pane.Rect.Height)
+		case cardInspector:
+			return m.renderTraffic(pane.Rect.Width, pane.Rect.Height)
+		default:
+			return m.renderOutput(pane.Rect.Width, pane.Rect.Height)
+		}
+	}
+	paneFor := func(card cardFocus) (paneCell, bool) {
+		for _, pane := range geometry.Panes {
+			if pane.Card == card {
+				return pane, true
+			}
+		}
+		return paneCell{}, false
+	}
+	renderPrimary := func() string {
+		output, outputOK := paneFor(cardOutput)
+		cli, cliOK := paneFor(cardCLI)
+		switch {
+		case outputOK && cliOK:
+			return lipgloss.JoinVertical(lipgloss.Left, renderPane(output), renderPane(cli))
+		case outputOK:
+			return renderPane(output)
+		case cliOK:
+			return renderPane(cli)
+		default:
+			return ""
+		}
+	}
+
+	switch geometry.Mode {
+	case layoutMaximized:
+		if len(geometry.Panes) == 0 {
+			return ""
+		}
+		return renderPane(geometry.Panes[0])
+	case layoutNarrow:
+		main := renderPrimary()
+		if inspector, ok := paneFor(cardInspector); ok {
+			return lipgloss.JoinVertical(lipgloss.Left, main, renderPane(inspector))
+		}
+		return main
+	case layoutMedium:
+		primary := renderPrimary()
+		inspector, inspectorOK := paneFor(cardInspector)
+		if inspectorOK {
+			return lipgloss.JoinVertical(lipgloss.Left, primary, renderPane(inspector))
+		}
+		return primary
+	default:
+		parts := []string{renderPrimary()}
+		if inspector, ok := paneFor(cardInspector); ok {
+			parts = append(parts, styleCanvas.Render(" "), renderPane(inspector))
+		}
+		return lipgloss.JoinHorizontal(lipgloss.Top, parts...)
+	}
+}
+
+func (m Model) renderStatus(width int) string {
+	project := "NO PROJECT"
+	if m.project != nil {
+		project = m.project.Manifest().Name
+		if m.project.Dirty() {
+			project += "*"
+		}
+	}
+	bridgeState := "offline"
+	runtimeOnline := false
+	if m.bridge != nil {
+		bridgeState = "bridge " + m.bridgeState
+		runtimeOnline = true
+	} else if m.edgeSession != nil {
+		bridgeState = "edge " + m.edgeMode
+		runtimeOnline = true
+	} else if m.listener != nil {
+		bridgeState = "observe"
+		runtimeOnline = true
+	}
+	project = safeDisplayText(project)
+	runtimeStyle := styleStatusLabel
+	if runtimeOnline {
+		runtimeStyle = styleStatusOnline
+	}
+	line := styleBrand.Render(" goLAN ") +
+		styleProduct.Render(" WORKBENCH ") +
+		styleStatusLabel.Render("│ PROJECT ") +
+		styleStatusValue.Render(project+" ") +
+		styleStatusLabel.Render("│ RUNTIME ") +
+		runtimeStyle.Render(strings.ToUpper(bridgeState)+" ") +
+		styleStatusLabel.Render("│ FOCUS (Shift+←/→) ") +
+		styleStatusValue.Render(cardFocusLabel(m.activeCard)+" ")
+	return renderStyleLayer(styleTopBar, fit(line, width))
+}
+
+func cardFocusLabel(card cardFocus) string {
+	switch card {
+	case cardNone:
+		return "ALL PANES"
+	case cardOutput:
+		return "OUTPUT"
+	case cardCLI:
+		return "CLI"
+	case cardInspector:
+		return "INSPECTOR"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func (m Model) renderTabs(width int) string {
+	rows := workspaceTabRows(width)
+	renderedRows := make([]string, 0, len(rows))
+	for _, row := range rows {
+		var rendered strings.Builder
+		for index, tab := range row {
+			if index > 0 {
+				rendered.WriteByte(' ')
+			}
+			if tab.Workspace == m.workspace {
+				label := "[" + strings.TrimSpace(tab.Label) + "]"
+				rendered.WriteString(styleTabActive.Render(label))
+			} else {
+				rendered.WriteString(styleTab.Render(tab.Label))
+			}
+		}
+		renderedRows = append(renderedRows, renderStyleLayer(styleTabBar, fit(rendered.String(), width)))
+	}
+	if len(renderedRows) == 0 {
+		return fit("", width)
+	}
+	return strings.Join(renderedRows, "\n")
 }
 
 func (m Model) renderOutput(width, height int) string {
+	switch m.workspace {
+	case workspaceNetwork:
+		return m.renderNetworkDevices(width, height)
+	case workspaceRules:
+		return m.renderRulesList(width, height)
+	}
 	available := max(1, height-3)
-	rows := wrapOutputLines(m.output, m.outputMuted, max(1, width-4))
+	rows := wrapOutputLinesStyled(m.output, m.outputMuted, m.outputLiteral, max(1, width-4))
 	maxOffset := max(0, len(rows)-available)
 	offset := clamp(m.outputScroll, 0, maxOffset)
 	end := len(rows) - offset
@@ -61,14 +206,18 @@ func (m Model) renderOutput(width, height int) string {
 
 func (m Model) renderCLI(width, height int) string {
 	cursor := " "
-	if m.cursorVisible {
+	if m.cursorVisible && m.activeCard == cardCLI {
 		cursor = "|"
 	}
+	innerWidth := max(1, width-2)
 	lines := []string{
-		styleCLILine(m.prompt() + m.input + cursor),
+		styleCLILine(fit(m.prompt()+m.input+cursor, innerWidth)),
 	}
 	if len(m.completions) > 0 {
-		lines = append(lines, styleAutocompleteLine(strings.Join(limitStrings(m.completions, 8), "  ")))
+		lines = append(lines, styleAutocompleteLine(fit(strings.Join(limitStrings(m.completions, 8), "  "), innerWidth)))
+		for _, hint := range m.completionHelpHints(2) {
+			lines = append(lines, styleAutocompleteLine(fit("↳ "+hint, innerWidth)))
+		}
 	}
 	return box(m.cardTitle("cli", cardCLI), lines, width, height, m.activeCard == cardCLI)
 }
@@ -77,125 +226,150 @@ func styleCLILine(line string) string {
 	if line == "" {
 		return line
 	}
-	return styleText.Render(line)
+	return styleCLIInput.Render(line)
 }
 
 func styleAutocompleteLine(line string) string {
 	if line == "" {
 		return line
 	}
-	return styleMuted.Render(line)
-}
-
-func (m Model) renderRightTop(width, height int) string {
-	available := max(1, height-3)
-	start := len(m.findings) - available
-	if start < 0 {
-		start = 0
-	}
-	return box(m.cardTitle("findings", cardMisc), m.findings[start:], width, height, m.activeCard == cardMisc)
+	return styleAutocomplete.Render(line)
 }
 
 func (m Model) renderTraffic(width, height int) string {
-	available := max(1, height-3)
-	start := len(m.traffic) - available
-	if start < 0 {
-		start = 0
+	if m.workspace == workspaceNetwork {
+		return m.renderNetworkInspector(width, height)
 	}
-	return box(m.cardTitle("traffic", cardMisc), m.traffic[start:], width, height, m.activeCard == cardMisc)
+	if m.workspace == workspaceRules {
+		return m.renderRuleInspector(width, height)
+	}
+	return box("inspector", []string{"no inspector for this workspace"}, width, height, m.activeCard == cardInspector)
 }
 
-func (m Model) renderMisc(width, height int) string {
-	lines := []string{
-		"golan init",
-		"",
-		"adapters: " + m.adapterStatus(),
-		fmt.Sprintf("selected: %d/%d", len(m.profile.Adapters), profile.MaxAdapters),
-		"active: " + m.activeStatus(),
-		"cap: " + m.captureStatus(),
-		fmt.Sprintf("bridge: %d", len(m.profile.Bridge.Observations)),
-		"",
-		"commands",
-		"show adapters",
-		"show bridge",
-		"show secrets",
-		"set <adapter> <role>",
-		"conf <name|bridge>",
-		"unset",
-		"load <name>",
-		"start listen|bridge|nat",
-		"stop listen|bridge|nat",
-		"send eapol start",
-		"enable eapol drop-logoff",
-		"disable eapol drop-logoff",
-		"enable eapol macsec-downgrade",
-		"disable eapol macsec-downgrade",
-		"set ip <value|auto>",
-		"set mac <value|auto>",
-		"set state up|down|auto",
-		"clear",
-		"",
-		"properties",
-	}
-
-	if isBridgeContext(m.activeAdapter) {
-		lines = append(lines, m.renderConfigLines(m.profile.BridgeAdapterSnapshot())...)
-	} else if cfg, ok := m.profile.ByName(m.activeAdapter); ok {
-		lines = append(lines, m.renderConfigLines(*cfg)...)
-	} else if len(m.profile.Adapters) > 0 {
-		lines = append(lines, "no active context")
-		lines = append(lines, "run: conf <adapter|bridge>")
-	} else {
-		lines = append(lines, "none staged")
-	}
-
-	if len(m.profile.Adapters) > 0 {
-		lines = append(lines, "", "staged")
-		for _, cfg := range m.profile.Adapters {
-			marker := " "
-			if strings.EqualFold(cfg.Name, m.activeAdapter) {
-				marker = "*"
+func (m Model) renderRulesList(width, height int) string {
+	available := max(1, height-3)
+	rules, revision := m.activeRules()
+	rows := []string{"no active revision · press r to create a rule"}
+	selected := -1
+	if len(rules) > 0 {
+		rows = make([]string, 0, len(rules)+1)
+		rows = append(rows, "revision "+revision)
+		selectedID := m.selectedRuleID
+		if selectedID == "" {
+			selectedID = rules[0].ID
+		}
+		capabilities := m.currentCapabilities()
+		for index, rule := range rules {
+			marker := "  "
+			if rule.ID == selectedID {
+				marker = "> "
+				selected = index + 1
 			}
-			lines = append(lines, fmt.Sprintf("%s %s %s", marker, cfg.AdapterRole, cfg.Name))
+			status, _, _ := m.compatibilityForCapabilities(rule, capabilities)
+			enabled := "off"
+			if rule.Enabled {
+				enabled = "on"
+			}
+			rows = append(rows, fmt.Sprintf("%s%s · p=%d · %s · %s", marker, rule.Name, rule.Priority, enabled, status))
 		}
-		bridgeMarker := " "
-		if isBridgeContext(m.activeAdapter) {
-			bridgeMarker = "*"
-		}
-		lines = append(lines, fmt.Sprintf("%s bridge bridge", bridgeMarker))
 	}
-
-	available := max(1, height-3)
-	maxOffset := max(0, len(lines)-available)
-	offset := clamp(m.miscScroll, 0, maxOffset)
-	end := offset + available
-	if end > len(lines) {
-		end = len(lines)
-	}
-
-	return box(m.cardTitle("misc", cardMisc), lines[offset:end], width, height, m.activeCard == cardMisc)
+	start := visibleSelectionStart(selected, len(rows), available)
+	end := min(len(rows), start+available)
+	return box(m.cardTitle("rules", cardOutput), rows[start:end], width, height, m.activeCard == cardOutput)
 }
 
-func rightPaneHeights(height int) (int, int) {
-	if height < 8 {
-		return 4, 4
+func (m Model) renderRuleInspector(width, height int) string {
+	available := max(1, height-3)
+	rule, ok := m.selectedRule()
+	if !ok {
+		return box(m.cardTitle("inspector", cardInspector), []string{"select or create a rule"}, width, height, m.activeCard == cardInspector)
 	}
-	top := height / 3
-	if top < 4 {
-		top = 4
+	status, required, reason := m.compatibilityForCapabilities(rule, m.currentCapabilities())
+	actions := make([]string, 0, len(rule.Actions))
+	for _, action := range rule.Actions {
+		actions = append(actions, string(action.Kind))
 	}
-	bottom := height - top
-	if bottom < 4 {
-		bottom = 4
-		top = height - bottom
-		if top < 4 {
-			top = 4
+	actionLabel := strings.Join(actions, ", ")
+	if actionLabel == "" {
+		actionLabel = "none"
+	}
+	rows := []string{
+		"name " + rule.Name,
+		"id " + rule.ID,
+		fmt.Sprintf("priority %d · revision %d · enabled %t", rule.Priority, rule.Revision, rule.Enabled),
+		fmt.Sprintf("matches %d groups · actions %s · transforms %d", ruleMatchGroupCount(rule.Match), actionLabel, len(rule.Transformations)),
+		fmt.Sprintf("runtime %s · requires %s", status, required),
+	}
+	if reason != "" {
+		rows = append(rows, "reason "+reason)
+	}
+	if revision, active := m.policyStore.Active(); active {
+		for _, diagnostic := range revision.DiagnosticsForRule(m.currentCapabilities(), rule.ID) {
+			rows = append(rows, diagnostic.String())
 		}
 	}
-	if top+bottom > height {
-		bottom = max(4, height-top)
+	rows = append(rows, "r edit/new · M match and replace · enable|disable rule <id>")
+	return box(m.cardTitle("inspector", cardInspector), rows[:min(len(rows), available)], width, height, m.activeCard == cardInspector)
+}
+
+func (m Model) activeRules() ([]policy.Rule, string) {
+	revision, ok := m.policyStore.Active()
+	if !ok {
+		return nil, ""
 	}
-	return top, bottom
+	return revision.Rules(), revision.Revision()
+}
+
+func (m Model) selectedRule() (policy.Rule, bool) {
+	rules, _ := m.activeRules()
+	if len(rules) == 0 {
+		return policy.Rule{}, false
+	}
+	for _, rule := range rules {
+		if rule.ID == m.selectedRuleID {
+			return rule, true
+		}
+	}
+	return rules[0], true
+}
+
+func (m *Model) moveRuleSelection(delta int) {
+	rules, _ := m.activeRules()
+	if len(rules) == 0 || delta == 0 {
+		return
+	}
+	index := 0
+	for candidate, rule := range rules {
+		if rule.ID == m.selectedRuleID {
+			index = candidate
+			break
+		}
+	}
+	index = clamp(index+delta, 0, len(rules)-1)
+	m.selectedRuleID = rules[index].ID
+}
+
+func ruleMatchGroupCount(match policy.Match) int {
+	count := 0
+	if len(match.Modes)+len(match.Topologies)+len(match.Ingress)+len(match.Egress)+len(match.Directions) > 0 {
+		count++
+	}
+	if len(match.SrcMAC)+len(match.DstMAC)+len(match.EtherTypes)+len(match.VLANs) > 0 {
+		count++
+	}
+	if len(match.IPVersions)+len(match.SrcCIDRs)+len(match.DstCIDRs)+len(match.Protocols) > 0 {
+		count++
+	}
+	if len(match.SrcPorts.Values)+len(match.SrcPorts.Ranges)+len(match.DstPorts.Values)+len(match.DstPorts.Ranges) > 0 {
+		count++
+	}
+	if len(match.DNSNames)+len(match.DNSTypes)+len(match.HTTPMethods)+len(match.HTTPStatuses)+len(match.HTTPHosts)+len(match.HTTPPaths)+len(match.HTTPHeaders) > 0 {
+		count++
+	}
+	if len(match.Payload) > 0 {
+		count++
+	}
+	return count
 }
 
 func mainAreaHeight(height, footerHeight int) int {
@@ -203,13 +377,8 @@ func mainAreaHeight(height, footerHeight int) int {
 }
 
 func (m Model) renderFooter(width int) string {
-	footer := spacedFooter(width, []string{
-		"left/right card",
-		"up/down scroll/history",
-		"ctrl+s save",
-		"ctrl+c quit",
-	})
-	return styleMuted.Render(footer)
+	footer := spacedFooter(width, footerHelp(m.workspace))
+	return styleFooterBar.Render(footer)
 }
 
 func spacedFooter(width int, items []string) string {
@@ -246,64 +415,7 @@ func spacedFooter(width int, items []string) string {
 }
 
 func (m Model) cardTitle(title string, card cardFocus) string {
-	if m.activeCard == card {
-		return title + " *"
-	}
 	return title
-}
-
-func (m Model) renderConfigLines(cfg profile.AdapterConfig) []string {
-	lines := []string{
-		"role: " + cfg.AdapterRole,
-		"name: " + cfg.Name,
-		"kind: " + cfg.Kind,
-		"current mac: " + emptyAs(cfg.CurrentMAC, "unknown"),
-		fmt.Sprintf("current mtu: %d", cfg.CurrentMTU),
-		"",
-	}
-	for _, field := range profile.Fields {
-		lines = append(lines, fmt.Sprintf("%-7s %s", field.Key+":", cfg.Value(field.Key)))
-	}
-	if len(cfg.Discovered) > 0 {
-		lines = append(lines, "", "discovered")
-		for _, item := range cfg.Discovered {
-			lines = append(lines, fmt.Sprintf("%s %s (%s)", item.Field, item.Value, item.Packet))
-		}
-	}
-	return lines
-}
-
-func (m Model) adapterStatus() string {
-	if m.loading {
-		return "loading"
-	}
-	if m.err != nil {
-		return "error"
-	}
-	return fmt.Sprintf("%d found", len(m.adapters))
-}
-
-func (m Model) activeStatus() string {
-	if m.activeAdapter == "" {
-		return "none"
-	}
-	return m.activeAdapter
-}
-
-func (m Model) captureStatus() string {
-	if m.natActive {
-		return "nat"
-	}
-	if m.bridge != nil {
-		return "bridge"
-	}
-	if m.listener == nil {
-		return "off"
-	}
-	if m.capMode == "" {
-		return "on"
-	}
-	return m.capMode
 }
 
 func box(title string, lines []string, width, height int, active bool) string {
@@ -314,33 +426,66 @@ func box(title string, lines []string, width, height int, active bool) string {
 		height = 4
 	}
 
-	innerWidth := width - 4
+	innerWidth := width - 2
 	innerHeight := height - 2
-	clean := make([]string, 0, innerHeight)
-	clean = append(clean, styleHeader.Render(title))
+	clean := make([]string, 0, height)
+	clean = append(clean, paneHeader(title, width, active))
 	for _, line := range lines {
-		if len(clean) == innerHeight {
+		if len(clean) == innerHeight+1 {
 			break
 		}
-		clean = append(clean, fit(styleTypedLine(line), innerWidth))
+		clean = append(clean, paneLine(line, innerWidth))
 	}
-	for len(clean) < innerHeight {
-		clean = append(clean, strings.Repeat(" ", innerWidth))
+	for len(clean) < innerHeight+1 {
+		clean = append(clean, paneLine("", innerWidth))
 	}
+	clean = append(clean, paneRule(width, active))
+	return strings.Join(clean, "\n")
+}
 
-	borderColor := colorPanel
+func paneHeader(title string, width int, active bool) string {
+	marker := "▏ "
+	style := stylePaneHeader
 	if active {
-		borderColor = colorAccent
+		marker = "▌ "
+		style = stylePaneHeaderActive
 	}
+	return style.Render(fit(marker+title, width))
+}
 
-	content := strings.Join(clean, "\n")
-	return lipgloss.NewStyle().
-		Width(width-2).
-		Height(innerHeight).
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Padding(0, 1).
-		Render(content)
+func paneLine(line string, innerWidth int) string {
+	selected := strings.HasPrefix(line, "> ")
+	content := " " + fit(styleTypedLine(line), innerWidth) + " "
+	if selected {
+		return renderStyleLayer(styleSelectedRow, content)
+	}
+	return renderStyleLayer(stylePaneBody, content)
+}
+
+func paneRule(width int, active bool) string {
+	if width <= 0 {
+		return ""
+	}
+	if !active {
+		return stylePaneRule.Render(strings.Repeat("─", width))
+	}
+	railWidth := min(4, width)
+	return stylePaneRuleActive.Render(strings.Repeat("━", railWidth)) +
+		stylePaneRule.Render(strings.Repeat("─", width-railWidth))
+}
+
+func fullscreenPanel(title string, rows []string, footer string, width, height, margin int) string {
+	flattened := make([]string, 0, len(rows))
+	for _, row := range rows {
+		flattened = append(flattened, strings.Split(row, "\n")...)
+	}
+	content := box(title, flattened, width, max(4, height-1), true)
+	view := lipgloss.JoinVertical(
+		lipgloss.Left,
+		content,
+		styleFooterBar.Render(fit(footer, width)),
+	)
+	return insetBlock(clampBlock(view, width, height), margin)
 }
 
 func fit(value string, width int) string {
@@ -354,7 +499,7 @@ func fit(value string, width int) string {
 	if width <= 1 {
 		return ""
 	}
-	out := truncateCells(value, width-1) + "."
+	out := truncateCells(value, width-1) + "…"
 	if strings.Contains(out, "\x1b[") {
 		out += "\x1b[0m"
 	}
@@ -382,7 +527,7 @@ func insetBlock(value string, margin int) string {
 	if margin <= 0 || value == "" {
 		return value
 	}
-	prefix := strings.Repeat(" ", margin)
+	prefix := styleCanvas.Render(strings.Repeat(" ", margin))
 	lines := strings.Split(value, "\n")
 	for i, line := range lines {
 		lines[i] = prefix + line
@@ -425,23 +570,13 @@ func truncateCells(value string, width int) string {
 	return out.String()
 }
 
-func wrapLines(lines []string, width int) []string {
-	if width <= 0 {
-		return nil
-	}
-	var out []string
-	for _, line := range lines {
-		out = append(out, wrapLine(line, width)...)
-	}
-	return out
-}
-
 type outputRow struct {
-	line  string
-	muted bool
+	line    string
+	muted   bool
+	literal bool
 }
 
-func wrapOutputLines(lines []string, muted []bool, width int) []outputRow {
+func wrapOutputLinesStyled(lines []string, muted, literal []bool, width int) []outputRow {
 	if width <= 0 {
 		return nil
 	}
@@ -451,8 +586,9 @@ func wrapOutputLines(lines []string, muted []bool, width int) []outputRow {
 		if i < len(muted) {
 			lineMuted = muted[i]
 		}
-		for _, wrapped := range wrapLine(line, width) {
-			out = append(out, outputRow{line: wrapped, muted: lineMuted})
+		lineLiteral := i < len(literal) && literal[i]
+		for _, wrapped := range wrapOutputLine(line, width) {
+			out = append(out, outputRow{line: wrapped, muted: lineMuted, literal: lineLiteral})
 		}
 	}
 	return out
@@ -461,7 +597,84 @@ func wrapOutputLines(lines []string, muted []bool, width int) []outputRow {
 func styledOutputRows(rows []outputRow) []string {
 	out := make([]string, len(rows))
 	for i, row := range rows {
-		out[i] = styleOutputLine(row.line, row.muted)
+		if row.literal {
+			out[i] = styleLiteralOutputLine(row.line)
+		} else {
+			out[i] = styleOutputLine(row.line, row.muted)
+		}
+	}
+	return out
+}
+
+func styleLiteralOutputLine(line string) string {
+	// Keep the semantic bypass even under a no-color renderer where a Lip Gloss
+	// style may otherwise emit no SGR sequence for paneLine to recognize.
+	return ansiFullReset + styleText.Render(line)
+}
+
+func wrapOutputLine(line string, width int) []string {
+	indent, ok := doctorContinuationIndent(line)
+	if !ok {
+		return wrapLine(line, width)
+	}
+	leading := line[:len(line)-len(strings.TrimLeft(line, " "))]
+	return wrapLineWithPrefixes(line, width, leading, indent)
+}
+
+func doctorContinuationIndent(line string) (string, bool) {
+	leading := len(line) - len(strings.TrimLeft(line, " "))
+	trimmed := line[leading:]
+	close := strings.Index(trimmed, "] ")
+	if !strings.HasPrefix(trimmed, "[") || close <= 1 {
+		return "", false
+	}
+	status := trimmed[1:close]
+	switch status {
+	case "PASS", "WARN", "FAIL", "SKIP":
+	default:
+		return "", false
+	}
+	return strings.Repeat(" ", leading+close+2), true
+}
+
+func wrapLineWithPrefixes(line string, width int, firstPrefix, continuationPrefix string) []string {
+	if width <= 0 || lipgloss.Width(continuationPrefix) >= width {
+		return wrapLine(line, width)
+	}
+	words := strings.Fields(line)
+	if len(words) == 0 {
+		return []string{firstPrefix}
+	}
+	prefix := firstPrefix
+	current := prefix
+	hasWord := false
+	var out []string
+	for _, word := range words {
+		separator := ""
+		if hasWord {
+			separator = " "
+		}
+		if lipgloss.Width(current+separator+word) <= width {
+			current += separator + word
+			hasWord = true
+			continue
+		}
+		if hasWord {
+			out = append(out, current)
+			prefix, current, hasWord = continuationPrefix, continuationPrefix, false
+		}
+		available := width - lipgloss.Width(prefix)
+		chunks := hardWrap(word, available)
+		for len(chunks) > 1 {
+			out = append(out, prefix+chunks[0])
+			chunks = chunks[1:]
+			prefix = continuationPrefix
+		}
+		current = prefix + chunks[0]
+		hasWord = true
+	}
+	if hasWord {
+		out = append(out, current)
 	}
 	return out
 }
@@ -540,13 +753,6 @@ func limitStrings(values []string, limit int) []string {
 	return out
 }
 
-func emptyAs(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
-	}
-	return value
-}
-
 func terminalWidth(width int) int {
 	if width <= 0 {
 		return 100
@@ -574,25 +780,6 @@ func horizontalMargin(width int) int {
 		return 0
 	}
 	return 1
-}
-
-func splitWidths(width int) (int, int) {
-	gap := 1
-	available := width - gap
-	if available < 2 {
-		return width, 0
-	}
-	left := (available * 2) / 3
-	right := available - left
-	if right < 22 && available >= 46 {
-		right = 22
-		left = available - right
-	}
-	if left < 24 && available >= 46 {
-		left = 24
-		right = available - left
-	}
-	return left, right
 }
 
 func clamp(value, minValue, maxValue int) int {

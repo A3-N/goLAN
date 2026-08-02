@@ -39,19 +39,20 @@ func NewDowngrader() *Downgrader {
 //   - EAPOL-Logoff (type 2) — session teardown
 //   - EAPOL-Key frames (type 3) — WPA/WPA2 4-way handshake (not MACsec)
 func (d *Downgrader) ShouldDrop(packet gopacket.Packet) bool {
+	if packet == nil {
+		return false
+	}
+	eapol, ok := packet.Layer(layers.LayerTypeEAPOL).(*layers.EAPOL)
+	if !ok || eapol == nil {
+		return false
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	if !d.enabled {
 		return false
 	}
-
-	eapolLayer := packet.Layer(layers.LayerTypeEAPOL)
-	if eapolLayer == nil {
-		return false
-	}
-
-	eapol, _ := eapolLayer.(*layers.EAPOL)
 
 	// MKA (type 5) carries MACsec key negotiation.
 	if eapol.Type == layers.EAPOLType(5) {
@@ -60,13 +61,6 @@ func (d *Downgrader) ShouldDrop(packet gopacket.Packet) bool {
 	}
 
 	return false
-}
-
-// RecordDrop increments the dropped MKA stat block manually.
-func (d *Downgrader) RecordDrop() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.droppedMKA++
 }
 
 // IsEnabled returns true if the downgrader is active.

@@ -1,0 +1,67 @@
+{
+  "revision": "policy-v1",
+  "order": [
+    "web-only-dhcp",
+    "web-only-dns-udp",
+    "web-only-dns-tcp",
+    "web-only-web",
+    "web-only-default"
+  ],
+  "compatibility": [
+    {
+      "rule_id": "web-only-dhcp",
+      "results": [
+        "listen=SHADOW/frame-filter",
+        "fast-bridge=LIVE/frame-filter",
+        "controlled-bridge=LIVE/frame-filter",
+        "takeover=LIVE/stateful-filter",
+        "edge-observe=SHADOW/frame-filter",
+        "edge-route=LIVE/stateful-filter"
+      ]
+    },
+    {
+      "rule_id": "web-only-dns-udp",
+      "results": [
+        "listen=SHADOW/frame-filter",
+        "fast-bridge=LIVE/frame-filter",
+        "controlled-bridge=LIVE/frame-filter",
+        "takeover=LIVE/stateful-filter",
+        "edge-observe=SHADOW/frame-filter",
+        "edge-route=LIVE/stateful-filter"
+      ]
+    },
+    {
+      "rule_id": "web-only-dns-tcp",
+      "results": [
+        "listen=SHADOW/frame-filter",
+        "fast-bridge=LIVE/frame-filter",
+        "controlled-bridge=LIVE/frame-filter",
+        "takeover=LIVE/stateful-filter",
+        "edge-observe=SHADOW/frame-filter",
+        "edge-route=LIVE/stateful-filter"
+      ]
+    },
+    {
+      "rule_id": "web-only-web",
+      "results": [
+        "listen=SHADOW/frame-filter",
+        "fast-bridge=LIVE/frame-filter",
+        "controlled-bridge=LIVE/frame-filter",
+        "takeover=LIVE/stateful-filter",
+        "edge-observe=SHADOW/frame-filter",
+        "edge-route=LIVE/stateful-filter"
+      ]
+    },
+    {
+      "rule_id": "web-only-default",
+      "results": [
+        "listen=SHADOW/frame-filter",
+        "fast-bridge=LIVE/frame-filter",
+        "controlled-bridge=LIVE/frame-filter",
+        "takeover=SHADOW/stateful-filter: rule is outside the takeover endpoint PF boundary",
+        "edge-observe=SHADOW/frame-filter",
+        "edge-route=LIVE/stateful-filter"
+      ]
+    }
+  ]
+}

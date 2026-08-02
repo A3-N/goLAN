@@ -6,9 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"golan/internal/inspect"
-	"golan/internal/profile"
 )
 
 func TestMapOverwritesHostsAndConversations(t *testing.T) {
@@ -35,7 +32,9 @@ func TestMapOverwritesHostsAndConversations(t *testing.T) {
 func TestWriteFileCreatesObsidianCanvas(t *testing.T) {
 	m := NewMap()
 	m.Apply(Observation{Kind: "host", IP: "192.168.1.10", MAC: "02:00:00:00:00:10", Tag: "host"})
-	path := filepath.Join(t.TempDir(), "session.canvas")
+	root := t.TempDir()
+	t.Setenv("GOLAN_CONFIG_DIR", root)
+	path := filepath.Join(root, "canvases", "session.canvas")
 
 	if err := m.WriteFile(path); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -54,105 +53,37 @@ func TestWriteFileCreatesObsidianCanvas(t *testing.T) {
 	if !strings.Contains(string(data), `"nodes"`) || !strings.Contains(string(data), `"edges"`) {
 		t.Fatalf("not json canvas: %s", data)
 	}
-}
-
-func TestFindingAddsSecretToDestinationService(t *testing.T) {
-	m := NewMap()
-	finding := inspect.Finding{
-		Protocol: "HTTP",
-		Kind:     "Basic",
-		User:     "alice",
-		Secret:   "secret123",
-		Src:      "192.168.1.10",
-		Sport:    49152,
-		Dst:      "192.168.1.20",
-		Dport:    80,
-	}
-
-	if !m.Apply(FromFinding(finding, "en11", "host")) {
-		t.Fatal("expected finding to update canvas")
-	}
-	server := m.Hosts["ip:192.168.1.20"]
-	if server == nil {
-		t.Fatalf("server missing: %+v", m.Hosts)
-	}
-	service := server.Services[serviceKey("HTTP", 80, "http Basic")]
-	if service == nil {
-		t.Fatalf("service missing: %+v", server.Services)
-	}
-	if !service.Secrets[finding.Display()] {
-		t.Fatalf("secret evidence missing: %+v", service.Secrets)
-	}
-	if len(m.Conversations) != 1 {
-		t.Fatalf("conversations = %+v", m.Conversations)
+	if info, err := os.Stat(path); err != nil {
+		t.Fatalf("Stat: %v", err)
+	} else if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("canvas mode = %o", got)
 	}
 }
 
-func TestConfiguredMACIsSelfAndKeepsLearnedIP(t *testing.T) {
-	m := NewMap()
-	cfg := profile.AdapterConfig{
-		AdapterRole: profile.AdapterRoleHost,
-		Name:        "en11",
-		CurrentMAC:  "6c:1f:f7:58:b5:fa",
-		IP:          "169.254.109.38",
-		MAC:         "a0:ad:9f:1c:3c:a5",
-		Discovered: []profile.DiscoveredValue{
-			{Field: "mac", Value: "a0:ad:9f:1c:3c:a5"},
-			{Field: "ip", Value: "169.254.109.38"},
-		},
-	}
+func TestWriteFileRejectsPathOutsideConfigRoot(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("GOLAN_CONFIG_DIR", root)
+	path := filepath.Join(t.TempDir(), "session.canvas")
 
-	if !m.ApplyAdapter(cfg) {
-		t.Fatal("expected configured adapter to update canvas")
+	if err := NewMap().WriteFile(path); err == nil {
+		t.Fatal("expected canvas path rejection")
 	}
-	host := m.Hosts["ip:169.254.109.38"]
-	if host == nil {
-		t.Fatalf("configured host missing: %+v", m.Hosts)
-	}
-	if !host.Tags["self"] || !host.Tags["host"] {
-		t.Fatalf("configured host tags = %+v", host.Tags)
-	}
-	if !host.MACs["a0:ad:9f:1c:3c:a5"] {
-		t.Fatalf("configured mac missing: %+v", host.MACs)
-	}
-	text := hostText(host)
-	if !strings.Contains(text, "configured+learned mac a0:ad:9f:1c:3c:a5") {
-		t.Fatalf("configured mac note missing: %s", text)
-	}
-	if !strings.Contains(text, "configured+learned ip 169.254.109.38 (internal-link-local)") {
-		t.Fatalf("configured ip note missing: %s", text)
-	}
-	for _, node := range m.JSONCanvas().Nodes {
-		if strings.Contains(node.Text, "169.254.109.38") && node.Color != colorSelf {
-			t.Fatalf("configured host node color = %s", node.Color)
+}
+
+func TestValidatePathRequiresCanvasDirectoryAndExtension(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("GOLAN_CONFIG_DIR", root)
+	for _, path := range []string{
+		filepath.Join(root, "session.canvas"),
+		filepath.Join(root, "canvases", "session.json"),
+		filepath.Join(root, "canvases"),
+	} {
+		if err := ValidatePath(path); err == nil {
+			t.Errorf("ValidatePath(%q) succeeded", path)
 		}
 	}
-}
-
-func TestLearnedIPJoinsConfiguredMACSelfHost(t *testing.T) {
-	m := NewMap()
-	cfg := profile.AdapterConfig{
-		AdapterRole: profile.AdapterRoleHost,
-		Name:        "en11",
-		IP:          "auto",
-		MAC:         "a0:ad:9f:1c:3c:a5",
-		Discovered: []profile.DiscoveredValue{
-			{Field: "arp_sender_ip", Value: "192.168.1.145"},
-		},
-	}
-
-	if !m.ApplyAdapter(cfg) {
-		t.Fatal("expected learned ip to update canvas")
-	}
-	host := m.Hosts["ip:192.168.1.145"]
-	if host == nil {
-		t.Fatalf("learned host missing: %+v", m.Hosts)
-	}
-	if !host.Tags["self"] || !host.MACs["a0:ad:9f:1c:3c:a5"] {
-		t.Fatalf("learned host did not inherit self identity: tags=%+v macs=%+v", host.Tags, host.MACs)
-	}
-	if !strings.Contains(hostText(host), "learned ip 192.168.1.145 (internal-private)") {
-		t.Fatalf("learned ip note missing: %s", hostText(host))
+	if err := ValidatePath(filepath.Join(root, "canvases", "session.canvas")); err != nil {
+		t.Fatalf("ValidatePath: %v", err)
 	}
 }
 

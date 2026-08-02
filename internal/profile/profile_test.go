@@ -1,10 +1,25 @@
 package profile
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"golan/internal/adapters"
 )
+
+func TestAdapterConfigDoesNotPersistLiveNetworkService(t *testing.T) {
+	config := FromAdapter(AdapterRoleHost, adapters.Adapter{
+		Name: "en7", HardwarePort: "USB Ethernet", NetworkService: "Renamed Lab Service",
+	})
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "Renamed Lab Service") || strings.Contains(string(encoded), "network_service") {
+		t.Fatalf("live network service leaked into persisted config: %s", encoded)
+	}
+}
 
 func TestProfileAddMaxAdapters(t *testing.T) {
 	var p Profile
@@ -35,6 +50,12 @@ func TestAdapterConfigSetValidatesValues(t *testing.T) {
 	if _, err := cfg.Set("mac", "not-a-mac"); err == nil {
 		t.Fatal("expected mac validation error")
 	}
+	if _, err := cfg.Set("mac", "01:00:5e:00:00:01"); err == nil {
+		t.Fatal("expected multicast mac validation error")
+	}
+	if _, err := cfg.Set("cidr", "64"); err == nil {
+		t.Fatal("expected IPv4 cidr validation error")
+	}
 	if _, err := cfg.Set("mac", "auto"); err != nil {
 		t.Fatalf("Set mac auto: %v", err)
 	}
@@ -46,6 +67,55 @@ func TestAdapterConfigSetValidatesValues(t *testing.T) {
 	}
 	if cfg.State != "down" {
 		t.Fatalf("State = %q", cfg.State)
+	}
+}
+
+func TestRehydrateUsesCurrentAdapterMetadata(t *testing.T) {
+	saved := Profile{Adapters: []AdapterConfig{{
+		AdapterRole:  AdapterRoleHost,
+		Name:         "en11",
+		HardwarePort: "tampered service",
+		CurrentMAC:   "02:00:00:00:00:99",
+		IP:           "192.0.2.10",
+		MAC:          "auto",
+	}}}
+	inventory := []adapters.Adapter{{
+		Name:           "en11",
+		HardwarePort:   "USB LAN",
+		NetworkService: "Renamed Lab Service",
+		MAC:            "02:00:00:00:00:11",
+		MTU:            1500,
+	}}
+
+	got, err := Rehydrate(saved, inventory)
+	if err != nil {
+		t.Fatalf("Rehydrate: %v", err)
+	}
+	if len(got.Adapters) != 1 {
+		t.Fatalf("Adapters = %+v", got.Adapters)
+	}
+	cfg := got.Adapters[0]
+	if cfg.HardwarePort != "USB LAN" || cfg.NetworkService != "Renamed Lab Service" || cfg.CurrentMAC != "02:00:00:00:00:11" || cfg.CurrentMTU != 1500 {
+		t.Fatalf("live metadata was not restored: %+v", cfg)
+	}
+	if cfg.IP != "192.0.2.10" {
+		t.Fatalf("editable IP = %q", cfg.IP)
+	}
+}
+
+func TestRehydrateRejectsMissingAndDuplicateAdapters(t *testing.T) {
+	inventory := []adapters.Adapter{{Name: "en11"}}
+	tests := []Profile{
+		{Adapters: []AdapterConfig{{AdapterRole: AdapterRoleHost, Name: "missing"}}},
+		{Adapters: []AdapterConfig{
+			{AdapterRole: AdapterRoleHost, Name: "en11"},
+			{AdapterRole: AdapterRoleSwitch, Name: "en11"},
+		}},
+	}
+	for _, saved := range tests {
+		if _, err := Rehydrate(saved, inventory); err == nil {
+			t.Errorf("Rehydrate(%+v) succeeded", saved)
+		}
 	}
 }
 
@@ -69,6 +139,26 @@ func TestExplicitRolesArePreserved(t *testing.T) {
 	}
 	if p.Adapters[0].AdapterRole != AdapterRoleHost || p.Adapters[0].Name != "en2" {
 		t.Fatalf("expected first free role to be filled: %+v", p.Adapters)
+	}
+}
+
+func TestSetAdapterRolePreservesSettingsAndEvidence(t *testing.T) {
+	var p Profile
+	if _, err := p.SetAdapterRole(adapters.Adapter{Name: "en0", MAC: "02:00:00:00:00:10"}, AdapterRoleHost); err != nil {
+		t.Fatalf("SetAdapterRole host: %v", err)
+	}
+	cfg, _ := p.ByName("en0")
+	if _, err := cfg.Set("ip", "192.0.2.10"); err != nil {
+		t.Fatalf("Set ip: %v", err)
+	}
+	cfg.AddDiscovery("gateway", "192.0.2.1", "ARP reply", "ARP")
+
+	got, err := p.SetAdapterRole(adapters.Adapter{Name: "en0", MAC: "02:00:00:00:00:11"}, AdapterRoleSwitch)
+	if err != nil {
+		t.Fatalf("SetAdapterRole switch: %v", err)
+	}
+	if got.AdapterRole != AdapterRoleSwitch || got.IP != "192.0.2.10" || got.CurrentMAC != "02:00:00:00:00:11" || len(got.Discovered) != 1 {
+		t.Fatalf("updated config = %+v", got)
 	}
 }
 

@@ -10,8 +10,10 @@ import (
 	"golan/internal/adapters"
 )
 
+// MaxAdapters is the host/switch pair supported by one inline profile.
 const MaxAdapters = 2
 
+// Inline adapter roles identify the host and switch sides.
 const (
 	AdapterRoleHost   = "host"
 	AdapterRoleSwitch = "switch"
@@ -24,10 +26,9 @@ type FieldDef struct {
 	Hint  string
 }
 
-// Fields is the ordered edit surface shown in the initialization TUI.
-var Fields = []FieldDef{
+var fieldDefinitions = [...]FieldDef{
 	{Key: "label", Label: "Label", Hint: "display name for this setup"},
-	{Key: "role", Label: "Role", Hint: "client, uplink, mirror, spare"},
+	{Key: "role", Label: "Role", Hint: "optional host-side or switch-side purpose"},
 	{Key: "ip", Label: "IP", Hint: "static IPv4 address or auto"},
 	{Key: "cidr", Label: "CIDR", Hint: "optional prefix length"},
 	{Key: "gateway", Label: "Gateway", Hint: "optional gateway address"},
@@ -39,15 +40,23 @@ var Fields = []FieldDef{
 	{Key: "notes", Label: "Notes", Hint: "free-form setup note"},
 }
 
+// Fields returns an immutable snapshot of the ordered TUI edit surface.
+func Fields() []FieldDef {
+	return append([]FieldDef(nil), fieldDefinitions[:]...)
+}
+
 // AdapterConfig holds the selected adapter and optional desired values.
 type AdapterConfig struct {
-	AdapterRole  string   `json:"role"`
-	Name         string   `json:"name"`
-	HardwarePort string   `json:"hardware_port"`
-	Kind         string   `json:"kind"`
-	CurrentMAC   string   `json:"current_mac"`
-	CurrentMTU   int      `json:"current_mtu"`
-	Addrs        []string `json:"addrs,omitempty"`
+	AdapterRole  string `json:"role"`
+	Name         string `json:"name"`
+	HardwarePort string `json:"hardware_port"`
+	// NetworkService is rehydrated from live macOS discovery and deliberately
+	// excluded from persisted configs because users can rename it at any time.
+	NetworkService string   `json:"-"`
+	Kind           string   `json:"kind"`
+	CurrentMAC     string   `json:"current_mac"`
+	CurrentMTU     int      `json:"current_mtu"`
+	Addrs          []string `json:"addrs,omitempty"`
 
 	Label   string `json:"label"`
 	Role    string `json:"option_role"`
@@ -101,31 +110,95 @@ type Profile struct {
 // FromAdapter creates the default staged config for a selected adapter.
 func FromAdapter(adapterRole string, adapter adapters.Adapter) AdapterConfig {
 	adapterRole = CanonicalAdapterRole(adapterRole)
-	return AdapterConfig{
-		AdapterRole:  adapterRole,
-		Name:         adapter.Name,
-		HardwarePort: adapter.HardwarePort,
-		Kind:         adapter.Kind,
-		CurrentMAC:   adapter.MAC,
-		CurrentMTU:   adapter.MTU,
-		Addrs:        append([]string(nil), adapter.Addrs...),
-		Label:        "auto",
-		Role:         "auto",
-		IP:           "auto",
-		CIDR:         "auto",
-		Gateway:      "auto",
-		DNS:          "auto",
-		MTU:          "auto",
-		MAC:          "auto",
-		DHCP:         "auto",
-		State:        "auto",
-		Notes:        "auto",
+	cfg := AdapterConfig{
+		AdapterRole:    adapterRole,
+		Name:           adapter.Name,
+		HardwarePort:   adapter.HardwarePort,
+		NetworkService: adapter.NetworkService,
+		Kind:           adapter.Kind,
+		CurrentMAC:     adapter.MAC,
+		CurrentMTU:     adapter.MTU,
+		Addrs:          append([]string(nil), adapter.Addrs...),
 	}
+	ensureEditableDefaults(&cfg)
+	return cfg
 }
 
 // Ready reports whether the staged setup has a valid adapter count.
 func (p Profile) Ready() bool {
 	return len(p.Adapters) >= 1 && len(p.Adapters) <= MaxAdapters
+}
+
+// Rehydrate validates a persisted profile and replaces stored platform
+// metadata with values from the current adapter inventory. Editable values and
+// passive evidence are preserved only after validation.
+func Rehydrate(saved Profile, inventory []adapters.Adapter) (Profile, error) {
+	if len(saved.Adapters) == 0 {
+		return Profile{}, fmt.Errorf("profile has no adapters")
+	}
+	if len(saved.Adapters) > MaxAdapters {
+		return Profile{}, fmt.Errorf("profile has %d adapters; maximum is %d", len(saved.Adapters), MaxAdapters)
+	}
+
+	liveByName := make(map[string]adapters.Adapter, len(inventory))
+	for _, adapter := range inventory {
+		name := strings.ToLower(strings.TrimSpace(adapter.Name))
+		if name != "" {
+			liveByName[name] = adapter
+		}
+	}
+
+	var out Profile
+	seenNames := make(map[string]bool, len(saved.Adapters))
+	seenRoles := make(map[string]bool, len(saved.Adapters))
+	for _, stored := range saved.Adapters {
+		name := strings.ToLower(strings.TrimSpace(stored.Name))
+		if name == "" {
+			return Profile{}, fmt.Errorf("profile adapter name is required")
+		}
+		if seenNames[name] {
+			return Profile{}, fmt.Errorf("profile adapter %q is duplicated", stored.Name)
+		}
+		seenNames[name] = true
+
+		adapterRole := CanonicalAdapterRole(stored.AdapterRole)
+		if !ValidAdapterRole(adapterRole) {
+			return Profile{}, fmt.Errorf("profile adapter %q has invalid role %q", stored.Name, stored.AdapterRole)
+		}
+		if seenRoles[adapterRole] {
+			return Profile{}, fmt.Errorf("profile role %q is duplicated", adapterRole)
+		}
+		seenRoles[adapterRole] = true
+
+		live, ok := liveByName[name]
+		if !ok {
+			return Profile{}, fmt.Errorf("profile adapter %q is not present", stored.Name)
+		}
+		cfg := FromAdapter(adapterRole, live)
+		if err := copyEditableValues(&cfg, stored); err != nil {
+			return Profile{}, fmt.Errorf("profile adapter %q: %w", stored.Name, err)
+		}
+		discovered, err := validateDiscoveries(stored.Discovered)
+		if err != nil {
+			return Profile{}, fmt.Errorf("profile adapter %q: %w", stored.Name, err)
+		}
+		cfg.Discovered = discovered
+		out.Adapters = append(out.Adapters, cfg)
+	}
+	out.sortRoles()
+
+	bridgeCfg := AdapterConfig{}
+	ensureBridgeAdapterDefaults(&bridgeCfg)
+	if err := copyEditableValues(&bridgeCfg, saved.Bridge.Config); err != nil {
+		return Profile{}, fmt.Errorf("bridge config: %w", err)
+	}
+	out.Bridge.Config = bridgeCfg
+	observations, err := validateBridgeObservations(saved.Bridge.Observations)
+	if err != nil {
+		return Profile{}, err
+	}
+	out.Bridge.Observations = observations
+	return out, nil
 }
 
 // Role returns a mutable selected adapter config by adapter role.
@@ -182,6 +255,22 @@ func (p *Profile) SetAdapterRole(adapter adapters.Adapter, adapterRole string) (
 		return AdapterConfig{}, fmt.Errorf("role must be host or switch")
 	}
 
+	var previous *AdapterConfig
+	for _, current := range p.Adapters {
+		if strings.EqualFold(current.Name, adapter.Name) {
+			copy := current
+			previous = &copy
+			break
+		}
+	}
+	cfg := FromAdapter(adapterRole, adapter)
+	if previous != nil {
+		if err := copyEditableValues(&cfg, *previous); err != nil {
+			return AdapterConfig{}, fmt.Errorf("preserve adapter settings: %w", err)
+		}
+		cfg.Discovered = append([]DiscoveredValue(nil), previous.Discovered...)
+	}
+
 	for i := 0; i < len(p.Adapters); i++ {
 		if strings.EqualFold(p.Adapters[i].Name, adapter.Name) || p.Adapters[i].AdapterRole == adapterRole {
 			p.Adapters = append(p.Adapters[:i], p.Adapters[i+1:]...)
@@ -189,7 +278,6 @@ func (p *Profile) SetAdapterRole(adapter adapters.Adapter, adapterRole string) (
 		}
 	}
 
-	cfg := FromAdapter(adapterRole, adapter)
 	p.Adapters = append(p.Adapters, cfg)
 	p.sortRoles()
 	return cfg, nil
@@ -292,6 +380,7 @@ func (p *Profile) sortRoles() {
 	}
 }
 
+// CanonicalAdapterRole normalizes a user-facing inline adapter role.
 func CanonicalAdapterRole(adapterRole string) string {
 	switch strings.ToLower(strings.TrimSpace(adapterRole)) {
 	case "1", "host":
@@ -303,6 +392,7 @@ func CanonicalAdapterRole(adapterRole string) string {
 	}
 }
 
+// ValidAdapterRole reports whether adapterRole identifies an inline side.
 func ValidAdapterRole(adapterRole string) bool {
 	switch CanonicalAdapterRole(adapterRole) {
 	case AdapterRoleHost, AdapterRoleSwitch:
@@ -312,6 +402,7 @@ func ValidAdapterRole(adapterRole string) bool {
 	}
 }
 
+// AdapterRoles returns the valid roles in stable host/switch order.
 func AdapterRoles() []string {
 	return []string{AdapterRoleHost, AdapterRoleSwitch}
 }
@@ -326,9 +417,25 @@ func ensureBridgeAdapterDefaults(cfg *AdapterConfig) {
 	if strings.TrimSpace(cfg.Kind) == "" {
 		cfg.Kind = "bridge"
 	}
-	for _, field := range Fields {
-		if strings.TrimSpace(cfg.Value(field.Key)) == "" {
-			_, _ = cfg.Set(field.Key, "auto")
+	ensureEditableDefaults(cfg)
+}
+
+func ensureEditableDefaults(cfg *AdapterConfig) {
+	for _, value := range []*string{
+		&cfg.Label,
+		&cfg.Role,
+		&cfg.IP,
+		&cfg.CIDR,
+		&cfg.Gateway,
+		&cfg.DNS,
+		&cfg.MTU,
+		&cfg.MAC,
+		&cfg.DHCP,
+		&cfg.State,
+		&cfg.Notes,
+	} {
+		if strings.TrimSpace(*value) == "" {
+			*value = "auto"
 		}
 	}
 }
@@ -536,13 +643,13 @@ func validate(key, value string) error {
 	case "label", "role", "notes":
 		return nil
 	case "ip", "gateway":
-		if net.ParseIP(value) == nil {
-			return fmt.Errorf("%s must be an IP address", key)
+		if net.ParseIP(value).To4() == nil {
+			return fmt.Errorf("%s must be an IPv4 address", key)
 		}
 	case "cidr":
 		n, err := strconv.Atoi(value)
-		if err != nil || n < 0 || n > 128 {
-			return fmt.Errorf("cidr must be between 0 and 128")
+		if err != nil || n < 0 || n > 32 {
+			return fmt.Errorf("cidr must be between 0 and 32")
 		}
 	case "dns":
 		for _, entry := range strings.Split(value, ",") {
@@ -556,8 +663,9 @@ func validate(key, value string) error {
 			return fmt.Errorf("mtu must be between 68 and 9216")
 		}
 	case "mac":
-		if _, err := net.ParseMAC(value); err != nil {
-			return fmt.Errorf("mac must be a hardware address")
+		mac, err := net.ParseMAC(value)
+		if err != nil || !validUnicastMAC(mac) {
+			return fmt.Errorf("mac must be a usable 48-bit unicast address")
 		}
 	case "dhcp":
 		switch strings.ToLower(value) {
@@ -577,9 +685,71 @@ func validate(key, value string) error {
 	return nil
 }
 
+func copyEditableValues(dst *AdapterConfig, src AdapterConfig) error {
+	for _, field := range fieldDefinitions {
+		value := strings.TrimSpace(src.Value(field.Key))
+		if value == "" {
+			continue
+		}
+		if _, err := dst.Set(field.Key, value); err != nil {
+			return fmt.Errorf("%s: %w", field.Key, err)
+		}
+	}
+	return nil
+}
+
+func validateDiscoveries(values []DiscoveredValue) ([]DiscoveredValue, error) {
+	out := make([]DiscoveredValue, 0, len(values))
+	for _, value := range values {
+		value.Field = canonicalKey(value.Field)
+		value.Value = strings.TrimSpace(value.Value)
+		if !knownField(value.Field) || value.Value == "" {
+			return nil, fmt.Errorf("invalid discovery field %q", value.Field)
+		}
+		if err := validate(value.Field, value.Value); err != nil {
+			return nil, fmt.Errorf("discovery %s: %w", value.Field, err)
+		}
+		if value.Count < 1 {
+			value.Count = 1
+		}
+		out = append(out, value)
+	}
+	return out, nil
+}
+
+func validateBridgeObservations(values []BridgeObservation) ([]BridgeObservation, error) {
+	out := make([]BridgeObservation, 0, len(values))
+	for _, value := range values {
+		value.Adapter = strings.TrimSpace(value.Adapter)
+		value.Role = strings.TrimSpace(value.Role)
+		value.Field = canonicalKey(value.Field)
+		value.Value = strings.TrimSpace(value.Value)
+		if value.Adapter == "" || value.Field == "" || value.Value == "" {
+			return nil, fmt.Errorf("bridge observation is incomplete")
+		}
+		if value.Count < 1 {
+			value.Count = 1
+		}
+		out = append(out, value)
+	}
+	return out, nil
+}
+
+func validUnicastMAC(mac net.HardwareAddr) bool {
+	if len(mac) != 6 || mac[0]&1 != 0 {
+		return false
+	}
+	for _, octet := range mac {
+		if octet != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func knownField(key string) bool {
 	key = canonicalKey(key)
-	for _, field := range Fields {
+	for _, field := range fieldDefinitions {
 		if field.Key == key {
 			return true
 		}

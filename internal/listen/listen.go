@@ -2,6 +2,7 @@ package listen
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -10,19 +11,38 @@ import (
 	"sync"
 	"time"
 
+	"golan/internal/dataplane"
+	"golan/internal/inspect"
+	"golan/internal/paths"
+	"golan/internal/policy"
+	"golan/internal/traffic"
+
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/pcapgo"
-	"golan/internal/canvas"
-	"golan/internal/inspect"
-	"golan/internal/paths"
 )
 
 const (
 	ethernetTypeEAPOL  = layers.EthernetType(0x888e)
 	ethernetTypeMACsec = layers.EthernetType(0x88e5)
 	arpRequestOp       = 1
+)
+
+// EventKind identifies listener lifecycle and packet-analysis events.
+type EventKind string
+
+// Listener event kinds identify lifecycle, capture, discovery, and analysis output.
+const (
+	KindLog       EventKind = "log"
+	KindPcap      EventKind = "pcap"
+	KindError     EventKind = "error"
+	KindStopped   EventKind = "stopped"
+	KindTraffic   EventKind = "traffic"
+	KindEvidence  EventKind = "evidence"
+	KindDecision  EventKind = "decision"
+	KindSignal    EventKind = "signal"
+	KindDiscovery EventKind = "discovery"
 )
 
 // Target describes one staged adapter to passively capture.
@@ -35,25 +55,33 @@ type Target struct {
 
 // Event is emitted for listener lifecycle and passive discoveries.
 type Event struct {
-	Kind     string
-	Message  string
-	Adapter  string
-	Role     string
-	Field    string
-	Value    string
-	Evidence string
-	Packet   string
-	Path     string
-	Err      error
+	Kind      EventKind
+	Message   string
+	Adapter   string
+	Role      string
+	Field     string
+	Value     string
+	Evidence  string
+	Packet    string
+	DeviceMAC string
+	Path      string
+	Err       error
+	Frame     traffic.Frame
+	Flow      traffic.Flow
+	Mode      dataplane.Mode
+	Decision  policy.DecisionSummary
 }
 
 // Session owns active capture goroutines.
 type Session struct {
 	Dir    string
 	Events <-chan Event
+	Engine *policy.Engine
 
-	cancel context.CancelFunc
-	done   chan struct{}
+	cancel    context.CancelFunc
+	done      chan struct{}
+	resultMu  sync.Mutex
+	resultErr error
 }
 
 // Stop ends all active captures.
@@ -64,31 +92,63 @@ func (s *Session) Stop() error {
 	if s == nil || s.done == nil {
 		return nil
 	}
+	timer := time.NewTimer(8 * time.Second)
+	defer timer.Stop()
 	select {
 	case <-s.done:
-		return nil
-	case <-time.After(8 * time.Second):
+		s.resultMu.Lock()
+		defer s.resultMu.Unlock()
+		return s.resultErr
+	case <-timer.C:
 		return fmt.Errorf("listen stop timed out")
 	}
 }
 
-// Start begins passive capture for each target.
-func Start(targets []Target) (*Session, error) {
-	if len(targets) == 0 {
-		return nil, fmt.Errorf("no adapter")
+// Stopped reports whether every capture goroutine and artifact finalizer has
+// completed.
+func (s *Session) Stopped() bool {
+	if s == nil || s.done == nil {
+		return true
+	}
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// StartWithPolicy begins passive capture through the shared normalized flow
+// and policy engine. Enforcement actions are always evaluated in SHADOW for
+// Listen and Edge Observe modes.
+func StartWithPolicy(targets []Target, mode dataplane.Mode, revision string, rules []policy.Rule) (*Session, error) {
+	validated, err := validateTargets(targets)
+	if err != nil {
+		return nil, err
+	}
+	targets = validated
+	if mode != dataplane.ModeListen && mode != dataplane.ModeEdgeObserve {
+		return nil, fmt.Errorf("passive capture mode must be listen or edge-observe")
+	}
+	engine := policy.NewEngine(8192)
+	if len(rules) > 0 {
+		if err := engine.Policies.Activate(revision, rules); err != nil {
+			return nil, fmt.Errorf("compile passive policy: %w", err)
+		}
 	}
 
 	dir, err := pcapDir()
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create pcap dir: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	events := make(chan Event, 128)
 	done := make(chan struct{})
+	session := &Session{Dir: dir, Events: events, Engine: engine, cancel: cancel, done: done}
 	var wg sync.WaitGroup
 
 	for _, target := range targets {
@@ -96,7 +156,9 @@ func Start(targets []Target) (*Session, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runCapture(ctx, target, dir, events)
+			if err := runCapture(ctx, target, dir, events, engine, dataplane.ForMode(mode)); err != nil {
+				session.recordResult(err)
+			}
 		}()
 	}
 
@@ -104,103 +166,234 @@ func Start(targets []Target) (*Session, error) {
 		defer close(done)
 		wg.Wait()
 		if err := paths.FinalizeTree(dir); err != nil {
-			sendEvent(context.Background(), events, Event{Kind: "error", Err: fmt.Errorf("finalize pcaps: %w", err)})
+			err = fmt.Errorf("finalize pcaps: %w", err)
+			session.recordResult(err)
+			finalCtx, cancelFinal := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			if sendErr := sendEvent(finalCtx, events, Event{Kind: KindError, Err: err}); sendErr != nil {
+				session.recordResult(sendErr)
+			}
+			cancelFinal()
 		}
 		close(events)
 	}()
 
-	return &Session{Dir: dir, Events: events, cancel: cancel, done: done}, nil
+	return session, nil
 }
 
-func runCapture(ctx context.Context, target Target, dir string, events chan<- Event) {
-	sendEvent(ctx, events, Event{Kind: "log", Adapter: target.Name, Role: target.Role, Message: "listen init " + target.Role + "/" + target.Name})
-	sendEvent(ctx, events, Event{Kind: "log", Adapter: target.Name, Role: target.Role, Message: "listen capture: host side only"})
+// SetPolicy atomically changes the passive session's shadow-evaluation
+// revision. A compile error leaves the prior revision active.
+func (s *Session) SetPolicy(revision string, rules []policy.Rule) error {
+	if s == nil || s.Engine == nil {
+		return fmt.Errorf("listen policy engine is unavailable")
+	}
+	return s.Engine.Policies.Activate(revision, rules)
+}
+
+func runCapture(ctx context.Context, target Target, dir string, events chan<- Event, engine *policy.Engine, capabilities dataplane.Capabilities) (resultErr error) {
+	if err := sendEvent(ctx, events, Event{Kind: KindLog, Adapter: target.Name, Role: target.Role, Message: "listen init " + target.Role + "/" + target.Name}); err != nil {
+		return err
+	}
+	if err := sendEvent(ctx, events, Event{Kind: KindLog, Adapter: target.Name, Role: target.Role, Message: "listen capture: host side only"}); err != nil {
+		return err
+	}
 	handle, err := pcap.OpenLive(target.Name, 65535, true, pcap.BlockForever)
 	if err != nil {
-		sendEvent(ctx, events, Event{Kind: "error", Adapter: target.Name, Role: target.Role, Err: err})
-		return
+		err = fmt.Errorf("open capture on %s: %w", target.Name, err)
+		return errors.Join(err, sendEvent(ctx, events, Event{Kind: KindError, Adapter: target.Name, Role: target.Role, Err: err}))
 	}
 	defer handle.Close()
 
-	path := filepath.Join(dir, fmt.Sprintf("%s-%s.pcap", safeName(target.Role), safeName(target.Name)))
-	file, err := os.Create(path)
+	path := filepath.Join(dir, fmt.Sprintf("%s-%s.pcap", paths.SafeFilenamePart(target.Role), paths.SafeFilenamePart(target.Name)))
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		sendEvent(ctx, events, Event{Kind: "error", Adapter: target.Name, Role: target.Role, Err: err})
-		return
+		err = fmt.Errorf("create pcap %s: %w", path, err)
+		return errors.Join(err, sendEvent(ctx, events, Event{Kind: KindError, Adapter: target.Name, Role: target.Role, Err: err}))
 	}
-	defer file.Close()
+	captureReady := false
+	defer func() {
+		if syncErr := file.Sync(); syncErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("sync pcap %s: %w", path, syncErr))
+		}
+		if closeErr := file.Close(); closeErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("close pcap %s: %w", path, closeErr))
+		}
+		if !captureReady {
+			if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				resultErr = errors.Join(resultErr, fmt.Errorf("remove incomplete pcap %s: %w", path, removeErr))
+			}
+		}
+		finalCtx, cancelFinal := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		if sendErr := sendEvent(finalCtx, events, Event{Kind: KindStopped, Adapter: target.Name, Role: target.Role, Path: path, Err: resultErr}); sendErr != nil {
+			resultErr = errors.Join(resultErr, sendErr)
+		}
+		cancelFinal()
+	}()
 
 	writer := pcapgo.NewWriter(file)
 	if err := writer.WriteFileHeader(65535, handle.LinkType()); err != nil {
-		sendEvent(ctx, events, Event{Kind: "error", Adapter: target.Name, Role: target.Role, Err: err})
-		return
+		err = fmt.Errorf("write pcap header %s: %w", path, err)
+		return errors.Join(err, sendEvent(ctx, events, Event{Kind: KindError, Adapter: target.Name, Role: target.Role, Err: err}))
+	}
+	journalPath := strings.TrimSuffix(path, filepath.Ext(path)) + "." + string(capabilities.Mode()) + ".decisions.jsonl"
+	journal, err := policy.OpenJournal(journalPath)
+	if err != nil {
+		err = fmt.Errorf("open passive decision journal for %s: %w", target.Name, err)
+		return errors.Join(err, sendEvent(ctx, events, Event{Kind: KindError, Adapter: target.Name, Role: target.Role, Err: err, Path: path}))
+	}
+	defer func() {
+		if closeErr := journal.Close(); closeErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("close passive decision journal %s: %w", journalPath, closeErr))
+		}
+	}()
+	captureReady = true
+
+	if err := sendEvent(ctx, events, Event{Kind: KindPcap, Adapter: target.Name, Role: target.Role, Path: path}); err != nil {
+		return err
+	}
+	if err := sendEvent(ctx, events, Event{Kind: KindLog, Adapter: target.Name, Role: target.Role, Message: "listen decision journal: " + journalPath}); err != nil {
+		return err
+	}
+	if err := sendEvent(ctx, events, Event{Kind: KindLog, Adapter: target.Name, Role: target.Role, Message: "awaiting host mac on " + target.Name}); err != nil {
+		return err
 	}
 
-	sendEvent(ctx, events, Event{Kind: "pcap", Adapter: target.Name, Role: target.Role, Path: path})
-	sendEvent(ctx, events, Event{Kind: "log", Adapter: target.Name, Role: target.Role, Message: "awaiting host mac on " + target.Name})
-
-	done := make(chan struct{})
+	stopWatcher := make(chan struct{})
+	watcherDone := make(chan struct{})
 	go func() {
+		defer close(watcherDone)
 		select {
 		case <-ctx.Done():
 			handle.Close()
-		case <-done:
+		case <-stopWatcher:
 		}
 	}()
-	defer close(done)
+	defer func() {
+		close(stopWatcher)
+		<-watcherDone
+	}()
 
-	ignoreMAC, _ := net.ParseMAC(target.LocalMAC)
+	var ignoreMAC net.HardwareAddr
+	if target.LocalMAC != "" {
+		ignoreMAC, err = net.ParseMAC(target.LocalMAC)
+		if err != nil {
+			return fmt.Errorf("parse local MAC for %s: %w", target.Name, err)
+		}
+	}
 	inspector := inspect.New()
 	source := gopacket.NewPacketSource(handle, handle.LinkType())
 	var lockedMAC net.HardwareAddr
-	seenTraffic := make(map[string]bool)
 	packetCount := 0
 	for {
-		select {
-		case <-ctx.Done():
-			sendEvent(context.Background(), events, Event{Kind: "stopped", Adapter: target.Name, Role: target.Role, Path: path})
-			return
-		case packet, ok := <-source.Packets():
-			if !ok || packet == nil {
-				sendEvent(context.Background(), events, Event{Kind: "stopped", Adapter: target.Name, Role: target.Role, Path: path})
-				return
+		packet, err := source.NextPacket()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
 			}
-			if err := writer.WritePacket(packet.Metadata().CaptureInfo, packet.Data()); err != nil {
-				sendEvent(ctx, events, Event{Kind: "error", Adapter: target.Name, Role: target.Role, Err: err, Path: path})
-				return
-			}
-			packetCount++
-			if message := trafficLogMessage(target, packet, packetCount, seenTraffic); message != "" {
-				sendEvent(ctx, events, Event{Kind: "traffic", Adapter: target.Name, Role: target.Role, Message: message})
-			}
-			for _, finding := range inspector.AnalyzePacket(packet) {
-				sendEvent(ctx, events, Event{Kind: "finding", Adapter: target.Name, Role: target.Role, Message: finding.Encode()})
-			}
-			for _, observation := range canvas.ObservePacket(packet, target.Name, target.Role) {
-				sendEvent(ctx, events, Event{Kind: canvas.EventKind, Adapter: target.Name, Role: target.Role, Message: observation.Encode()})
-			}
-			if lockedMAC == nil {
-				if mac, source := targetSourceMAC(packet, ignoreMAC); mac != nil {
-					lockedMAC = append(net.HardwareAddr(nil), mac...)
-					sendEvent(ctx, events, Event{Kind: "log", Adapter: target.Name, Role: target.Role, Message: fmt.Sprintf("host mac locked %s via %s", lockedMAC, source)})
+			err = fmt.Errorf("read capture on %s: %w", target.Name, err)
+			return errors.Join(err, sendEvent(ctx, events, Event{Kind: KindError, Adapter: target.Name, Role: target.Role, Err: err, Path: path}))
+		}
+		if packet == nil {
+			continue
+		}
+		if err := writer.WritePacket(packet.Metadata().CaptureInfo, packet.Data()); err != nil {
+			err = fmt.Errorf("write pcap for %s: %w", target.Name, err)
+			return errors.Join(err, sendEvent(ctx, events, Event{Kind: KindError, Adapter: target.Name, Role: target.Role, Err: err, Path: path}))
+		}
+		if lockedMAC == nil {
+			if mac, source := targetSourceMAC(packet, ignoreMAC); mac != nil {
+				lockedMAC = append(net.HardwareAddr(nil), mac...)
+				if err := sendEvent(ctx, events, Event{Kind: KindLog, Adapter: target.Name, Role: target.Role, Message: fmt.Sprintf("host mac locked %s via %s", lockedMAC, source)}); err != nil {
+					return err
 				}
 			}
-			for _, discovery := range AnalyzePacket(packet, ignoreMAC) {
-				discovery.Kind = "discovery"
-				discovery.Adapter = target.Name
-				discovery.Role = target.Role
-				sendEvent(ctx, events, discovery)
+		}
+		frame := normalizeObservedPacket(target, packet, lockedMAC, path, capabilities.Mode())
+		ordinal := uint64(packetCount + 1)
+		result, err := processObservedFrame(engine, capabilities, frame, ordinal, journal)
+		if err != nil {
+			return errors.Join(fmt.Errorf("evaluate and journal passive policy on %s: %w", target.Name, err), sendEvent(ctx, events, Event{Kind: KindError, Adapter: target.Name, Role: target.Role, Err: err, Path: path}))
+		}
+		if result.Decision.RuleRevision != "" {
+			_ = sendEvent(ctx, events, Event{
+				Kind: KindDecision, Adapter: target.Name, Role: target.Role,
+				Packet:   string(result.Original.ID),
+				Message:  fmt.Sprintf("[%s] %s", result.Decision.Status, result.Decision.Explanation),
+				Decision: result.Decision.Summary(),
+			})
+		}
+		packetCount++
+		if message := trafficLogMessage(target, packet, packetCount); message != "" {
+			_ = sendEvent(ctx, events, Event{
+				Kind: KindTraffic, Adapter: target.Name, Role: target.Role,
+				Packet: string(result.Original.ID), Message: message,
+			})
+		}
+		_ = sendEvent(ctx, events, Event{
+			Kind: KindEvidence, Frame: result.Original, Flow: result.Flow,
+			Mode: capabilities.Mode(), Decision: result.Decision.Summary(),
+		})
+		for _, signal := range inspector.AnalyzePacket(packet) {
+			if err := sendEvent(ctx, events, Event{Kind: KindSignal, Adapter: target.Name, Role: target.Role, Message: signal.Encode()}); err != nil {
+				return err
+			}
+		}
+		for _, discovery := range AnalyzePacket(packet, ignoreMAC) {
+			discovery.Kind = KindDiscovery
+			discovery.Adapter = target.Name
+			discovery.Role = target.Role
+			if err := sendEvent(ctx, events, discovery); err != nil {
+				return err
 			}
 		}
 	}
+}
+
+func processObservedFrame(engine *policy.Engine, capabilities dataplane.Capabilities, frame traffic.Frame, ordinal uint64, journal *policy.Journal) (policy.Result, error) {
+	if engine == nil {
+		return policy.Result{}, fmt.Errorf("passive policy engine is unavailable")
+	}
+	if ordinal == 0 {
+		return policy.Result{}, fmt.Errorf("passive capture ordinal is required")
+	}
+	result := engine.Evaluate(frame, capabilities)
+	result.Decision.OriginalCaptureOrdinal = ordinal
+	if err := journal.Append(result.Decision); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func normalizeObservedPacket(target Target, packet gopacket.Packet, hostMAC net.HardwareAddr, source string, mode dataplane.Mode) traffic.Frame {
+	metadata := packet.Metadata().CaptureInfo
+	side := traffic.SideHost
+	if mode == dataplane.ModeEdgeObserve {
+		side = traffic.SideDownstream
+	}
+	direction := traffic.DirectionUnknown
+	if ethernet, ok := packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet); ok && len(hostMAC) == 6 {
+		switch {
+		case macEqual(ethernet.SrcMAC, hostMAC):
+			direction = traffic.DirectionOutbound
+		case macEqual(ethernet.DstMAC, hostMAC):
+			direction = traffic.DirectionInbound
+		}
+	}
+	return traffic.Normalize(packet.Data(), traffic.CaptureMetadata{
+		Timestamp: metadata.Timestamp, CaptureLength: metadata.CaptureLength,
+		OriginalLength: metadata.Length, InterfaceIndex: metadata.InterfaceIndex,
+		LinkType: int(layers.LinkTypeEthernet), Source: source,
+	}, target.Name, side, direction)
 }
 
 // AnalyzePacket extracts assignable values from Layer 2/3 evidence.
 func AnalyzePacket(packet gopacket.Packet, ignoreMAC net.HardwareAddr) []Event {
+	if packet == nil {
+		return nil
+	}
 	var events []Event
 	var eth *layers.Ethernet
-	if layer := packet.Layer(layers.LayerTypeEthernet); layer != nil {
-		eth, _ = layer.(*layers.Ethernet)
+	if layer, ok := packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet); ok {
+		eth = layer
 	}
 
 	if eth != nil {
@@ -219,8 +412,7 @@ func AnalyzePacket(packet gopacket.Packet, ignoreMAC net.HardwareAddr) []Event {
 		}
 	}
 
-	if layer := packet.Layer(layers.LayerTypeDot1Q); layer != nil {
-		dot1q, _ := layer.(*layers.Dot1Q)
+	if dot1q, ok := packet.Layer(layers.LayerTypeDot1Q).(*layers.Dot1Q); ok {
 		if dot1q.VLANIdentifier != 0 {
 			events = append(events, discovery("vlan", fmt.Sprintf("%d", dot1q.VLANIdentifier), "802.1Q vlan id", "VLAN-tagged traffic"))
 		}
@@ -229,8 +421,7 @@ func AnalyzePacket(packet gopacket.Packet, ignoreMAC net.HardwareAddr) []Event {
 		}
 	}
 
-	if layer := packet.Layer(layers.LayerTypeARP); layer != nil {
-		arp, _ := layer.(*layers.ARP)
+	if arp, ok := packet.Layer(layers.LayerTypeARP).(*layers.ARP); ok {
 		events = append(events, discovery("arp_op", arpOperationName(arp.Operation), "operation", "ARP"))
 		srcMAC := net.HardwareAddr(arp.SourceHwAddress)
 		if validSourceMAC(srcMAC, ignoreMAC) {
@@ -261,8 +452,7 @@ func AnalyzePacket(packet gopacket.Packet, ignoreMAC net.HardwareAddr) []Event {
 		}
 	}
 
-	if layer := packet.Layer(layers.LayerTypeIPv4); layer != nil {
-		ipv4, _ := layer.(*layers.IPv4)
+	if ipv4, ok := packet.Layer(layers.LayerTypeIPv4).(*layers.IPv4); ok {
 		if observableIPv4(ipv4.SrcIP) {
 			events = append(events, discovery("ipv4_src", ipv4.SrcIP.String(), "source ip", "IPv4"))
 			if usableIPv4(ipv4.SrcIP) {
@@ -277,8 +467,7 @@ func AnalyzePacket(packet gopacket.Packet, ignoreMAC net.HardwareAddr) []Event {
 		}
 	}
 
-	if layer := packet.Layer(layers.LayerTypeIPv6); layer != nil {
-		ipv6, _ := layer.(*layers.IPv6)
+	if ipv6, ok := packet.Layer(layers.LayerTypeIPv6).(*layers.IPv6); ok {
 		if observableIP(ipv6.SrcIP) {
 			events = append(events, discovery("ipv6_src", ipv6.SrcIP.String(), "source ip", "IPv6"))
 		}
@@ -290,8 +479,7 @@ func AnalyzePacket(packet gopacket.Packet, ignoreMAC net.HardwareAddr) []Event {
 		}
 	}
 
-	if layer := packet.Layer(layers.LayerTypeDHCPv4); layer != nil {
-		dhcp, _ := layer.(*layers.DHCPv4)
+	if dhcp, ok := packet.Layer(layers.LayerTypeDHCPv4).(*layers.DHCPv4); ok {
 		if validSourceMAC(dhcp.ClientHWAddr, ignoreMAC) {
 			events = append(events, discovery("mac", dhcp.ClientHWAddr.String(), "dhcp client mac", "DHCP"))
 		}
@@ -328,8 +516,7 @@ func AnalyzePacket(packet gopacket.Packet, ignoreMAC net.HardwareAddr) []Event {
 		}
 	}
 
-	if layer := packet.Layer(layers.LayerTypeEAPOL); layer != nil {
-		eapol, _ := layer.(*layers.EAPOL)
+	if eapol, ok := packet.Layer(layers.LayerTypeEAPOL).(*layers.EAPOL); ok {
 		events = append(events, discovery("eapol", eapol.Type.String(), "type", "EAPOL / 802.1X"))
 		events = append(events, discovery("eapol_type", fmt.Sprintf("%d", eapol.Type), "type number", "EAPOL / 802.1X"))
 		events = append(events, discovery("eapol_version", fmt.Sprintf("%d", eapol.Version), "version", "EAPOL / 802.1X"))
@@ -338,15 +525,30 @@ func AnalyzePacket(packet gopacket.Packet, ignoreMAC net.HardwareAddr) []Event {
 		events = append(events, discovery("macsec", "0x88e5", "ether type", "MACsec"))
 	}
 
-	if layer := packet.Layer(layers.LayerTypeEAP); layer != nil {
-		eap, _ := layer.(*layers.EAP)
+	if eap, ok := packet.Layer(layers.LayerTypeEAP).(*layers.EAP); ok {
 		events = append(events, discovery("eap_code", eapCodeName(eap.Code), "code", "EAPOL / 802.1X"))
 		if eap.Type != layers.EAPTypeNone {
 			events = append(events, discovery("eap_type", eapTypeName(eap.Type), "method", "EAPOL / 802.1X"))
 		}
 	}
 
-	return dedupeEvents(events)
+	deviceMAC := ""
+	if eth != nil && validUnicastMAC(eth.SrcMAC) {
+		deviceMAC = eth.SrcMAC.String()
+	}
+	if arp, ok := packet.Layer(layers.LayerTypeARP).(*layers.ARP); ok {
+		if candidate := net.HardwareAddr(arp.SourceHwAddress); validUnicastMAC(candidate) {
+			deviceMAC = candidate.String()
+		}
+	}
+	if dhcp, ok := packet.Layer(layers.LayerTypeDHCPv4).(*layers.DHCPv4); ok && validUnicastMAC(dhcp.ClientHWAddr) {
+		deviceMAC = dhcp.ClientHWAddr.String()
+	}
+	events = dedupeEvents(events)
+	for index := range events {
+		events[index].DeviceMAC = deviceMAC
+	}
+	return events
 }
 
 func sourcePacketName(packet gopacket.Packet, eth *layers.Ethernet) string {
@@ -375,18 +577,17 @@ func discovery(field, value, evidence, packet string) Event {
 }
 
 func targetSourceMAC(packet gopacket.Packet, ignoreMAC net.HardwareAddr) (net.HardwareAddr, string) {
-	layer := packet.Layer(layers.LayerTypeEthernet)
-	if layer == nil {
+	if packet == nil {
 		return nil, ""
 	}
-	eth, _ := layer.(*layers.Ethernet)
-	if eth == nil || !validSourceMAC(eth.SrcMAC, ignoreMAC) {
+	eth, ok := packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet)
+	if !ok || !validSourceMAC(eth.SrcMAC, ignoreMAC) {
 		return nil, ""
 	}
 	return append(net.HardwareAddr(nil), eth.SrcMAC...), sourcePacketName(packet, eth)
 }
 
-func trafficLogMessage(target Target, packet gopacket.Packet, count int, seen map[string]bool) string {
+func trafficLogMessage(target Target, packet gopacket.Packet, count int) string {
 	summary, _ := PacketSummary(packet)
 	if summary == "" {
 		return ""
@@ -394,25 +595,23 @@ func trafficLogMessage(target Target, packet gopacket.Packet, count int, seen ma
 	return fmt.Sprintf("#%d %s/%s %s", count, target.Role, target.Name, summary)
 }
 
+// PacketSummary returns compact display text and a stable traffic key.
 func PacketSummary(packet gopacket.Packet) (string, string) {
-	layer := packet.Layer(layers.LayerTypeEthernet)
-	if layer == nil {
+	if packet == nil {
 		return "", ""
 	}
-	eth, _ := layer.(*layers.Ethernet)
-	if eth == nil {
+	eth, ok := packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet)
+	if !ok {
 		return "", ""
 	}
 	name := sourcePacketName(packet, eth)
 	details := []string{shortPacketName(name), shortMAC(eth.SrcMAC) + ">" + shortMAC(eth.DstMAC)}
 	keyParts := []string{name, strings.ToLower(eth.SrcMAC.String()), strings.ToLower(eth.DstMAC.String())}
-	if vlanLayer := packet.Layer(layers.LayerTypeDot1Q); vlanLayer != nil {
-		vlan, _ := vlanLayer.(*layers.Dot1Q)
+	if vlan, ok := packet.Layer(layers.LayerTypeDot1Q).(*layers.Dot1Q); ok {
 		details = append(details, fmt.Sprintf("vlan:%d", vlan.VLANIdentifier))
 		keyParts = append(keyParts, fmt.Sprintf("vlan=%d", vlan.VLANIdentifier))
 	}
-	if eapolLayer := packet.Layer(layers.LayerTypeEAPOL); eapolLayer != nil {
-		eapol, _ := eapolLayer.(*layers.EAPOL)
+	if eapol, ok := packet.Layer(layers.LayerTypeEAPOL).(*layers.EAPOL); ok {
 		details = append(details, "eapol:"+strings.ToLower(eapol.Type.String()))
 		keyParts = append(keyParts, "eapol="+eapol.Type.String())
 	}
@@ -420,20 +619,17 @@ func PacketSummary(packet gopacket.Packet) (string, string) {
 		details = append(details, "ether:0x88e5")
 		keyParts = append(keyParts, "macsec=0x88e5")
 	}
-	if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
-		arp, _ := arpLayer.(*layers.ARP)
+	if arp, ok := packet.Layer(layers.LayerTypeARP).(*layers.ARP); ok {
 		src := net.IP(arp.SourceProtAddress)
 		dst := net.IP(arp.DstProtAddress)
 		details = append(details, fmt.Sprintf("arp:%s %s>%s", arpOperationName(arp.Operation), src, dst))
 		keyParts = append(keyParts, "arp="+arpOperationName(arp.Operation), src.String(), dst.String())
 	}
-	if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
-		ipv4, _ := ipv4Layer.(*layers.IPv4)
+	if ipv4, ok := packet.Layer(layers.LayerTypeIPv4).(*layers.IPv4); ok {
 		details = append(details, fmt.Sprintf("%s>%s %s", ipv4.SrcIP, ipv4.DstIP, ipv4.Protocol))
 		keyParts = append(keyParts, ipv4.SrcIP.String(), ipv4.DstIP.String(), ipv4.Protocol.String())
 	}
-	if ipv6Layer := packet.Layer(layers.LayerTypeIPv6); ipv6Layer != nil {
-		ipv6, _ := ipv6Layer.(*layers.IPv6)
+	if ipv6, ok := packet.Layer(layers.LayerTypeIPv6).(*layers.IPv6); ok {
 		details = append(details, fmt.Sprintf("%s>%s %s", ipv6.SrcIP, ipv6.DstIP, ipv6.NextHeader))
 		keyParts = append(keyParts, ipv6.SrcIP.String(), ipv6.DstIP.String(), ipv6.NextHeader.String())
 	}
@@ -486,10 +682,7 @@ func validUnicastMAC(mac net.HardwareAddr) bool {
 			break
 		}
 	}
-	if allZero {
-		return false
-	}
-	return true
+	return !allZero
 }
 
 func validMAC(mac net.HardwareAddr) bool {
@@ -596,13 +789,40 @@ func pcapDir() (string, error) {
 	return paths.PcapRunDir()
 }
 
-func safeName(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "unknown"
+func validateTargets(targets []Target) ([]Target, error) {
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("no adapter")
 	}
-	replacer := strings.NewReplacer("/", "_", "\\", "_", ":", "_", " ", "_")
-	return replacer.Replace(value)
+	if len(targets) > 2 {
+		return nil, fmt.Errorf("at most two adapters may be captured")
+	}
+	validated := make([]Target, 0, len(targets))
+	seen := make(map[string]bool, len(targets))
+	for _, target := range targets {
+		target.Name = strings.TrimSpace(target.Name)
+		target.Role = strings.TrimSpace(target.Role)
+		target.LocalMAC = strings.TrimSpace(target.LocalMAC)
+		if target.Name == "" {
+			return nil, fmt.Errorf("adapter name is required")
+		}
+		key := strings.ToLower(target.Name)
+		if seen[key] {
+			return nil, fmt.Errorf("adapter %q is duplicated", target.Name)
+		}
+		seen[key] = true
+		if target.Role == "" {
+			return nil, fmt.Errorf("adapter role is required for %s", target.Name)
+		}
+		if target.LocalMAC != "" {
+			mac, err := net.ParseMAC(target.LocalMAC)
+			if err != nil || !validUnicastMAC(mac) {
+				return nil, fmt.Errorf("local MAC for %s must be a 48-bit unicast address", target.Name)
+			}
+			target.LocalMAC = mac.String()
+		}
+		validated = append(validated, target)
+	}
+	return validated, nil
 }
 
 func macEqual(a, b net.HardwareAddr) bool {
@@ -617,10 +837,32 @@ func macEqual(a, b net.HardwareAddr) bool {
 	return true
 }
 
-func sendEvent(ctx context.Context, events chan<- Event, event Event) {
+func sendEvent(ctx context.Context, events chan<- Event, event Event) error {
+	if event.Kind == KindTraffic || event.Kind == KindEvidence || event.Kind == KindDecision {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case events <- event:
+		default:
+			// Traffic and decision summaries are explicitly lossy telemetry.
+			// The packet capture and in-engine counters remain independent of
+			// this bounded TUI channel.
+		}
+		return nil
+	}
 	select {
 	case <-ctx.Done():
+		return ctx.Err()
 	case events <- event:
-	default:
+		return nil
 	}
+}
+
+func (s *Session) recordResult(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.resultMu.Lock()
+	s.resultErr = errors.Join(s.resultErr, err)
+	s.resultMu.Unlock()
 }

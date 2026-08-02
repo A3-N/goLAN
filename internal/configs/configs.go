@@ -1,10 +1,17 @@
 package configs
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -14,6 +21,12 @@ import (
 )
 
 const envConfigDir = paths.EnvConfigDir
+
+const (
+	// CurrentVersion is the persisted config schema written by this build.
+	CurrentVersion = 2
+	maxConfigSize  = 1 << 20
+)
 
 // Snapshot is the persisted setup state.
 type Snapshot struct {
@@ -26,16 +39,69 @@ type Snapshot struct {
 
 // Settings is persisted TUI/runtime feature state.
 type Settings struct {
-	CanvasEnabled        bool   `json:"canvas_enabled"`
-	CanvasPath           string `json:"canvas_path,omitempty"`
-	EAPOLLogoffDrop      bool   `json:"eapol_logoff_drop"`
-	EAPOLDowngradeMACsec bool   `json:"eapol_downgrade_macsec"`
+	EAPOLLogoffDrop      bool             `json:"eapol_logoff_drop"`
+	EAPOLDowngradeMACsec bool             `json:"eapol_downgrade_macsec"`
+	RedactSecrets        *bool            `json:"redact_secrets"`
+	Runtime              *RuntimeSettings `json:"runtime,omitempty"`
+
+	// Canvas fields are accepted only so old configs can be loaded and rewritten
+	// without reviving the retired Canvas workspace or PCAP-derived artifacts.
+	CanvasVisible         bool     `json:"canvas_visible,omitempty"`
+	LegacyCanvasArtifacts []string `json:"legacy_canvas_artifacts,omitempty"`
+	CanvasEnabled         bool     `json:"canvas_enabled,omitempty"`
+	CanvasPath            string   `json:"canvas_path,omitempty"`
 }
 
+// RuntimeSettings is the portable, staged live-session configuration saved
+// with a setup snapshot. Strings keep durations and enums human-readable while
+// Decode validates the complete block before it reaches the Workbench model.
+type RuntimeSettings struct {
+	EdgeMode             string        `json:"edge_mode"`
+	EdgeUpstream         string        `json:"edge_upstream"`
+	EdgePortForwards     []PortForward `json:"edge_port_forwards,omitempty"`
+	ControlledQueueDepth int           `json:"controlled_queue_depth"`
+	ControlledOverload   string        `json:"controlled_overload"`
+}
+
+type PortForward struct {
+	Protocol   string `json:"protocol"`
+	ListenPort uint16 `json:"listen_port"`
+	TargetPort uint16 `json:"target_port"`
+}
+
+// Change is one deterministic semantic difference between two snapshots.
+// Version and save timestamps are excluded from comparisons.
+type Change struct {
+	Field  string
+	Before string
+	After  string
+}
+
+// DefaultSettings returns safe runtime feature defaults for configs that omit
+// settings.
 func DefaultSettings() Settings {
+	runtime := DefaultRuntimeSettings()
+	redactSecrets := true
 	return Settings{
 		EAPOLLogoffDrop:      true,
 		EAPOLDowngradeMACsec: true,
+		RedactSecrets:        &redactSecrets,
+		Runtime:              &runtime,
+	}
+}
+
+// SecretsRedacted reports the privacy setting with a safe default for legacy
+// snapshots that predate the field.
+func (s Settings) SecretsRedacted() bool {
+	return s.RedactSecrets == nil || *s.RedactSecrets
+}
+
+func DefaultRuntimeSettings() RuntimeSettings {
+	return RuntimeSettings{
+		EdgeMode:             "observe",
+		EdgeUpstream:         "auto",
+		ControlledQueueDepth: 1024,
+		ControlledOverload:   "fail-open",
 	}
 }
 
@@ -54,12 +120,15 @@ func Save(name string, snapshot Snapshot) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("create config dir: %w", err)
-	}
-
-	snapshot.Version = 1
+	snapshot.Version = CurrentVersion
 	snapshot.SavedAt = time.Now().UTC()
+	if snapshot.Settings != nil {
+		settings := migrateSettings(*snapshot.Settings)
+		if err := validateSettings(settings); err != nil {
+			return "", fmt.Errorf("validate settings: %w", err)
+		}
+		snapshot.Settings = &settings
+	}
 
 	content, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
@@ -67,13 +136,8 @@ func Save(name string, snapshot Snapshot) (string, error) {
 	}
 
 	path := filepath.Join(dir, fileName)
-	if err := os.WriteFile(path, append(content, '\n'), 0o600); err != nil {
+	if err := paths.WriteConfigArtifact(path, append(content, '\n')); err != nil {
 		return "", fmt.Errorf("write config: %w", err)
-	}
-	if root, err := paths.ConfigRoot(); err == nil {
-		if err := paths.FinalizeTree(root); err != nil {
-			return "", fmt.Errorf("finalize config permissions: %w", err)
-		}
 	}
 	return path, nil
 }
@@ -89,15 +153,267 @@ func Load(name string) (Snapshot, string, error) {
 		return Snapshot{}, "", err
 	}
 	path := filepath.Join(dir, fileName)
-	content, err := os.ReadFile(path)
+	content, err := paths.ReadConfigArtifact(path, maxConfigSize)
 	if err != nil {
 		return Snapshot{}, "", fmt.Errorf("read config: %w", err)
 	}
-	var snapshot Snapshot
-	if err := json.Unmarshal(content, &snapshot); err != nil {
-		return Snapshot{}, "", fmt.Errorf("decode config: %w", err)
+	snapshot, err := Decode(content)
+	if err != nil {
+		return Snapshot{}, "", err
 	}
 	return snapshot, path, nil
+}
+
+// LoadFile strictly reads a stable, regular non-symlink config outside the
+// managed config directory. It returns the decoded snapshot, exact source
+// bytes, and SHA-256 fingerprint so a project can snapshot the same revision.
+func LoadFile(path string) (Snapshot, []byte, string, error) {
+	path, err := filepath.Abs(strings.TrimSpace(path))
+	if err != nil {
+		return Snapshot{}, nil, "", fmt.Errorf("resolve config: %w", err)
+	}
+	before, err := os.Lstat(path)
+	if err != nil {
+		return Snapshot{}, nil, "", fmt.Errorf("inspect config: %w", err)
+	}
+	if before.Mode()&fs.ModeSymlink != 0 || !before.Mode().IsRegular() || before.Size() > maxConfigSize {
+		return Snapshot{}, nil, "", fmt.Errorf("config source must be a regular non-symlink file no larger than %d bytes", maxConfigSize)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return Snapshot{}, nil, "", fmt.Errorf("open config: %w", err)
+	}
+	opened, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return Snapshot{}, nil, "", fmt.Errorf("inspect open config: %w", err)
+	}
+	if !os.SameFile(before, opened) {
+		_ = file.Close()
+		return Snapshot{}, nil, "", fmt.Errorf("config source changed while opening")
+	}
+	content, readErr := io.ReadAll(io.LimitReader(file, maxConfigSize+1))
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		return Snapshot{}, nil, "", errors.Join(readErr, closeErr)
+	}
+	if len(content) > maxConfigSize {
+		return Snapshot{}, nil, "", fmt.Errorf("config source exceeds %d bytes", maxConfigSize)
+	}
+	after, err := os.Lstat(path)
+	if err != nil || after.Mode()&fs.ModeSymlink != 0 || !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		return Snapshot{}, nil, "", fmt.Errorf("config source changed while reading")
+	}
+	snapshot, err := Decode(content)
+	if err != nil {
+		return Snapshot{}, nil, "", err
+	}
+	digest := sha256.Sum256(content)
+	return snapshot, content, hex.EncodeToString(digest[:]), nil
+}
+
+// Decode strictly decodes one bounded config snapshot and applies supported
+// schema migration without reading or writing the filesystem.
+func Decode(content []byte) (Snapshot, error) {
+	if len(content) > maxConfigSize {
+		return Snapshot{}, fmt.Errorf("config exceeds %d bytes", maxConfigSize)
+	}
+	var snapshot Snapshot
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&snapshot); err != nil {
+		return Snapshot{}, fmt.Errorf("decode config: %w", err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return Snapshot{}, fmt.Errorf("decode config: %w", err)
+	}
+	if snapshot.Version != 1 && snapshot.Version != CurrentVersion {
+		return Snapshot{}, fmt.Errorf("unsupported config version %d", snapshot.Version)
+	}
+	if snapshot.Settings != nil {
+		settings := migrateSettings(*snapshot.Settings)
+		if err := validateSettings(settings); err != nil {
+			return Snapshot{}, fmt.Errorf("validate settings: %w", err)
+		}
+		snapshot.Settings = &settings
+	}
+	snapshot.Version = CurrentVersion
+	return snapshot, nil
+}
+
+// Diff returns a stable field-by-field semantic comparison. Schema version and
+// SavedAt are ignored; omitted settings compare as their safe defaults.
+func Diff(before, after Snapshot) ([]Change, error) {
+	left, err := comparableSnapshot(before)
+	if err != nil {
+		return nil, err
+	}
+	right, err := comparableSnapshot(after)
+	if err != nil {
+		return nil, err
+	}
+	var changes []Change
+	diffJSONValue("", left, right, &changes)
+	return changes, nil
+}
+
+func comparableSnapshot(snapshot Snapshot) (any, error) {
+	snapshot.Version = 0
+	snapshot.SavedAt = time.Time{}
+	settings := DefaultSettings()
+	if snapshot.Settings != nil {
+		settings = migrateSettings(*snapshot.Settings)
+	}
+	if err := validateSettings(settings); err != nil {
+		return nil, fmt.Errorf("validate settings: %w", err)
+	}
+	snapshot.Settings = &settings
+	content, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("encode config comparison: %w", err)
+	}
+	var value any
+	if err := json.Unmarshal(content, &value); err != nil {
+		return nil, fmt.Errorf("decode config comparison: %w", err)
+	}
+	if object, ok := value.(map[string]any); ok {
+		delete(object, "version")
+		delete(object, "saved_at")
+	}
+	return value, nil
+}
+
+func diffJSONValue(field string, before, after any, changes *[]Change) {
+	beforeObject, beforeIsObject := before.(map[string]any)
+	afterObject, afterIsObject := after.(map[string]any)
+	if beforeIsObject && afterIsObject {
+		keys := make(map[string]bool, len(beforeObject)+len(afterObject))
+		for key := range beforeObject {
+			keys[key] = true
+		}
+		for key := range afterObject {
+			keys[key] = true
+		}
+		ordered := make([]string, 0, len(keys))
+		for key := range keys {
+			ordered = append(ordered, key)
+		}
+		sort.Strings(ordered)
+		for _, key := range ordered {
+			diffJSONValue(joinDiffField(field, key), beforeObject[key], afterObject[key], changes)
+		}
+		return
+	}
+	beforeArray, beforeIsArray := before.([]any)
+	afterArray, afterIsArray := after.([]any)
+	if beforeIsArray && afterIsArray {
+		for index := 0; index < max(len(beforeArray), len(afterArray)); index++ {
+			var beforeValue, afterValue any
+			if index < len(beforeArray) {
+				beforeValue = beforeArray[index]
+			}
+			if index < len(afterArray) {
+				afterValue = afterArray[index]
+			}
+			diffJSONValue(fmt.Sprintf("%s[%d]", field, index), beforeValue, afterValue, changes)
+		}
+		return
+	}
+	if reflect.DeepEqual(before, after) {
+		return
+	}
+	*changes = append(*changes, Change{Field: field, Before: formatDiffValue(before), After: formatDiffValue(after)})
+}
+
+func joinDiffField(parent, child string) string {
+	if parent == "" {
+		return child
+	}
+	return parent + "." + child
+}
+
+func formatDiffValue(value any) string {
+	if value == nil {
+		return "<absent>"
+	}
+	content, err := json.Marshal(value)
+	if err != nil {
+		return "<unavailable>"
+	}
+	return string(content)
+}
+
+func migrateSettings(settings Settings) Settings {
+	if settings.RedactSecrets == nil {
+		redactSecrets := true
+		settings.RedactSecrets = &redactSecrets
+	}
+	settings.CanvasVisible = false
+	settings.LegacyCanvasArtifacts = nil
+	settings.CanvasEnabled = false
+	settings.CanvasPath = ""
+	if settings.Runtime == nil {
+		runtime := DefaultRuntimeSettings()
+		settings.Runtime = &runtime
+	} else {
+		runtime := *settings.Runtime
+		if runtime.EdgeMode == "intercept" {
+			runtime.EdgeMode = "route"
+		}
+		settings.Runtime = &runtime
+	}
+	return settings
+}
+
+func validateSettings(settings Settings) error {
+	if settings.RedactSecrets == nil {
+		return fmt.Errorf("secret redaction setting is required after migration")
+	}
+	if settings.Runtime == nil {
+		return fmt.Errorf("runtime settings are required after migration")
+	}
+	runtime := settings.Runtime
+	if runtime.EdgeMode != "observe" && runtime.EdgeMode != "route" {
+		return fmt.Errorf("edge mode must be observe or route")
+	}
+	if !validRuntimeAdapter(runtime.EdgeUpstream) {
+		return fmt.Errorf("edge upstream must be auto or a valid adapter name")
+	}
+	if runtime.ControlledQueueDepth < 1 || runtime.ControlledQueueDepth > 4096 {
+		return fmt.Errorf("controlled queue depth must be between 1 and 4096")
+	}
+	if runtime.ControlledOverload != "fail-open" && runtime.ControlledOverload != "fail-closed" {
+		return fmt.Errorf("controlled overload must be fail-open or fail-closed")
+	}
+	if len(runtime.EdgePortForwards) > 0 && runtime.EdgeMode == "observe" {
+		return fmt.Errorf("edge port forwards require route mode")
+	}
+	seenForwards := make(map[string]bool, len(runtime.EdgePortForwards))
+	for _, forward := range runtime.EdgePortForwards {
+		protocol := strings.ToLower(forward.Protocol)
+		key := fmt.Sprintf("%s/%d", protocol, forward.ListenPort)
+		if (protocol != "tcp" && protocol != "udp") || forward.ListenPort == 0 || forward.TargetPort == 0 || seenForwards[key] {
+			return fmt.Errorf("invalid or duplicate edge port forward %s", key)
+		}
+		seenForwards[key] = true
+	}
+	return nil
+}
+
+func validRuntimeAdapter(value string) bool {
+	value = strings.TrimSpace(value)
+	if strings.EqualFold(value, "auto") {
+		return true
+	}
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for _, character := range value {
+		if character <= ' ' || character == '/' || character == '\\' {
+			return false
+		}
+	}
+	return true
 }
 
 // List returns saved JSON config filenames.
@@ -106,20 +422,13 @@ func List() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(dir)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
+	entries, err := paths.ListConfigArtifacts(dir)
 	if err != nil {
 		return nil, fmt.Errorf("list configs: %w", err)
 	}
 
 	names := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
+	for _, name := range entries {
 		if strings.EqualFold(filepath.Ext(name), ".json") {
 			names = append(names, name)
 		}
@@ -136,6 +445,9 @@ func normalizeName(name string) (string, error) {
 	if filepath.Base(name) != name {
 		return "", fmt.Errorf("filename must not include a path")
 	}
+	if name == "." || strings.ContainsAny(name, "\x00\r\n") {
+		return "", fmt.Errorf("filename contains invalid characters")
+	}
 	if filepath.Ext(name) == "" {
 		name += ".json"
 	}
@@ -143,4 +455,14 @@ func normalizeName(name string) (string, error) {
 		return "", fmt.Errorf("filename must use .json")
 	}
 	return name, nil
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); errors.Is(err, io.EOF) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return fmt.Errorf("multiple JSON values")
 }
