@@ -57,6 +57,10 @@ func TestNormalizeMalformedDoesNotPanic(t *testing.T) {
 func TestTrackerStableBidirectionalFlowAndCopies(t *testing.T) {
 	tracker := NewTracker(4)
 	forward := Normalize(syntheticTCPFrame(false), CaptureMetadata{Timestamp: time.Unix(1, 0)}, "en1", SideHost, DirectionHostToSwitch)
+	identity := CanonicalFlow(forward)
+	if identity.ID == "" || identity.EndpointA.IP == "" || identity.EndpointB.IP == "" || identity.Protocol != 6 || identity.Packets != 0 {
+		t.Fatalf("canonical flow identity=%#v", identity)
+	}
 	reverseRaw := syntheticTCPFrame(false)
 	copy(reverseRaw[0:6], forward.RawBytes()[6:12])
 	copy(reverseRaw[6:12], forward.RawBytes()[0:6])
@@ -69,7 +73,7 @@ func TestTrackerStableBidirectionalFlowAndCopies(t *testing.T) {
 
 	first := tracker.Observe(forward)
 	second := tracker.Observe(reverse)
-	if first.ID != second.ID || second.Packets != 2 {
+	if first.ID != identity.ID || first.ID != second.ID || second.Packets != 2 {
 		t.Fatalf("flow snapshots = %#v then %#v", first, second)
 	}
 	if second.State != FlowStateEstablished {

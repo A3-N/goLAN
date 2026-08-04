@@ -41,55 +41,55 @@ func TestMissingRouteErrorsAreBenignForNATClear(t *testing.T) {
 	}
 }
 
-func TestStartTakeoverRejectsAddressingBeforeAnyMutation(t *testing.T) {
+func TestStartNATRejectsAddressingBeforeAnyMutation(t *testing.T) {
 	runner := &fakeCommandRunner{}
 	backend := &fakeFastPolicyBackend{}
 	session := &Session{
 		bridgeName: "bridge7", targetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1},
 		runner: runner, fastPF: backend, fastPFRules: "fast-rules\n",
 	}
-	err := session.StartTakeover(TakeoverConfig{
+	err := session.StartNAT(NATConfig{
 		IP: "192.0.2.10", CIDR: "24", Gateway: "not-an-ip", DHCP: "off",
 	})
 	if err == nil || !strings.Contains(err.Error(), "gateway") {
-		t.Fatalf("StartTakeover error=%v", err)
+		t.Fatalf("StartNAT error=%v", err)
 	}
 	if len(runner.calls) != 0 || backend.applyCalls != 0 || session.nat != nil {
 		t.Fatalf("mutation before preflight: commands=%#v PF=%d state=%+v", runner.calls, backend.applyCalls, session.nat)
 	}
 }
 
-func TestStartTakeoverRequiresAuthenticatedIdentityAndFastMode(t *testing.T) {
+func TestStartNATRequiresAuthenticatedIdentityAndFastMode(t *testing.T) {
 	tests := []struct {
 		name    string
 		session *Session
-		config  TakeoverConfig
+		config  NATConfig
 		want    string
 	}{
 		{
 			name:    "identity mismatch",
 			session: &Session{bridgeName: "bridge7", targetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}, runner: &fakeCommandRunner{}},
-			config:  TakeoverConfig{MAC: "02:00:00:00:00:02", IP: "192.0.2.10", CIDR: "24", DHCP: "off"},
+			config:  NATConfig{MAC: "02:00:00:00:00:02", IP: "192.0.2.10", CIDR: "24", DHCP: "off"},
 			want:    "differs from authenticated identity",
 		},
 		{
 			name:    "controlled bridge",
 			session: &Session{Mode: ModeControlled, bridgeName: "bridge7", targetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}, runner: &fakeCommandRunner{}},
-			config:  TakeoverConfig{IP: "192.0.2.10", CIDR: "24", DHCP: "off"},
+			config:  NATConfig{IP: "192.0.2.10", CIDR: "24", DHCP: "off"},
 			want:    "requires a fast bridge",
 		},
 		{
 			name:    "cleanup pending",
 			session: &Session{Mode: ModeFast, bridgeName: "bridge7", nat: &NATState{}, runner: &fakeCommandRunner{}},
-			config:  TakeoverConfig{IP: "192.0.2.10", CIDR: "24", DHCP: "off"},
+			config:  NATConfig{IP: "192.0.2.10", CIDR: "24", DHCP: "off"},
 			want:    "cleanup is pending",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := test.session.StartTakeover(test.config)
+			err := test.session.StartNAT(test.config)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("StartTakeover error=%v", err)
+				t.Fatalf("StartNAT error=%v", err)
 			}
 			runner := test.session.runner.(*fakeCommandRunner)
 			if len(runner.calls) != 0 {

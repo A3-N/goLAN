@@ -14,7 +14,7 @@ const (
 	ModeListen           Mode = "listen"
 	ModeFastBridge       Mode = "fast-bridge"
 	ModeControlledBridge Mode = "controlled-bridge"
-	ModeTakeover         Mode = "takeover"
+	ModeNAT              Mode = "nat"
 	ModeEdgeObserve      Mode = "edge-observe"
 	ModeEdgeRoute        Mode = "edge-route"
 )
@@ -25,7 +25,7 @@ func Modes() []Mode {
 		ModeListen,
 		ModeFastBridge,
 		ModeControlledBridge,
-		ModeTakeover,
+		ModeNAT,
 		ModeEdgeObserve,
 		ModeEdgeRoute,
 	}
@@ -109,7 +109,7 @@ func ForMode(mode Mode) Capabilities {
 			CapabilityTrafficShape)
 		shadow(CapabilityStatefulFilter, CapabilityRedirect)
 		unsupported(CapabilityNAT, CapabilityPortForward)
-	case ModeTakeover:
+	case ModeNAT:
 		live(CapabilityStatefulFilter)
 		shadow(CapabilityFrameFilter, CapabilityRewritePayload,
 			CapabilityTrafficShape)

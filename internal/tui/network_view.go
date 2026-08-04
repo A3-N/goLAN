@@ -52,6 +52,12 @@ func networkDeviceSearchText(device networkobs.Device) string {
 	values = append(values, device.IPs...)
 	values = append(values, device.Hostnames...)
 	values = append(values, device.Protocols...)
+	for _, service := range device.Services {
+		values = append(values, service.Type, service.Name, service.Target, service.Protocol)
+	}
+	for _, event := range device.AccessEvents {
+		values = append(values, event.Kind, event.Label, event.Protocol)
+	}
 	for _, observation := range device.Observations {
 		values = append(values, observation.Summary, observation.Source, observation.Destination)
 	}
@@ -70,6 +76,7 @@ func (m *Model) ensureNetworkSelection() {
 		}
 	}
 	m.selectedNetworkDevice = devices[0].Key
+	m.networkInsight = ""
 }
 
 func (m *Model) moveNetworkSelection(delta int) {
@@ -85,7 +92,10 @@ func (m *Model) moveNetworkSelection(delta int) {
 		}
 	}
 	index = clamp(index+delta, 0, len(devices)-1)
-	m.selectedNetworkDevice = devices[index].Key
+	if m.selectedNetworkDevice != devices[index].Key {
+		m.selectedNetworkDevice = devices[index].Key
+		m.networkInsight = ""
+	}
 }
 
 func (m Model) selectedNetworkDeviceSnapshot() (networkobs.Device, bool) {
@@ -146,10 +156,10 @@ func (m Model) renderNetworkDevices(width, height int) string {
 		if devices[index].Key == m.selectedNetworkDevice {
 			prefix = "> "
 		}
-		rows = append(rows, networkDeviceRow(prefix, index+1, devices[index], width))
+		rows = append(rows, networkDeviceRow(prefix, devices[index], width))
 	}
 	if allCount == 0 {
-		rows = append(rows, "", "No devices observed.", "Start listen, bridge, takeover, or edge mode; full traffic is still saved to PCAP.")
+		rows = append(rows, "", "No devices observed.", "Start listen, bridge, nat, or edge mode; full traffic is still saved to PCAP.")
 	} else if len(devices) == 0 {
 		rows = append(rows, "", "No devices match this view.", "Use `network reset` to show the complete inventory.")
 	}
@@ -208,15 +218,15 @@ func networkCategoryForButton(id string) networkobs.Category {
 
 func networkDeviceHeader(width int) string {
 	if width >= 100 {
-		return "  #   STATE    MAC                 IPs                     VLAN   PROTOCOLS             ALERTS LAST SEEN"
+		return "  #    STATE    MAC                 IPs                     VLAN   PROTOCOLS             ALERTS LAST SEEN"
 	}
 	if width >= 72 {
-		return "  #   MAC                 IPs                VLAN   PROTOCOLS        ALERTS"
+		return "  #    MAC                 IPs                VLAN   PROTOCOLS        ALERTS"
 	}
-	return "  #   MAC                 IPs            ALERTS"
+	return "  #    MAC                 IPs            ALERTS"
 }
 
-func networkDeviceRow(prefix string, index int, device networkobs.Device, width int) string {
+func networkDeviceRow(prefix string, device networkobs.Device, width int) string {
 	ips := "-"
 	if len(device.IPs) > 0 {
 		ips = strings.Join(device.IPs, ",")
@@ -240,11 +250,11 @@ func networkDeviceRow(prefix string, index int, device networkobs.Device, width 
 	}
 	switch {
 	case width >= 100:
-		return fmt.Sprintf("%s%-3d %-8s %-19s %-23s %-6s %-21s %-6d %s", prefix, index, "SEEN", clipLiveColumn(device.MAC, 19), clipLiveColumn(ips, 23), clipLiveColumn(vlans, 6), clipLiveColumn(protocols, 21), alerts, lastSeen)
+		return fmt.Sprintf("%s%-4d %-8s %-19s %-23s %-6s %-21s %-6d %s", prefix, device.Number, "SEEN", clipLiveColumn(device.MAC, 19), clipLiveColumn(ips, 23), clipLiveColumn(vlans, 6), clipLiveColumn(protocols, 21), alerts, lastSeen)
 	case width >= 72:
-		return fmt.Sprintf("%s%-3d %-19s %-18s %-6s %-16s %-6d", prefix, index, clipLiveColumn(device.MAC, 19), clipLiveColumn(ips, 18), clipLiveColumn(vlans, 6), clipLiveColumn(protocols, 16), alerts)
+		return fmt.Sprintf("%s%-4d %-19s %-18s %-6s %-16s %-6d", prefix, device.Number, clipLiveColumn(device.MAC, 19), clipLiveColumn(ips, 18), clipLiveColumn(vlans, 6), clipLiveColumn(protocols, 16), alerts)
 	default:
-		return fmt.Sprintf("%s%-3d %-19s %-14s %-6d", prefix, index, clipLiveColumn(device.MAC, 19), clipLiveColumn(ips, 14), alerts)
+		return fmt.Sprintf("%s%-4d %-19s %-14s %-6d", prefix, device.Number, clipLiveColumn(device.MAC, 19), clipLiveColumn(ips, 14), alerts)
 	}
 }
 
@@ -264,14 +274,26 @@ func (m Model) renderNetworkInspector(width, height int) string {
 	if !ok {
 		return box(m.cardTitle("inspector", cardInspector), []string{"Select an observed device.", "Packet detail is intentionally left to the saved capture and external analyzers."}, width, height, m.activeCard == cardInspector)
 	}
+	identity := networkobs.DeviceIdentity(device)
 	rows := []string{
-		"IDENTITY",
+		"IDENTITY · DISCOVERY #" + strconv.FormatUint(device.Number, 10),
+		renderTextButtonBar(m.networkInsightButtonBar()),
+		fmt.Sprintf("  name %s · confidence %s %d/100", safeDisplayText(identity.Name), identity.Confidence, identity.Score),
 		"  MAC " + device.MAC,
 		"  scope " + emptyNetworkValue(strings.Trim(strings.Join([]string{device.Role, device.Adapter}, "/"), "/")),
 		"  first " + networkTime(device.FirstSeen) + " · last " + networkTime(device.LastSeen),
 		"  IPs " + emptyNetworkValue(strings.Join(device.IPs, ", ")),
 		"  VLANs " + networkVLANs(device.VLANs),
 		"  protocols " + emptyNetworkValue(strings.Join(device.Protocols, ", ")),
+		fmt.Sprintf("  services %d · access events %d", len(device.Services), len(device.AccessEvents)),
+	}
+	if m.networkInsight != "" {
+		rows = append(rows, "")
+		rows = append(rows, m.networkInsightRows(device)...)
+		if len(rows) > available {
+			rows = rows[:available]
+		}
+		return box(m.cardTitle("device inspector", cardInspector), rows, width, height, m.activeCard == cardInspector)
 	}
 	for index, category := range networkCategories {
 		observations := networkCategoryObservations(device, category)
@@ -309,6 +331,71 @@ func (m Model) renderNetworkInspector(width, height int) string {
 		rows = rows[:available]
 	}
 	return box(m.cardTitle("device inspector", cardInspector), rows, width, height, m.activeCard == cardInspector)
+}
+
+func (m Model) networkInsightButtonBar() textButtonBar {
+	return textButtonBar{Buttons: []textButton{
+		{ID: "overview", Label: "O Overview", Active: m.networkInsight == ""},
+		{ID: "explain", Label: "E Explain", Active: m.networkInsight == "explain"},
+		{ID: "access", Label: "A Access", Active: m.networkInsight == "access"},
+		{ID: "fate", Label: "F Fate", Active: m.networkInsight == "fate"},
+		{ID: "rule", Label: "R Rule"},
+	}}
+}
+
+func (m Model) networkInsightRows(device networkobs.Device) []string {
+	session := networkobs.Session{}
+	if m.networkTracker != nil {
+		session = m.networkTracker.Snapshot()
+	}
+	switch m.networkInsight {
+	case "explain":
+		report := networkobs.ExplainConnection(session, device)
+		rows := []string{"CONNECTION EXPLAINER", "  " + report.Summary}
+		for _, stage := range report.Stages {
+			rows = append(rows, fmt.Sprintf("  [%s] %-11s %s", stage.Status, stage.Name, stage.Summary))
+		}
+		return rows
+	case "access":
+		story := networkobs.BuildAccessStory(device)
+		rows := []string{"ACCESS STORY", fmt.Sprintf("  result %s · attempts %d · duration %s", story.Result, story.Attempts, story.Duration.Round(time.Millisecond))}
+		for _, event := range story.Events {
+			rows = append(rows, fmt.Sprintf("  %s [%s] %s", event.ObservedAt.UTC().Format("15:04:05.000"), networkSeverityStatus(event.Severity), event.Label))
+		}
+		return rows
+	case "fate":
+		fates := networkobs.PacketFatesForDevice(session, device)
+		rows := []string{"PACKET FATE", fmt.Sprintf("  %d payload-free flow outcome(s)", len(fates))}
+		for _, fate := range fates {
+			rows = append(rows, fmt.Sprintf("  %s <-> %s  fwd=%d block=%d unresolved=%d [%s]", formatFateEndpoint(fate.EndpointA), formatFateEndpoint(fate.EndpointB), fate.Forwarded, fate.Blocked, fate.Unresolved, fate.Confidence))
+		}
+		return rows
+	default:
+		return nil
+	}
+}
+
+func (m Model) networkSectionAtInspectorRow(contentRow int) (int, bool) {
+	row := 10
+	device, ok := m.selectedNetworkDeviceSnapshot()
+	if !ok {
+		return 0, false
+	}
+	for index, category := range networkCategories {
+		if contentRow == row {
+			return index + 1, true
+		}
+		row++
+		if !m.networkExpanded[category] {
+			continue
+		}
+		observations := networkCategoryObservations(device, category)
+		row += min(5, len(observations))
+		if len(observations) > 5 {
+			row++
+		}
+	}
+	return 0, false
 }
 
 func networkCategoryObservations(device networkobs.Device, category networkobs.Category) []networkobs.Observation {

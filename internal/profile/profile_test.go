@@ -163,11 +163,11 @@ func TestSetAdapterRolePreservesSettingsAndEvidence(t *testing.T) {
 }
 
 func TestCanonicalAdapterRole(t *testing.T) {
-	if got := CanonicalAdapterRole("1"); got != AdapterRoleHost {
-		t.Fatalf("CanonicalAdapterRole(1) = %q", got)
+	if got := CanonicalAdapterRole(" HOST "); got != AdapterRoleHost {
+		t.Fatalf("CanonicalAdapterRole(HOST) = %q", got)
 	}
-	if got := CanonicalAdapterRole("2"); got != AdapterRoleSwitch {
-		t.Fatalf("CanonicalAdapterRole(2) = %q", got)
+	if ValidAdapterRole("1") || ValidAdapterRole("2") {
+		t.Fatal("numeric role aliases were accepted")
 	}
 }
 

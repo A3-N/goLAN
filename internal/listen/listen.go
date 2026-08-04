@@ -2,6 +2,8 @@ package listen
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -491,6 +493,29 @@ func AnalyzePacket(packet gopacket.Packet, ignoreMAC net.HardwareAddr) []Event {
 		}
 		for _, option := range dhcp.Options {
 			switch option.Type {
+			case layers.DHCPOptMessageType:
+				if len(option.Data) == 1 {
+					event := discovery("dhcp_message", layers.DHCPMsgType(option.Data[0]).String(), "dhcp message type", "DHCP")
+					if eth != nil && validUnicastMAC(eth.SrcMAC) {
+						event.DeviceMAC = eth.SrcMAC.String()
+					}
+					events = append(events, event)
+				}
+			case layers.DHCPOptServerID:
+				if len(option.Data) >= 4 {
+					ip := net.IP(option.Data[:4])
+					if usableIPv4(ip) {
+						event := discovery("dhcp_server", ip.String(), "dhcp server identifier", "DHCP")
+						if dhcp.Operation == layers.DHCPOpReply && eth != nil && validUnicastMAC(eth.SrcMAC) {
+							event.DeviceMAC = eth.SrcMAC.String()
+						}
+						events = append(events, event)
+					}
+				}
+			case layers.DHCPOptHostname:
+				if hostname := cleanDiscoveryText(string(option.Data)); hostname != "" {
+					events = append(events, discovery("dhcp_hostname", hostname, "dhcp hostname option", "DHCP"))
+				}
 			case layers.DHCPOptSubnetMask:
 				if len(option.Data) >= 4 {
 					mask := net.IPMask(option.Data[:4])
@@ -513,6 +538,55 @@ func AnalyzePacket(packet gopacket.Packet, ignoreMAC net.HardwareAddr) []Event {
 					}
 				}
 			}
+		}
+	}
+
+	if ipv6, ok := packet.Layer(layers.LayerTypeIPv6).(*layers.IPv6); ok {
+		if advertisement, ok := packet.Layer(layers.LayerTypeICMPv6RouterAdvertisement).(*layers.ICMPv6RouterAdvertisement); ok {
+			event := discovery("ipv6_router", ipv6.SrcIP.String(), "router advertisement source", "ICMPv6 RA")
+			if eth != nil && validUnicastMAC(eth.SrcMAC) {
+				event.DeviceMAC = eth.SrcMAC.String()
+			}
+			events = append(events, event)
+			for _, option := range advertisement.Options {
+				if option.Type != layers.ICMPv6OptPrefixInfo || len(option.Data) < 30 {
+					continue
+				}
+				prefix := net.IP(option.Data[14:30])
+				value := fmt.Sprintf("%s/%d", prefix.String(), option.Data[0])
+				prefixEvent := discovery("ipv6_prefix", value, "router advertisement prefix", "ICMPv6 RA")
+				prefixEvent.DeviceMAC = event.DeviceMAC
+				events = append(events, prefixEvent)
+			}
+		}
+	}
+
+	if lldp, ok := packet.Layer(layers.LayerTypeLinkLayerDiscovery).(*layers.LinkLayerDiscovery); ok {
+		device := ""
+		if eth != nil && validUnicastMAC(eth.SrcMAC) {
+			device = eth.SrcMAC.String()
+		}
+		chassis := discovery("lldp_chassis", lldpIdentifier(lldp.ChassisID.ID), "LLDP chassis ID", "LLDP")
+		chassis.DeviceMAC = device
+		port := discovery("lldp_port", lldpIdentifier(lldp.PortID.ID), "LLDP port ID", "LLDP")
+		port.DeviceMAC = device
+		events = append(events, chassis, port)
+		if info, ok := packet.Layer(layers.LayerTypeLinkLayerDiscoveryInfo).(*layers.LinkLayerDiscoveryInfo); ok {
+			if name := cleanDiscoveryText(info.SysName); name != "" {
+				event := discovery("lldp_system_name", name, "LLDP system name", "LLDP")
+				event.DeviceMAC = device
+				events = append(events, event)
+			}
+		}
+	}
+	if stp, ok := packet.Layer(layers.LayerTypeSTP).(*layers.STP); ok && len(stp.Contents) >= 13 {
+		root := stpRootIdentifier(stp.Contents)
+		if root != "" {
+			event := discovery("stp_root", root, "STP root bridge ID", "STP")
+			if eth != nil && validUnicastMAC(eth.SrcMAC) {
+				event.DeviceMAC = eth.SrcMAC.String()
+			}
+			events = append(events, event)
 		}
 	}
 
@@ -546,7 +620,9 @@ func AnalyzePacket(packet gopacket.Packet, ignoreMAC net.HardwareAddr) []Event {
 	}
 	events = dedupeEvents(events)
 	for index := range events {
-		events[index].DeviceMAC = deviceMAC
+		if events[index].DeviceMAC == "" {
+			events[index].DeviceMAC = deviceMAC
+		}
 	}
 	return events
 }
@@ -557,6 +633,12 @@ func sourcePacketName(packet gopacket.Packet, eth *layers.Ethernet) string {
 		return "EAPOL / 802.1X"
 	case eth != nil && eth.EthernetType == ethernetTypeMACsec:
 		return "MACsec"
+	case packet.Layer(layers.LayerTypeLinkLayerDiscovery) != nil:
+		return "LLDP"
+	case packet.Layer(layers.LayerTypeSTP) != nil:
+		return "STP"
+	case packet.Layer(layers.LayerTypeICMPv6RouterAdvertisement) != nil:
+		return "ICMPv6 RA"
 	case packet.Layer(layers.LayerTypeDHCPv4) != nil:
 		return "DHCP"
 	case packet.Layer(layers.LayerTypeARP) != nil:
@@ -574,6 +656,47 @@ func sourcePacketName(packet gopacket.Packet, eth *layers.Ethernet) string {
 
 func discovery(field, value, evidence, packet string) Event {
 	return Event{Field: field, Value: value, Evidence: evidence, Packet: packet}
+}
+
+func cleanDiscoveryText(value string) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) > 255 {
+		runes = runes[:255]
+	}
+	for _, char := range runes {
+		if char < 0x20 || char == 0x7f {
+			return ""
+		}
+	}
+	return string(runes)
+}
+
+func lldpIdentifier(value []byte) string {
+	if len(value) == 6 {
+		return net.HardwareAddr(value).String()
+	}
+	if text := cleanDiscoveryText(string(value)); text != "" {
+		return text
+	}
+	if len(value) > 64 {
+		value = value[:64]
+	}
+	return hex.EncodeToString(value)
+}
+
+func stpRootIdentifier(contents []byte) string {
+	// Configuration and rapid spanning-tree BPDUs place the eight-byte root
+	// bridge identifier after protocol, version, type, and flags.
+	if len(contents) < 13 {
+		return ""
+	}
+	priority := binary.BigEndian.Uint16(contents[5:7])
+	mac := net.HardwareAddr(contents[7:13])
+	if !validMAC(mac) {
+		return ""
+	}
+	return fmt.Sprintf("%04x/%s", priority, mac.String())
 }
 
 func targetSourceMAC(packet gopacket.Packet, ignoreMAC net.HardwareAddr) (net.HardwareAddr, string) {

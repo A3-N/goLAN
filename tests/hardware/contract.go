@@ -25,10 +25,10 @@ const (
 	envExpectEAPOL       = "GOLAN_HARDWARE_EXPECT_EAPOL"
 	envExpectVLAN        = "GOLAN_HARDWARE_EXPECT_VLAN"
 	envAllowDefaultRoute = "GOLAN_HARDWARE_ALLOW_DEFAULT_ROUTE"
-	envTakeoverIP        = "GOLAN_HARDWARE_TAKEOVER_IP"
-	envTakeoverCIDR      = "GOLAN_HARDWARE_TAKEOVER_CIDR"
-	envTakeoverGateway   = "GOLAN_HARDWARE_TAKEOVER_GATEWAY"
-	envTakeoverDNS       = "GOLAN_HARDWARE_TAKEOVER_DNS"
+	envNATIP             = "GOLAN_HARDWARE_NAT_IP"
+	envNATCIDR           = "GOLAN_HARDWARE_NAT_CIDR"
+	envNATGateway        = "GOLAN_HARDWARE_NAT_GATEWAY"
+	envNATDNS            = "GOLAN_HARDWARE_NAT_DNS"
 	envPortForwardProto  = "GOLAN_HARDWARE_PORT_FORWARD_PROTOCOL"
 	envPortForwardListen = "GOLAN_HARDWARE_PORT_FORWARD_LISTEN_PORT"
 	envPortForwardTarget = "GOLAN_HARDWARE_PORT_FORWARD_TARGET_PORT"
@@ -41,7 +41,7 @@ const (
 	caseFast          hardwareCase = "fast"
 	caseFastDiscovery hardwareCase = "fast-discovery"
 	caseControlled    hardwareCase = "controlled"
-	caseTakeover      hardwareCase = "takeover"
+	caseNAT           hardwareCase = "nat"
 	caseEdgeRoute     hardwareCase = "edge-route"
 	caseEdgeForward   hardwareCase = "edge-port-forward"
 )
@@ -51,7 +51,7 @@ var caseOrder = []hardwareCase{
 	caseFast,
 	caseFastDiscovery,
 	caseControlled,
-	caseTakeover,
+	caseNAT,
 	caseEdgeRoute,
 	caseEdgeForward,
 }
@@ -70,10 +70,10 @@ type config struct {
 	ExpectEAPOL       bool
 	ExpectVLAN        bool
 	AllowDefaultRoute bool
-	TakeoverIP        string
-	TakeoverCIDR      string
-	TakeoverGateway   string
-	TakeoverDNS       string
+	NATIP             string
+	NATCIDR           string
+	NATGateway        string
+	NATDNS            string
 	PortForwardProto  string
 	PortForwardListen uint16
 	PortForwardTarget uint16
@@ -117,8 +117,8 @@ func loadConfig(getenv func(string) string) (config, error) {
 		TargetMAC:  strings.TrimSpace(getenv(envTargetMAC)),
 		Downstream: strings.TrimSpace(getenv(envDownstream)), Upstream: strings.TrimSpace(getenv(envUpstream)),
 		Duration: duration, ActiveTimeout: activeTimeout, MinPackets: minPackets,
-		TakeoverIP: strings.TrimSpace(getenv(envTakeoverIP)), TakeoverCIDR: strings.TrimSpace(getenv(envTakeoverCIDR)),
-		TakeoverGateway: strings.TrimSpace(getenv(envTakeoverGateway)), TakeoverDNS: strings.TrimSpace(getenv(envTakeoverDNS)),
+		NATIP: strings.TrimSpace(getenv(envNATIP)), NATCIDR: strings.TrimSpace(getenv(envNATCIDR)),
+		NATGateway: strings.TrimSpace(getenv(envNATGateway)), NATDNS: strings.TrimSpace(getenv(envNATDNS)),
 		PortForwardProto: strings.ToLower(strings.TrimSpace(getenv(envPortForwardProto))),
 	}
 	portForwardListen, err := parseBoundedInt(getenv(envPortForwardListen), 0, 0, 65535, envPortForwardListen)
@@ -216,14 +216,14 @@ func validateConfig(cfg config) error {
 	for _, candidate := range cfg.Cases {
 		selected[candidate] = true
 	}
-	needsInline := selected[caseFast] || selected[caseFastDiscovery] || selected[caseControlled] || selected[caseTakeover]
+	needsInline := selected[caseFast] || selected[caseFastDiscovery] || selected[caseControlled] || selected[caseNAT]
 	if needsInline && (cfg.Host == "" || cfg.Switch == "") {
 		return fmt.Errorf("%s and %s are required for inline cases", envHost, envSwitch)
 	}
 	if needsInline && strings.EqualFold(cfg.Host, cfg.Switch) {
 		return fmt.Errorf("host and switch adapters must differ")
 	}
-	if selected[caseFast] || selected[caseTakeover] {
+	if selected[caseFast] || selected[caseNAT] {
 		if err := validateTargetMAC(cfg.TargetMAC); err != nil {
 			return fmt.Errorf("%s: %w", envTargetMAC, err)
 		}
@@ -244,11 +244,11 @@ func validateConfig(cfg config) error {
 			return fmt.Errorf("%s and %s must be non-zero for edge-port-forward", envPortForwardListen, envPortForwardTarget)
 		}
 	}
-	if cfg.TakeoverIP == "" && cfg.TakeoverCIDR != "" {
-		return fmt.Errorf("%s requires %s", envTakeoverCIDR, envTakeoverIP)
+	if cfg.NATIP == "" && cfg.NATCIDR != "" {
+		return fmt.Errorf("%s requires %s", envNATCIDR, envNATIP)
 	}
-	if cfg.TakeoverIP != "" && cfg.TakeoverCIDR == "" {
-		return fmt.Errorf("%s requires %s", envTakeoverIP, envTakeoverCIDR)
+	if cfg.NATIP != "" && cfg.NATCIDR == "" {
+		return fmt.Errorf("%s requires %s", envNATIP, envNATCIDR)
 	}
 	return nil
 }

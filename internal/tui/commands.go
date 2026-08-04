@@ -24,7 +24,7 @@ func (m *Model) executeCommand(raw string) tea.Cmd {
 	}
 
 	switch strings.ToLower(fields[0]) {
-	case "help", "?":
+	case "help":
 		m.showHelp()
 	case "doctor":
 		return m.startDoctor(fields[1:])
@@ -39,10 +39,10 @@ func (m *Model) executeCommand(raw string) tea.Cmd {
 	case "canvas":
 		return m.executeCanvas(fields[1:])
 	case "network":
-		m.executeNetwork(fields[1:])
+		return m.executeNetwork(fields[1:])
 	case "delete":
 		return m.executeDelete(fields[1:])
-	case "clear", "cls":
+	case "clear":
 		m.output = nil
 		m.outputMuted = nil
 		m.outputLiteral = nil
@@ -52,7 +52,7 @@ func (m *Model) executeCommand(raw string) tea.Cmd {
 		return m.executeSet(fields[1:])
 	case "unset":
 		return m.executeUnset(fields[1:])
-	case "conf", "config", "configure":
+	case "conf":
 		return m.executeConf(fields[1:])
 	case "load":
 		return m.executeLoad(fields[1:])
@@ -84,7 +84,7 @@ func (m *Model) executeCommand(raw string) tea.Cmd {
 		m.err = nil
 		m.print("refresh: adapters")
 		return discoverAdaptersCmd
-	case "quit", "exit":
+	case "quit":
 		return tea.Quit
 	default:
 		m.print("unknown: " + fields[0])
@@ -124,31 +124,31 @@ func isAutoValue(value string) bool {
 }
 
 func (m *Model) executeShow(args []string) {
-	if len(args) < 1 || len(args) > 2 || (len(args) == 2 && !strings.EqualFold(args[0], "captures") && !strings.EqualFold(args[0], "capture")) {
-		m.print("use: show adapters|config|bridge|takeover|edge|project|rules|health|captures")
+	if len(args) < 1 || len(args) > 2 || len(args) == 2 && !strings.EqualFold(args[0], "captures") {
+		m.print("use: show adapters|config|bridge|nat|edge|project|rules|health|captures")
 		return
 	}
 	switch strings.ToLower(args[0]) {
-	case "adapters", "adapter":
+	case "adapters":
 		m.showAdapters()
-	case "config", "conf":
+	case "config":
 		m.showConfig()
 	case "bridge":
 		m.showBridge()
-	case "takeover", "nat":
-		m.showTakeover()
+	case "nat":
+		m.showNAT()
 	case "project":
 		m.showProject()
-	case "rules", "policy":
+	case "rules":
 		m.showRules()
 	case "edge":
 		m.showEdge()
-	case "health", "status":
+	case "health":
 		m.showHealth()
-	case "captures", "capture":
+	case "captures":
 		m.showNetworkCaptures(args[1:])
 	default:
-		m.print("use: show adapters|config|bridge|takeover|edge|project|rules|health|captures")
+		m.print("use: show adapters|config|bridge|nat|edge|project|rules|health|captures")
 	}
 }
 
@@ -206,7 +206,7 @@ func countSessions(sessions []workproject.AssociatedSession, recoverable bool) i
 
 func (m *Model) executeSet(args []string) tea.Cmd {
 	if len(args) == 0 {
-		m.print("use: set <adapter> <host|switch> | set <property> <value>")
+		m.print("use: set adapter <name> <host|switch> | set <property> <value>")
 		return nil
 	}
 	if blocker := m.adapterMutationBlocker(); blocker != "" {
@@ -337,22 +337,11 @@ func (m *Model) executeSet(args []string) tea.Cmd {
 		return nil
 	}
 	if key == "adapter" {
-		if len(args) < 2 || len(args) > 3 {
-			m.print("use: set adapter <name> [host|switch]")
+		if len(args) != 3 {
+			m.print("use: set adapter <name> <host|switch>")
 			return nil
 		}
-		if len(args) >= 3 {
-			return m.stageAdapter(args[1], args[2])
-		}
-		return m.stageAdapterNext(args[1])
-	}
-
-	if _, ok := m.findAdapter(args[0]); ok {
-		if len(args) != 2 {
-			m.print("use: set <adapter> <host|switch>")
-			return nil
-		}
-		return m.stageAdapter(args[0], args[1])
+		return m.stageAdapter(args[1], args[2])
 	}
 
 	if len(args) < 2 {
@@ -444,47 +433,11 @@ func (m *Model) stageAdapter(name, roleValue string) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-func (m *Model) stageAdapterNext(name string) tea.Cmd {
-	if blocker := m.adapterMutationBlocker(); blocker != "" {
-		m.print("adapter err: " + blocker)
-		return nil
-	}
-	if pending := m.inFlightLocks(); len(pending) > 0 {
-		m.print("adapter err: isolate pending " + strings.Join(pending, ","))
-		return nil
-	}
-	if m.adapterRestorationPending(name) {
-		m.print("adapter err: restore pending " + name)
-		return nil
-	}
-	adapter, ok := m.findAdapter(name)
-	if !ok {
-		m.print("adapter err: " + name)
-		return nil
-	}
-	cfg, err := m.profile.Add(adapter)
-	if err != nil {
-		m.print("adapter err: " + err.Error())
-		return nil
-	}
-	m.print(fmt.Sprintf("adapter: %s %s", cfg.AdapterRole, cfg.Name))
-	m.markLockPending(cfg.Name)
-	return m.trackEffect(lockdownAdapterCmd(cfg))
-}
-
 func (m *Model) executeUnset(args []string) tea.Cmd {
-	if len(args) == 0 {
-		return m.unsetAdapter(m.activeAdapter)
+	if len(args) == 2 && strings.EqualFold(args[0], "adapter") {
+		return m.unsetAdapter(args[1])
 	}
-	if strings.EqualFold(args[0], "adapter") {
-		if len(args) == 1 {
-			return m.unsetAdapter(m.activeAdapter)
-		}
-		if len(args) == 2 {
-			return m.unsetAdapter(args[1])
-		}
-	}
-	m.print("use: unset | unset adapter <name>")
+	m.print("use: unset adapter <name>")
 	return nil
 }
 
@@ -600,7 +553,7 @@ func (m Model) adapterMutationBlocker() string {
 	case anyPending(m.restorePending):
 		return "adapter restore pending"
 	case m.natActive:
-		return "takeover active"
+		return "nat active"
 	case m.bridge != nil:
 		return "bridge active"
 	case m.edgeSession != nil:
@@ -681,10 +634,6 @@ func (m *Model) executeLoad(args []string) tea.Cmd {
 	}
 	if len(args) != 1 {
 		m.print("use: load [name]")
-		return nil
-	}
-	if args[0] == "<>" {
-		m.listConfigs()
 		return nil
 	}
 	if blocker := m.adapterMutationBlocker(); blocker != "" {
@@ -797,19 +746,27 @@ func (m *Model) executeStart(args []string) tea.Cmd {
 		m.print("live err: macOS root privileges are required; offline project, Rules, and saved Network observations remain available")
 		return nil
 	}
-	if len(args) == 0 || len(args) > 2 {
-		m.print("use: start listen|bridge [fast|controlled]|takeover|nat|edge <mode>")
-		return nil
-	}
-	if len(args) == 2 && !strings.EqualFold(args[0], "bridge") && !strings.EqualFold(args[0], "edge") {
-		m.print("use: start listen|bridge [fast|controlled]|takeover|nat|edge <mode>")
+	if len(args) < 1 || len(args) > 2 {
+		m.print("use: start listen | start bridge <fast|controlled> | start nat | start edge <observe|route>")
 		return nil
 	}
 	operation := strings.ToLower(args[0])
-	switch operation {
-	case "listen", "bridge", "edge", "takeover", "nat":
-	default:
-		m.print("use: start listen|bridge [fast|controlled]|takeover|nat|edge <mode>")
+	if operation == "listen" || operation == "nat" {
+		if len(args) != 1 {
+			m.print("use: start " + operation)
+			return nil
+		}
+	} else if operation == "bridge" || operation == "edge" {
+		if len(args) != 2 {
+			if operation == "bridge" {
+				m.print("use: start bridge <fast|controlled>")
+			} else {
+				m.print("use: start edge <observe|route>")
+			}
+			return nil
+		}
+	} else {
+		m.print("use: start listen | start bridge <fast|controlled> | start nat | start edge <observe|route>")
 		return nil
 	}
 	if m.profileNeedsRehydrate {
@@ -860,13 +817,10 @@ func (m *Model) executeStart(args []string) tea.Cmd {
 		m.beginRuntimeOperation("listen start")
 		return m.trackEffect(startListenPolicyCmd(targets, "listen", dataplane.ModeListen, revision, rules))
 	case "bridge":
-		mode := bridge.ModeFast
-		if len(args) == 2 {
-			mode = bridge.Mode(strings.ToLower(args[1]))
-			if mode != bridge.ModeFast && mode != bridge.ModeControlled {
-				m.print("use: start bridge [fast|controlled]")
-				return nil
-			}
+		mode := bridge.Mode(strings.ToLower(args[1]))
+		if mode != bridge.ModeFast && mode != bridge.ModeControlled {
+			m.print("use: start bridge <fast|controlled>")
+			return nil
 		}
 		if pending := m.pendingRuntimeOperation(); pending != "" {
 			m.print("bridge err: operation pending: " + pending)
@@ -898,10 +852,7 @@ func (m *Model) executeStart(args []string) tea.Cmd {
 		m.beginRuntimeOperation("bridge start")
 		return m.trackEffect(startBridgeCmd(host, sw, m.eapolPolicy(), mode, revision, rules, m.bridgeControlledOptions))
 	case "edge":
-		mode := m.edgeConfiguredMode
-		if len(args) == 2 {
-			mode = strings.ToLower(args[1])
-		}
+		mode := strings.ToLower(args[1])
 		if mode != "observe" && mode != "route" {
 			m.print("use: start edge <observe|route>")
 			return nil
@@ -930,35 +881,33 @@ func (m *Model) executeStart(args []string) tea.Cmd {
 		return m.trackEffect(startEdgeCmd(
 			targets[0].Name, m.edgeUpstream, edge.Mode(mode), revision, rules, m.edgeForwards,
 		))
-	case "nat", "takeover":
+	case "nat":
 		if pending := m.pendingRuntimeOperation(); pending != "" {
-			m.print("takeover err: operation pending: " + pending)
+			m.print("nat err: operation pending: " + pending)
 			return nil
 		}
 		if m.bridge == nil {
-			m.print("takeover err: bridge")
+			m.print("nat err: bridge")
 			return nil
 		}
 		if m.bridgeMode == string(bridge.ModeControlled) {
-			m.print("takeover err: fast bridge is required")
+			m.print("nat err: fast bridge is required")
 			return nil
 		}
 		if m.natActive {
-			snapshot := m.bridge.TakeoverSnapshot()
+			snapshot := m.bridge.NATSnapshot()
 			if snapshot.CleanupPending {
-				m.print("takeover err: cleanup pending; use: stop takeover")
+				m.print("nat err: cleanup pending; use: stop nat")
 			} else {
-				m.print("takeover: on")
+				m.print("nat: on")
 			}
 			return nil
 		}
-		m.print("takeover: start")
-		m.beginRuntimeOperation("takeover start")
-		return m.trackEffect(startNATCmd(m.bridge, m.bridgeTakeoverConfig()))
-	default:
-		m.print("use: start listen|bridge [fast|controlled]|takeover|nat|edge <mode>")
-		return nil
+		m.print("nat: start")
+		m.beginRuntimeOperation("nat start")
+		return m.trackEffect(startNATCmd(m.bridge, m.bridgeNATConfig()))
 	}
+	return nil
 }
 
 // prepareStagedConfigForLive refreshes platform-owned adapter metadata only at
@@ -1049,7 +998,7 @@ func (m *Model) setMACsecToggle(enabled bool) {
 
 func (m *Model) executeStop(args []string) tea.Cmd {
 	if len(args) != 1 {
-		m.print("use: stop listen|bridge|takeover|nat|edge")
+		m.print("use: stop listen|bridge|nat|edge")
 		return nil
 	}
 	if m.runtimeOperation != "" {
@@ -1077,7 +1026,7 @@ func (m *Model) executeStop(args []string) tea.Cmd {
 			return nil
 		}
 		if m.natActive {
-			m.print("bridge err: takeover; use: stop takeover")
+			m.print("bridge err: nat; use: stop nat")
 			return nil
 		}
 		m.print("bridge: stop")
@@ -1097,16 +1046,16 @@ func (m *Model) executeStop(args []string) tea.Cmd {
 		m.listenStopPending = true
 		m.beginRuntimeOperation("listen stop")
 		return m.trackEffect(stopListenCmd(m.listener, m.listenInterfaces))
-	case "nat", "takeover":
+	case "nat":
 		if m.bridge == nil || !m.natActive {
-			m.print("takeover: off")
+			m.print("nat: off")
 			return nil
 		}
-		m.print("takeover: stop")
-		m.beginRuntimeOperation("takeover stop")
+		m.print("nat: stop")
+		m.beginRuntimeOperation("nat stop")
 		return m.trackEffect(stopNATCmd(m.bridge))
 	default:
-		m.print("use: stop listen|bridge|takeover|nat|edge")
+		m.print("use: stop listen|bridge|nat|edge")
 		return nil
 	}
 }
@@ -1167,7 +1116,7 @@ func (m *Model) executeConf(args []string) tea.Cmd {
 	cfg, ok := m.profile.ByName(args[0])
 	if !ok {
 		m.print("adapter off: " + args[0])
-		m.print("use: set " + args[0] + " <host|switch>")
+		m.print("use: set adapter " + args[0] + " <host|switch>")
 		return nil
 	}
 	m.activeAdapter = cfg.Name
@@ -1299,16 +1248,16 @@ func (m *Model) showBridge() {
 	m.print("bridge state: " + state)
 	next := m.bridgeControlledOptions
 	m.print(fmt.Sprintf("controlled next queue-depth=%d overload=%s", next.QueueDepth, next.Overload))
-	takeoverState := "off"
+	natState := "off"
 	if m.bridge != nil {
-		snapshot := m.bridge.TakeoverSnapshot()
+		snapshot := m.bridge.NATSnapshot()
 		if snapshot.Active {
-			takeoverState = "on"
+			natState = "on"
 		} else if snapshot.CleanupPending {
-			takeoverState = "cleanup-pending"
+			natState = "cleanup-pending"
 		}
 	}
-	m.print("takeover: " + takeoverState)
+	m.print("nat: " + natState)
 	m.print(eapolLogoffStatus(m.eapolSuppressLogoff))
 	m.print(macsecStatus(m.eapolDowngradeMACsec))
 	if m.bridge != nil && m.bridgeMode == string(bridge.ModeControlled) {

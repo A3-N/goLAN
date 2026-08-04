@@ -2,6 +2,7 @@ package listen
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"os"
@@ -382,6 +383,36 @@ func TestAnalyzePacketDiscoversDHCPOptions(t *testing.T) {
 	if !hasEvent(events, "dns", "192.0.2.53", "DHCP") {
 		t.Fatalf("missing DHCP DNS event: %+v", events)
 	}
+	if !hasEvent(events, "dhcp_message", "Request", "DHCP") ||
+		!hasEvent(events, "dhcp_server", "192.0.2.2", "DHCP") ||
+		!hasEvent(events, "dhcp_hostname", "client-30", "DHCP") {
+		t.Fatalf("missing readable DHCP identity events: %+v", events)
+	}
+}
+
+func TestAnalyzePacketDiscoversLLDPAndSTPRoot(t *testing.T) {
+	src := mac(t, "02:00:00:00:00:77")
+	lldpPayload := appendLLDPTLV(nil, 1, append([]byte{4}, src...))
+	lldpPayload = appendLLDPTLV(lldpPayload, 2, append([]byte{5}, []byte("en7")...))
+	lldpPayload = appendLLDPTLV(lldpPayload, 3, []byte{0, 120})
+	lldpPayload = appendLLDPTLV(lldpPayload, 5, []byte("access-switch"))
+	lldpPayload = appendLLDPTLV(lldpPayload, 0, nil)
+	events := AnalyzePacket(decode(ethernet(src, mac(t, "01:80:c2:00:00:0e"), 0x88cc, lldpPayload)), nil)
+	if !hasEvent(events, "lldp_chassis", src.String(), "LLDP") ||
+		!hasEvent(events, "lldp_port", "en7", "LLDP") ||
+		!hasEvent(events, "lldp_system_name", "access-switch", "LLDP") {
+		t.Fatalf("missing LLDP infrastructure events: %+v", events)
+	}
+
+	rootMAC := mac(t, "02:00:00:00:00:01")
+	bpdu := make([]byte, 35)
+	binary.BigEndian.PutUint16(bpdu[5:7], 0x8000)
+	copy(bpdu[7:13], rootMAC)
+	llcBPDU := append([]byte{0x42, 0x42, 0x03}, bpdu...)
+	events = AnalyzePacket(decode(ethernet(src, mac(t, "01:80:c2:00:00:00"), uint16(len(llcBPDU)), llcBPDU)), nil)
+	if !hasEvent(events, "stp_root", "8000/"+rootMAC.String(), "STP") {
+		t.Fatalf("missing STP root event: %+v", events)
+	}
 }
 
 func decode(data []byte) gopacket.Packet {
@@ -460,8 +491,18 @@ func dhcpPayload(clientMAC net.HardwareAddr, clientIP, yourIP, routerIP, dnsIP n
 	out = append(out, routerIP.To4()...)
 	out = append(out, 6, 4)
 	out = append(out, dnsIP.To4()...)
+	out = append(out, 53, 1, 3)
+	out = append(out, 54, 4, 192, 0, 2, 2)
+	out = append(out, 12, 9)
+	out = append(out, []byte("client-30")...)
 	out = append(out, 255)
 	return out
+}
+
+func appendLLDPTLV(destination []byte, kind uint16, value []byte) []byte {
+	header := uint16(kind<<9) | uint16(len(value))
+	destination = append(destination, byte(header>>8), byte(header))
+	return append(destination, value...)
 }
 
 func hasEvent(events []Event, field, value, packet string) bool {

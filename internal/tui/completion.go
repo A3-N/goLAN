@@ -140,7 +140,7 @@ func (m Model) completionCandidateSet(input string) ([]string, string) {
 		candidates = topLevelCommands()
 	case lower[0] == "show":
 		if len(lower) <= 2 {
-			candidates = []string{"adapters", "bridge", "captures", "config", "edge", "health", "project", "rules", "takeover"}
+			candidates = []string{"adapters", "bridge", "captures", "config", "edge", "health", "nat", "project", "rules"}
 		}
 	case lower[0] == "set":
 		candidates = m.setCompletions(lower, trailingSpace)
@@ -160,7 +160,7 @@ func (m Model) completionCandidateSet(input string) ([]string, string) {
 		}
 	case lower[0] == "start":
 		if len(lower) <= 2 {
-			candidates = []string{"bridge", "edge", "listen", "nat", "takeover"}
+			candidates = []string{"bridge", "edge", "listen", "nat"}
 		} else if len(lower) <= 3 && lower[1] == "bridge" {
 			candidates = []string{"controlled", "fast"}
 		} else if len(lower) <= 3 && lower[1] == "edge" {
@@ -168,7 +168,7 @@ func (m Model) completionCandidateSet(input string) ([]string, string) {
 		}
 	case lower[0] == "stop":
 		if len(lower) <= 2 {
-			candidates = []string{"bridge", "edge", "listen", "nat", "takeover"}
+			candidates = []string{"bridge", "edge", "listen", "nat"}
 		}
 	case lower[0] == "project":
 		if len(lower) == 1 || len(lower) == 2 && !trailingSpace {
@@ -182,8 +182,8 @@ func (m Model) completionCandidateSet(input string) ([]string, string) {
 		} else if lower[1] == "open-recent" && (len(lower) == 2 && trailingSpace || len(lower) == 3 && !trailingSpace) {
 			candidates = m.recentProjectIndexes()
 		} else if lower[1] == "recover" && (len(lower) == 2 && trailingSpace || len(lower) == 3 && !trailingSpace) {
-			candidates = []string{"archive", "attach", "capture", "policy", "session"}
-		} else if lower[1] == "recover" && (lower[2] == "capture" || lower[2] == "policy") && (len(lower) == 3 && trailingSpace || len(lower) == 4 && !trailingSpace) {
+			candidates = []string{"archive", "attach", "policy", "session"}
+		} else if lower[1] == "recover" && lower[2] == "policy" && (len(lower) == 3 && trailingSpace || len(lower) == 4 && !trailingSpace) {
 			candidates = []string{"archive", "attach"}
 		} else if lower[1] == "sessions" && (len(lower) == 2 && trailingSpace || len(lower) == 3 && !trailingSpace) {
 			candidates = []string{"archive", "list"}
@@ -194,13 +194,13 @@ func (m Model) completionCandidateSet(input string) ([]string, string) {
 		} else if lower[1] == "config" && lower[2] == "export" && (len(lower) == 3 && trailingSpace || len(lower) == 4 && !trailingSpace) {
 			candidates = m.configNames()
 		} else if lower[1] == "journals" && (len(lower) == 2 && trailingSpace || len(lower) == 3 && !trailingSpace) {
-			candidates = []string{"capture", "list"}
+			candidates = []string{"list"}
 		}
 	case lower[0] == "policy":
 		if len(lower) == 1 || (len(lower) == 2 && !trailingSpace) {
 			candidates = []string{"compare", "history", "rollback", "use"}
 		} else if lower[1] == "use" && ((len(lower) == 2 && trailingSpace) || (len(lower) == 3 && !trailingSpace)) {
-			candidates = []string{"block-internet", "controlled-bridge", "dns-debug", "eapol-debug", "high-latency", "observe-everything", "open-internet", "packet-loss", "web-only"}
+			candidates = []string{"block-internet", "controlled-bridge", "high-latency", "observe-everything", "open-internet", "packet-loss", "web-only"}
 		} else if lower[1] == "rollback" && ((len(lower) == 2 && trailingSpace) || (len(lower) == 3 && !trailingSpace)) {
 			candidates = m.policyRevisionNames()
 		} else if lower[1] == "compare" && ((len(lower) == 2 && trailingSpace) || len(lower) == 3 || (len(lower) == 4 && !trailingSpace)) {
@@ -208,8 +208,8 @@ func (m Model) completionCandidateSet(input string) ([]string, string) {
 		}
 	case lower[0] == "canvas":
 		if len(lower) == 1 || len(lower) == 2 && !trailingSpace {
-			candidates = []string{"auto-layout", "build", "export", "rebuild", "reset-generated", "snapshot"}
-		} else if (lower[1] == "build" || lower[1] == "rebuild") &&
+			candidates = []string{"auto-layout", "build", "reset-generated", "snapshot"}
+		} else if lower[1] == "build" &&
 			(len(lower) == 2 && trailingSpace ||
 				len(lower) == 3 && !trailingSpace) {
 			candidates = m.projectNetworkSessionIDs()
@@ -224,12 +224,14 @@ func (m Model) completionCandidateSet(input string) ([]string, string) {
 			candidates = m.ruleIDs()
 		}
 	case lower[0] == "bridge":
-		if len(lower) == 1 || (len(lower) == 2 && !trailingSpace) {
-			candidates = []string{"show"}
-		}
+		// Bridge is a show target, not a top-level command.
+		candidates = nil
 	case lower[0] == "network":
 		if len(lower) == 1 || len(lower) == 2 && !trailingSpace {
-			candidates = []string{"filter", "reset", "search", "session", "show"}
+			candidates = []string{"access", "baseline", "compare", "explain", "fate", "filter", "identity", "infrastructure", "passport", "probe", "reset", "rule", "search", "services", "session", "show"}
+		} else if (lower[1] == "access" || lower[1] == "explain" || lower[1] == "fate" || lower[1] == "identity") &&
+			(len(lower) == 2 && trailingSpace || len(lower) == 3 && !trailingSpace) {
+			candidates = m.networkDeviceSelectors()
 		} else if lower[1] == "filter" &&
 			(len(lower) == 2 && trailingSpace || len(lower) == 3 && !trailingSpace) {
 			candidates = []string{"all", "addressing", "dns", "http", "access", "risks", "actions"}
@@ -244,6 +246,31 @@ func (m Model) completionCandidateSet(input string) ([]string, string) {
 			for _, session := range m.project.Manifest().NetworkSessions {
 				candidates = append(candidates, session.ID)
 			}
+		} else if lower[1] == "baseline" && (len(lower) == 2 && trailingSpace || len(lower) == 3 && !trailingSpace) {
+			candidates = []string{"clear", "set", "show"}
+		} else if lower[1] == "baseline" && len(lower) >= 3 && lower[2] == "set" &&
+			(len(lower) == 3 && trailingSpace || len(lower) == 4 && !trailingSpace) {
+			candidates = m.projectNetworkSessionIDs()
+		} else if lower[1] == "compare" && (len(lower) == 2 && trailingSpace || len(lower) == 3 && !trailingSpace) {
+			candidates = []string{"baseline", "session"}
+		} else if lower[1] == "compare" && len(lower) >= 3 && lower[2] == "session" &&
+			(len(lower) == 3 && trailingSpace || len(lower) == 4 && !trailingSpace) {
+			candidates = m.projectNetworkSessionIDs()
+		} else if lower[1] == "passport" && (len(lower) == 2 && trailingSpace || len(lower) == 3 && !trailingSpace) {
+			candidates = []string{"compare", "save", "verify"}
+		} else if lower[1] == "probe" && (len(lower) == 2 && trailingSpace || len(lower) == 3 && !trailingSpace) {
+			candidates = []string{"plan", "run"}
+		} else if lower[1] == "probe" && len(lower) >= 3 && lower[2] == "plan" &&
+			(len(lower) == 3 && trailingSpace || len(lower) == 4 && !trailingSpace) {
+			candidates = []string{"device", "dhcp", "dns", "gateway", "route"}
+		} else if lower[1] == "probe" && len(lower) >= 4 && lower[2] == "plan" && lower[3] == "dhcp" &&
+			(len(lower) == 4 && trailingSpace || len(lower) == 5 && !trailingSpace) {
+			candidates = m.adapterNames()
+		} else if lower[1] == "rule" && (len(lower) == 2 && trailingSpace || len(lower) == 3 && !trailingSpace) {
+			candidates = []string{"draft"}
+		} else if lower[1] == "rule" && len(lower) >= 3 && lower[2] == "draft" &&
+			(len(lower) == 3 && trailingSpace || len(lower) == 4 && !trailingSpace) {
+			candidates = m.networkDeviceSelectors()
 		}
 	case lower[0] == "send":
 		if len(lower) <= 2 {
@@ -274,12 +301,21 @@ func (m Model) projectConfigSourceIDs() []string {
 	return dedupe(result)
 }
 
+func (m Model) networkDeviceSelectors() []string {
+	devices := m.networkDevices()
+	result := make([]string, 0, len(devices)*2)
+	for _, device := range devices {
+		result = append(result, strconv.FormatUint(device.Number, 10), device.MAC)
+	}
+	return dedupe(result)
+}
+
 func (m Model) setCompletions(tokens []string, trailingSpace bool) []string {
 	if len(tokens) == 1 && !trailingSpace {
 		return []string{"set"}
 	}
 	if len(tokens) == 1 || (len(tokens) == 2 && !trailingSpace) {
-		return append(append(m.adapterNames(), "bridge", "edge"), propertyKeys()...)
+		return append([]string{"adapter", "bridge", "edge"}, propertyKeys()...)
 	}
 
 	target := tokens[1]
@@ -332,10 +368,6 @@ func (m Model) setCompletions(tokens []string, trailingSpace bool) []string {
 		}
 		return m.adapterNames()
 	}
-	if _, ok := m.findAdapter(target); ok {
-		return profile.AdapterRoles()
-	}
-
 	if len(tokens) == 2 && trailingSpace {
 		return m.valueCompletions(target)
 	}
@@ -490,12 +522,7 @@ func lowerTokens(tokens []string) []string {
 }
 
 func isConfCommand(value string) bool {
-	switch value {
-	case "conf", "config", "configure":
-		return true
-	default:
-		return false
-	}
+	return value == "conf"
 }
 
 func completionContext(input string) string {

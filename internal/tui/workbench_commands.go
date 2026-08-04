@@ -123,8 +123,8 @@ func (m *Model) projectCaptureJournalsCommand(args []string) {
 		m.print("project err: no active project")
 		return
 	}
-	if len(args) > 1 || len(args) == 1 && !strings.EqualFold(args[0], "list") && !strings.EqualFold(args[0], "capture") {
-		m.print("use: project journals [list|capture]")
+	if len(args) != 1 || !strings.EqualFold(args[0], "list") {
+		m.print("use: project journals list")
 		return
 	}
 	manifest := m.project.Manifest()
@@ -200,7 +200,7 @@ func (m *Model) projectConfigCommand(args []string) {
 		m.print("project err: no active project")
 		return
 	}
-	if len(args) == 0 || len(args) == 1 && strings.EqualFold(args[0], "list") {
+	if len(args) == 1 && strings.EqualFold(args[0], "list") {
 		manifest := m.project.Manifest()
 		m.print(fmt.Sprintf("project: config sources=%d", len(manifest.Configs)))
 		for index, source := range manifest.Configs {
@@ -222,7 +222,7 @@ func (m *Model) projectConfigCommand(args []string) {
 		}
 		m.exportProjectConfig(args[1])
 	default:
-		m.print("use: project config [list|update <source-id>|export <name.json>]")
+		m.print("use: project config list | project config update <source-id> | project config export <name.json>")
 	}
 }
 
@@ -428,7 +428,7 @@ func (m *Model) projectSessionsCommand(args []string) {
 		m.print("project err: no active project")
 		return
 	}
-	if len(args) == 0 || len(args) == 1 && strings.EqualFold(args[0], "list") {
+	if len(args) == 1 && strings.EqualFold(args[0], "list") {
 		if !m.refreshAssociatedSessions() {
 			m.print("project err: sessions " + m.projectSessionErr)
 			return
@@ -444,7 +444,7 @@ func (m *Model) projectSessionsCommand(args []string) {
 		return
 	}
 	if len(args) < 2 || !strings.EqualFold(args[0], "archive") {
-		m.print("use: project sessions [list|archive <artifact-directory>]")
+		m.print("use: project sessions list | project sessions archive <artifact-directory>")
 		return
 	}
 	if blocker := m.adapterMutationBlocker(); blocker != "" {
@@ -498,14 +498,12 @@ func (m *Model) reportUnindexedPolicies() {
 
 func (m *Model) recoverProjectArtifact(args []string) tea.Cmd {
 	if len(args) == 0 {
-		m.print("use: project recover [capture] attach|archive <capture-path> | project recover policy attach <revision> <path> | project recover policy archive <path> | project recover session <directory>")
+		m.print("use: project recover attach|archive <capture-path> | project recover policy attach <revision> <path> | project recover policy archive <path> | project recover session <directory>")
 		return nil
 	}
 	switch strings.ToLower(args[0]) {
 	case "attach", "archive":
 		m.recoverProjectCapture(args)
-	case "capture":
-		m.recoverProjectCapture(args[1:])
 	case "policy":
 		m.recoverProjectPolicy(args[1:])
 	case "session":
@@ -519,7 +517,7 @@ func (m *Model) recoverProjectArtifact(args []string) tea.Cmd {
 		}
 		return m.startProjectCaptureIndex(strings.Join(args[1:], " "))
 	default:
-		m.print("use: project recover [capture] attach|archive <capture-path> | project recover policy attach <revision> <path> | project recover policy archive <path> | project recover session <directory>")
+		m.print("use: project recover attach|archive <capture-path> | project recover policy attach <revision> <path> | project recover policy archive <path> | project recover session <directory>")
 	}
 	return nil
 }
@@ -702,7 +700,7 @@ func (m *Model) exportProjectCommand(args []string) tea.Cmd {
 		m.print("project err: no active project")
 		return nil
 	}
-	if len(args) == 0 || len(args) == 1 && strings.EqualFold(args[0], "bundle") {
+	if len(args) == 1 && strings.EqualFold(args[0], "bundle") {
 		m.openBundleExport()
 		return nil
 	}
@@ -851,11 +849,11 @@ func (m *Model) commitRules(revision, name string, rules []policy.Rule) error {
 
 func (m *Model) executeCanvas(args []string) tea.Cmd {
 	if len(args) == 0 {
-		m.print("use: canvas build|rebuild [session-id] | canvas auto-layout | canvas reset-generated confirm | canvas snapshot|export <destination.canvas>")
+		m.print("use: canvas build [session-id] | canvas auto-layout | canvas reset-generated confirm | canvas snapshot <destination.canvas>")
 		return nil
 	}
 	switch strings.ToLower(args[0]) {
-	case "build", "rebuild":
+	case "build":
 		m.buildNetworkCanvas(args[1:])
 		return nil
 	case "auto-layout":
@@ -874,9 +872,9 @@ func (m *Model) executeCanvas(args []string) tea.Cmd {
 		m.canvasDirty = true
 		m.print("canvas: generated network observations reset")
 		return nil
-	case "snapshot", "export":
+	case "snapshot":
 		if len(args) != 2 {
-			m.print("use: canvas snapshot|export <destination.canvas>")
+			m.print("use: canvas snapshot <destination.canvas>")
 			return nil
 		}
 		if m.canvasMap == nil || len(m.canvasMap.Hosts) == 0 {
@@ -890,7 +888,7 @@ func (m *Model) executeCanvas(args []string) tea.Cmd {
 		m.print("canvas: exported " + args[1])
 		return nil
 	default:
-		m.print("use: canvas build|rebuild [session-id] | canvas auto-layout | canvas reset-generated confirm | canvas snapshot|export <destination.canvas>")
+		m.print("use: canvas build [session-id] | canvas auto-layout | canvas reset-generated confirm | canvas snapshot <destination.canvas>")
 		return nil
 	}
 }
@@ -949,8 +947,8 @@ func (m Model) currentCapabilities() dataplane.Capabilities {
 		return dataplane.ForMode(dataplane.ModeEdgeObserve)
 	case m.edgeMode == "route":
 		return dataplane.ForMode(dataplane.ModeEdgeRoute)
-	case m.natActive && m.bridge != nil && m.bridge.TakeoverSnapshot().Active:
-		return dataplane.ForMode(dataplane.ModeTakeover)
+	case m.natActive && m.bridge != nil && m.bridge.NATSnapshot().Active:
+		return dataplane.ForMode(dataplane.ModeNAT)
 	case m.bridge != nil && m.bridgeMode == "controlled":
 		return dataplane.ForMode(dataplane.ModeControlledBridge)
 	case m.bridge != nil:
@@ -979,18 +977,18 @@ func (m *Model) showEdge() {
 	}
 }
 
-func (m *Model) showTakeover() {
+func (m *Model) showNAT() {
 	state := "off"
-	var snapshot bridge.TakeoverSnapshot
+	var snapshot bridge.NATSnapshot
 	if m.bridge != nil {
-		snapshot = m.bridge.TakeoverSnapshot()
+		snapshot = m.bridge.NATSnapshot()
 	}
 	if snapshot.Active {
 		state = "on"
 	} else if snapshot.CleanupPending {
 		state = "cleanup-pending"
 	}
-	m.print("takeover state: " + state)
+	m.print("nat state: " + state)
 	if !snapshot.Active && !snapshot.CleanupPending {
 		return
 	}

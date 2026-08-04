@@ -227,7 +227,7 @@ func TestFastCapturedPacketsAlwaysAppendPayloadFreeDecisions(t *testing.T) {
 	}
 }
 
-func TestTakeoverCaptureUsesEndpointModeAndDirections(t *testing.T) {
+func TestNATCaptureUsesEndpointModeAndDirections(t *testing.T) {
 	directory := t.TempDir()
 	journal, err := policy.OpenJournal(filepath.Join(directory, "decisions.jsonl"))
 	if err != nil {
@@ -235,7 +235,7 @@ func TestTakeoverCaptureUsesEndpointModeAndDirections(t *testing.T) {
 	}
 	defer journal.Close()
 	engine := policy.NewEngine(8)
-	if err := engine.Policies.Activate("takeover-capture", []policy.Rule{{
+	if err := engine.Policies.Activate("nat-capture", []policy.Rule{{
 		ID: "broad-frame-block", Enabled: true, Actions: []policy.Action{{Kind: policy.ActionBlock}},
 	}}); err != nil {
 		t.Fatal(err)
@@ -251,11 +251,11 @@ func TestTakeoverCaptureUsesEndpointModeAndDirections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mode != dataplane.ModeTakeover || result.Original.Direction != traffic.DirectionOutbound {
+	if mode != dataplane.ModeNAT || result.Original.Direction != traffic.DirectionOutbound {
 		t.Fatalf("mode=%s direction=%s", mode, result.Original.Direction)
 	}
 	if result.Decision.Status != dataplane.StatusShadow || result.Decision.EffectiveVerdict != policy.VerdictAllow {
-		t.Fatalf("non-IPv4 takeover decision=%#v", result.Decision)
+		t.Fatalf("non-IPv4 nat decision=%#v", result.Decision)
 	}
 }
 
@@ -632,25 +632,25 @@ func TestStopNATRetriesOnlyFailedState(t *testing.T) {
 	}
 }
 
-func TestStopTakeoverKeepsPFBoundaryAcrossHostReattach(t *testing.T) {
+func TestStopNATKeepsPFBoundaryAcrossHostReattach(t *testing.T) {
 	runner := &fakeCommandRunner{}
 	backend := &fakeFastPolicyBackend{}
 	state := &NATState{
 		BridgeName: "bridge7", HostDetached: true, PFEndpointRules: true,
-		PFRestorePending: true, takeoverPFRules: "takeover-rules\n",
+		PFRestorePending: true, natPFRules: "nat-rules\n",
 	}
 	session := &Session{
 		Host: Adapter{Name: "en11"}, runner: runner, nat: state,
 		fastPF: backend, fastPFRules: "fast-rules\n",
 	}
 
-	if err := session.StopTakeover(); err != nil {
-		t.Fatalf("StopTakeover: %v", err)
+	if err := session.StopNAT(); err != nil {
+		t.Fatalf("StopNAT: %v", err)
 	}
 	if session.nat != nil {
-		t.Fatalf("takeover state remains: %+v", session.nat)
+		t.Fatalf("nat state remains: %+v", session.nat)
 	}
-	wantPF := []string{"fast-rules\ntakeover-rules\n", "fast-rules\n"}
+	wantPF := []string{"fast-rules\nnat-rules\n", "fast-rules\n"}
 	if !reflect.DeepEqual(backend.applyHistory, wantPF) {
 		t.Fatalf("PF transition history=%q want=%q", backend.applyHistory, wantPF)
 	}
@@ -663,17 +663,17 @@ func TestStopTakeoverKeepsPFBoundaryAcrossHostReattach(t *testing.T) {
 	}
 }
 
-func TestStartTakeoverPreflightsAndTransitionsCompletePolicyBoundary(t *testing.T) {
+func TestStartNATPreflightsAndTransitionsCompletePolicyBoundary(t *testing.T) {
 	runner := &fakeCommandRunner{responses: []fakeCommandResponse{{
 		output: "bridge7: flags=8843\n\tether 02:00:00:00:00:77\n",
 	}}}
 	backend := &fakeFastPolicyBackend{}
 	l2 := &fakeBridgeRuleManager{}
 	engine := policy.NewEngine(8)
-	if err := engine.Policies.Activate("takeover-1", []policy.Rule{{
+	if err := engine.Policies.Activate("nat-1", []policy.Rule{{
 		ID: "block-web", Priority: 10, Enabled: true,
 		Match: policy.Match{
-			Modes:      []dataplane.Mode{dataplane.ModeTakeover},
+			Modes:      []dataplane.Mode{dataplane.ModeNAT},
 			Directions: []traffic.Direction{traffic.DirectionOutbound},
 			IPVersions: []uint8{4}, Protocols: []uint8{6},
 			DstPorts: policy.PortSet{Values: []uint16{80}},
@@ -689,16 +689,16 @@ func TestStartTakeoverPreflightsAndTransitionsCompletePolicyBoundary(t *testing.
 		targetMAC:    net.HardwareAddr{2, 0, 0, 0, 0, 1},
 		policyEngine: engine, fastPF: backend, fastPFRules: "fast-rules\n", l2Rules: l2,
 	}
-	if err := session.StartTakeover(TakeoverConfig{
+	if err := session.StartNAT(NATConfig{
 		MAC: "auto", IP: "192.0.2.10", CIDR: "24", DNS: "192.0.2.53", DHCP: "off",
 	}); err != nil {
-		t.Fatalf("StartTakeover: %v", err)
+		t.Fatalf("StartNAT: %v", err)
 	}
-	snapshot := session.TakeoverSnapshot()
+	snapshot := session.NATSnapshot()
 	if !snapshot.Active || !snapshot.PFEndpointRules || !snapshot.PFRestorationOwned ||
 		!snapshot.L2EndpointRules || !snapshot.L2RestorationOwned ||
 		snapshot.LivePolicyRules != 1 || snapshot.ShadowPolicyRules != 0 ||
-		snapshot.PolicyRevision != "takeover-1" {
+		snapshot.PolicyRevision != "nat-1" {
 		t.Fatalf("snapshot=%+v", snapshot)
 	}
 	if len(backend.applyHistory) != 2 ||
@@ -710,17 +710,17 @@ func TestStartTakeoverPreflightsAndTransitionsCompletePolicyBoundary(t *testing.
 	if !reflect.DeepEqual(l2.calls, []string{"reset", "safety", "leaks", "eapol"}) {
 		t.Fatalf("L2 start transition=%v", l2.calls)
 	}
-	if err := session.StopTakeover(); err != nil {
-		t.Fatalf("StopTakeover: %v", err)
+	if err := session.StopNAT(); err != nil {
+		t.Fatalf("StopNAT: %v", err)
 	}
-	if session.TakeoverSnapshot().Active || session.nat != nil {
-		t.Fatalf("takeover remained after stop: %+v", session.TakeoverSnapshot())
+	if session.NATSnapshot().Active || session.nat != nil {
+		t.Fatalf("nat remained after stop: %+v", session.NATSnapshot())
 	}
 	if got := backend.applyHistory[len(backend.applyHistory)-1]; got != "fast-rules\n" {
 		t.Fatalf("final PF rules=%q", got)
 	}
 }
-func TestTakeoverL2TransitionRemovesAndRestoresFastPolicy(t *testing.T) {
+func TestNATL2TransitionRemovesAndRestoresFastPolicy(t *testing.T) {
 	manager := &fakeBridgeRuleManager{}
 	session := &Session{
 		Host:      Adapter{Name: "en11", LocalMAC: "02:00:00:00:00:11"},
@@ -728,11 +728,11 @@ func TestTakeoverL2TransitionRemovesAndRestoresFastPolicy(t *testing.T) {
 		targetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}, l2Rules: manager,
 	}
 	state := &NATState{BridgeName: "bridge7", L2RestorePending: true}
-	if err := session.installTakeoverL2Rules(state); err != nil {
+	if err := session.installNATL2Rules(state); err != nil {
 		t.Fatal(err)
 	}
 	if !state.L2EndpointRules || !reflect.DeepEqual(manager.calls, []string{"reset", "safety", "leaks", "eapol"}) {
-		t.Fatalf("takeover L2 state=%+v calls=%v", state, manager.calls)
+		t.Fatalf("nat L2 state=%+v calls=%v", state, manager.calls)
 	}
 	manager.calls = nil
 	if err := session.restoreFastL2Rules(state); err != nil {
@@ -743,7 +743,7 @@ func TestTakeoverL2TransitionRemovesAndRestoresFastPolicy(t *testing.T) {
 	}
 }
 
-func TestTakeoverL2RestoreFailurePreventsHostReattach(t *testing.T) {
+func TestNATL2RestoreFailurePreventsHostReattach(t *testing.T) {
 	want := errors.New("rules busy")
 	manager := &fakeBridgeRuleManager{err: want}
 	runner := &fakeCommandRunner{}
@@ -753,18 +753,18 @@ func TestTakeoverL2RestoreFailurePreventsHostReattach(t *testing.T) {
 		fastPF: backend, fastPFRules: "fast-rules\n", l2Rules: manager,
 		nat: &NATState{
 			BridgeName: "bridge7", HostDetached: true, PFRestorePending: true,
-			takeoverPFRules: "takeover-rules\n", L2RestorePending: true,
+			natPFRules: "nat-rules\n", L2RestorePending: true,
 		},
 	}
-	if err := session.StopTakeover(); !errors.Is(err, want) {
-		t.Fatalf("StopTakeover error=%v", err)
+	if err := session.StopNAT(); !errors.Is(err, want) {
+		t.Fatalf("StopNAT error=%v", err)
 	}
 	if len(runner.calls) != 0 || session.nat == nil || !session.nat.HostDetached {
 		t.Fatalf("host reattached across L2 restore failure: calls=%#v state=%+v", runner.calls, session.nat)
 	}
 }
 
-func TestStopTakeoverRetainsFailedPFTransitionBeforeReattach(t *testing.T) {
+func TestStopNATRetainsFailedPFTransitionBeforeReattach(t *testing.T) {
 	want := errors.New("PF busy")
 	runner := &fakeCommandRunner{}
 	backend := &fakeFastPolicyBackend{applyErr: want}
@@ -773,56 +773,56 @@ func TestStopTakeoverRetainsFailedPFTransitionBeforeReattach(t *testing.T) {
 		fastPFRules: "fast-rules\n",
 		nat: &NATState{
 			BridgeName: "bridge7", HostDetached: true, PFEndpointRules: true,
-			PFRestorePending: true, takeoverPFRules: "takeover-rules\n",
+			PFRestorePending: true, natPFRules: "nat-rules\n",
 		},
 	}
-	if err := session.StopTakeover(); !errors.Is(err, want) {
+	if err := session.StopNAT(); !errors.Is(err, want) {
 		t.Fatalf("first stop error=%v", err)
 	}
 	if len(runner.calls) != 0 || session.nat == nil || !session.nat.HostDetached {
 		t.Fatalf("host reattached across failed transition: calls=%#v state=%+v", runner.calls, session.nat)
 	}
 	backend.applyErr = nil
-	if err := session.StopTakeover(); err != nil {
-		t.Fatalf("retry StopTakeover: %v", err)
+	if err := session.StopNAT(); err != nil {
+		t.Fatalf("retry StopNAT: %v", err)
 	}
 	if session.nat != nil {
-		t.Fatalf("takeover state remains after retry: %+v", session.nat)
+		t.Fatalf("nat state remains after retry: %+v", session.nat)
 	}
 }
 
-func TestStopTakeoverRetriesSTPRestoration(t *testing.T) {
+func TestStopNATRetriesSTPRestoration(t *testing.T) {
 	want := errors.New("stp busy")
 	runner := &fakeCommandRunner{responses: []fakeCommandResponse{{}, {output: "busy", err: want}}}
 	session := &Session{
 		Host: Adapter{Name: "en11"}, runner: runner,
 		nat: &NATState{BridgeName: "bridge7", HostDetached: true, Started: true},
 	}
-	if err := session.StopTakeover(); !errors.Is(err, want) {
-		t.Fatalf("first StopTakeover error=%v", err)
+	if err := session.StopNAT(); !errors.Is(err, want) {
+		t.Fatalf("first StopNAT error=%v", err)
 	}
-	snapshot := session.TakeoverSnapshot()
+	snapshot := session.NATSnapshot()
 	if snapshot.Active || !snapshot.CleanupPending || session.nat == nil || !session.nat.HostSTPRestorePending {
 		t.Fatalf("failed STP state=%+v snapshot=%+v", session.nat, snapshot)
 	}
-	if err := session.StartTakeover(TakeoverConfig{}); err == nil || !strings.Contains(err.Error(), "cleanup is pending") {
+	if err := session.StartNAT(NATConfig{}); err == nil || !strings.Contains(err.Error(), "cleanup is pending") {
 		t.Fatalf("restart during cleanup error=%v", err)
 	}
-	if err := session.StopTakeover(); err != nil {
-		t.Fatalf("retry StopTakeover: %v", err)
+	if err := session.StopNAT(); err != nil {
+		t.Fatalf("retry StopNAT: %v", err)
 	}
 	if session.nat != nil {
-		t.Fatalf("takeover state remains after STP retry: %+v", session.nat)
+		t.Fatalf("nat state remains after STP retry: %+v", session.nat)
 	}
 }
 
-func TestStopTakeoverRestoresBackendCreatedOnlyForEndpoint(t *testing.T) {
+func TestStopNATRestoresBackendCreatedOnlyForEndpoint(t *testing.T) {
 	backend := &fakeFastPolicyBackend{}
 	session := &Session{
 		fastPF: backend,
 		nat:    &NATState{PFCreated: true, PFEndpointRules: true, PFRestorePending: true},
 	}
-	if err := session.StopTakeover(); err != nil {
+	if err := session.StopNAT(); err != nil {
 		t.Fatal(err)
 	}
 	if backend.restoreCalls != 1 || session.fastPF != nil || session.nat != nil {
@@ -830,7 +830,7 @@ func TestStopTakeoverRestoresBackendCreatedOnlyForEndpoint(t *testing.T) {
 	}
 }
 
-func TestCleanupRetainsBridgeWhileTakeoverRestorationIsPending(t *testing.T) {
+func TestCleanupRetainsBridgeWhileNATRestorationIsPending(t *testing.T) {
 	want := errors.New("route busy")
 	runner := &fakeCommandRunner{responses: []fakeCommandResponse{{output: "busy", err: want}}}
 	session := &Session{
@@ -843,14 +843,14 @@ func TestCleanupRetainsBridgeWhileTakeoverRestorationIsPending(t *testing.T) {
 		t.Fatalf("cleanup error=%v", err)
 	}
 	if session.bridgeName != "bridge7" || session.nat == nil {
-		t.Fatalf("bridge or takeover state discarded: bridge=%q state=%+v", session.bridgeName, session.nat)
+		t.Fatalf("bridge or nat state discarded: bridge=%q state=%+v", session.bridgeName, session.nat)
 	}
 	if len(runner.calls) != 1 || runner.calls[0].name != "route" {
-		t.Fatalf("unrelated restoration ran before takeover cleanup: %#v", runner.calls)
+		t.Fatalf("unrelated restoration ran before nat cleanup: %#v", runner.calls)
 	}
 	for _, call := range runner.calls {
 		if call.name == "ifconfig" && reflect.DeepEqual(call.args, []string{"bridge7", "destroy"}) {
-			t.Fatal("bridge destroyed while takeover restoration remained pending")
+			t.Fatal("bridge destroyed while nat restoration remained pending")
 		}
 	}
 }

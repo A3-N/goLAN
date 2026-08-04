@@ -84,7 +84,7 @@ func TestProjectSessionRecoveryIndexesPassiveCaptureJournal(t *testing.T) {
 		!strings.Contains(output, "session capture journals indexed imported=1 deduplicated=0") {
 		t.Fatalf("recovery output=%q", output)
 	}
-	m.executeCommand("project journals capture")
+	m.executeCommand("project journals list")
 	output = strings.Join(m.output, "\n")
 	if !strings.Contains(output, "project: capture journals=1") ||
 		!strings.Contains(output, "mode=listen") ||
@@ -124,7 +124,7 @@ func TestProjectSessionInventoryRendersAndArchivesStaleMarker(t *testing.T) {
 		t.Fatalf("Main health output=%v", m.output)
 	}
 
-	m.executeCommand("project sessions")
+	m.executeCommand("project sessions list")
 	if output := strings.Join(m.output, "\n"); !strings.Contains(output, "session 1 stale "+directory) {
 		t.Fatalf("session inventory output=%q", output)
 	}

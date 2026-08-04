@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -91,7 +92,10 @@ type Model struct {
 	selectedNetworkDevice   string
 	networkSection          int
 	networkExpanded         map[networkobs.Category]bool
+	networkInsight          string
 	networkSessionPersisted string
+	pendingNetworkProbe     *networkobs.ProbePlan
+	networkProbeRunning     bool
 	selectedRuleID          string
 	artifacts               *artifactRegistry
 	canvasMap               *canvas.Map
@@ -227,6 +231,10 @@ type adapterStateMsg struct {
 	name  string
 	state string
 	err   error
+}
+
+type networkProbeMsg struct {
+	result networkobs.ProbeResult
 }
 
 type adapterLockdownMsg struct {
@@ -517,6 +525,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.print("  " + line)
 		}
 		return m, nil
+	case networkProbeMsg:
+		m.networkProbeRunning = false
+		m.pendingNetworkProbe = nil
+		m.printNetworkProbeResult(msg.result)
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -740,27 +753,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case bridgeNATMsg:
 		if msg.active {
-			m.clearRuntimeOperation("takeover start")
+			m.clearRuntimeOperation("nat start")
 		} else {
-			m.clearRuntimeOperation("takeover stop")
+			m.clearRuntimeOperation("nat stop")
 		}
 		if m.bridge != msg.session {
 			return m, nil
 		}
 		if msg.err != nil {
-			snapshot := msg.session.TakeoverSnapshot()
+			snapshot := msg.session.NATSnapshot()
 			m.natActive = snapshot.Active || snapshot.CleanupPending
-			m.print("takeover err: " + msg.err.Error())
+			m.print("nat err: " + msg.err.Error())
 			if snapshot.CleanupPending {
-				m.print("takeover: cleanup pending; use: stop takeover")
+				m.print("nat: cleanup pending; use: stop nat")
 			}
 			return m, nil
 		}
 		m.natActive = msg.active
 		if msg.active {
-			m.print("takeover: on")
+			m.print("nat: on")
 		} else {
-			m.print("takeover: off")
+			m.print("nat: off")
 		}
 		return m, nil
 	case eapolSentMsg:
@@ -895,6 +908,12 @@ func (m Model) updateCLI(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.openRuleEditor(false)
 				return m, nil
 			}
+			if m.workspace == workspaceNetwork && m.activeCard == cardInspector {
+				if device, ok := m.selectedNetworkDeviceSnapshot(); ok {
+					m.executeNetworkRule([]string{"draft", strconv.FormatUint(device.Number, 10)})
+				}
+				return m, nil
+			}
 		case "M":
 			if m.workspace == workspaceRules {
 				m.openRuleEditor(true)
@@ -903,6 +922,16 @@ func (m Model) updateCLI(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if m.workspace == workspaceNetwork && m.activeCard == cardInspector {
 				m.toggleNetworkSection()
+				return m, nil
+			}
+		case "o":
+			if m.workspace == workspaceNetwork && m.activeCard == cardInspector {
+				m.networkInsight = ""
+				return m, nil
+			}
+		case "e", "a", "f":
+			if m.workspace == workspaceNetwork && m.activeCard == cardInspector {
+				m.networkInsight = map[string]string{"e": "explain", "a": "access", "f": "fate"}[msg.String()]
 				return m, nil
 			}
 		}

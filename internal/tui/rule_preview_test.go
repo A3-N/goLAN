@@ -22,7 +22,7 @@ func TestRuleEditorSeparatesLiveEvidenceFromStaticDeploymentPreview(t *testing.T
 		"no transformations · packet bytes unchanged",
 		"Compatibility:",
 		"listen=SHADOW · fast=LIVE",
-		"controlled=LIVE · takeover=LIVE",
+		"controlled=LIVE · nat=LIVE",
 		"edge-observe=SHADOW · edge-route=LIVE",
 		"Active mode:",
 	} {

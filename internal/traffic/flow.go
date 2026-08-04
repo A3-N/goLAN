@@ -67,38 +67,41 @@ func NewTracker(maxFlows int) *Tracker {
 	return &Tracker{maxFlows: maxFlows, flows: make(map[FlowID]*trackedFlow)}
 }
 
+// CanonicalFlow returns the shared bidirectional identity and initial
+// transport state for one frame without retaining tracker state.
+func CanonicalFlow(frame Frame) Flow {
+	decoded := frame.Decoded()
+	a := Endpoint{IP: decoded.SrcIP, Port: decoded.SrcPort, MAC: decoded.SrcMAC}
+	b := Endpoint{IP: decoded.DstIP, Port: decoded.DstPort, MAC: decoded.DstMAC}
+	canonicalA, canonicalB := canonicalEndpoints(a, b)
+	state := FlowStateNew
+	if decoded.IPProtocol == 0 {
+		state = FlowStateUnknown
+	}
+	return Flow{
+		ID: flowID(decoded.IPProtocol, canonicalA, canonicalB), EndpointA: canonicalA, EndpointB: canonicalB,
+		Protocol: decoded.IPProtocol, State: state, FirstSeen: frame.Timestamp, LastSeen: frame.Timestamp,
+	}
+}
+
 // Observe merges frame counters and transport state, then returns a snapshot.
 func (t *Tracker) Observe(frame Frame) Flow {
 	if t == nil {
 		return Flow{}
 	}
+	identity := CanonicalFlow(frame)
 	decoded := frame.Decoded()
-	a := Endpoint{IP: decoded.SrcIP, Port: decoded.SrcPort, MAC: decoded.SrcMAC}
-	b := Endpoint{IP: decoded.DstIP, Port: decoded.DstPort, MAC: decoded.DstMAC}
-	canonicalA, canonicalB := canonicalEndpoints(a, b)
-	id := flowID(decoded.IPProtocol, canonicalA, canonicalB)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	tracked := t.flows[id]
+	tracked := t.flows[identity.ID]
 	if tracked == nil {
 		if len(t.flows) >= t.maxFlows {
 			t.evictOldest()
 		}
-		state := FlowStateNew
-		if decoded.IPProtocol == 0 {
-			state = FlowStateUnknown
-		}
-		tracked = &trackedFlow{flow: Flow{
-			ID:             id,
-			EndpointA:      canonicalA,
-			EndpointB:      canonicalB,
-			Protocol:       decoded.IPProtocol,
-			State:          state,
-			FirstSeen:      frame.Timestamp,
-			DirectionCount: make(map[Direction]int),
-		}}
-		t.flows[id] = tracked
+		identity.DirectionCount = make(map[Direction]int)
+		tracked = &trackedFlow{flow: identity}
+		t.flows[identity.ID] = tracked
 	}
 	tracked.flow.Packets++
 	tracked.flow.Bytes += uint64(len(frame.raw))

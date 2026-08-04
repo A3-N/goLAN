@@ -225,6 +225,7 @@ func (p *Project) bundleEntries(ctx context.Context, options BundleOptions) ([]b
 		manifest.CapturePairs = nil
 		manifest.CaptureJournals = nil
 		manifest.NetworkSessions = nil
+		manifest.Preferences.NetworkBaselineSessionID = ""
 	}
 	sort.Strings(report.IncludedCaptures)
 	sort.Strings(report.OmittedCaptures)

@@ -71,6 +71,15 @@ type VLAN struct {
 // TCPFlags stores the wire flag byte and NS bit in a compact comparable form.
 type TCPFlags uint16
 
+// DNSRecord is a bounded, payload-free DNS answer used for readable service
+// discovery. TXT values and arbitrary resource data are deliberately omitted.
+type DNSRecord struct {
+	Name   string `json:"name"`
+	Type   uint16 `json:"type"`
+	Target string `json:"target,omitempty"`
+	Port   uint16 `json:"port,omitempty"`
+}
+
 // DecodedFields contains normalized values used by rules and renderers. Slices
 // and maps are copied whenever a Frame crosses an ownership boundary.
 type DecodedFields struct {
@@ -91,6 +100,7 @@ type DecodedFields struct {
 	ICMPCode    uint8               `json:"icmp_code,omitempty"`
 	EAPOLType   uint8               `json:"eapol_type,omitempty"`
 	DNSNames    []string            `json:"dns_names,omitempty"`
+	DNSRecords  []DNSRecord         `json:"dns_records,omitempty"`
 	DNSType     uint16              `json:"dns_type,omitempty"`
 	DNSResponse bool                `json:"dns_response,omitempty"`
 	HTTPMethod  string              `json:"http_method,omitempty"`
@@ -396,7 +406,16 @@ func (f *Frame) decodeApplication() {
 	if packet.ErrorLayer() != nil {
 		f.decoded.Malformed = true
 	}
-	if dns, ok := packet.Layer(layers.LayerTypeDNS).(*layers.DNS); ok {
+	dns, _ := packet.Layer(layers.LayerTypeDNS).(*layers.DNS)
+	if dns == nil && (f.decoded.SrcPort == 5353 || f.decoded.DstPort == 5353) {
+		if ranges := f.offsets[FieldPayload]; len(ranges) == 1 && ranges[0].Start < ranges[0].End && ranges[0].End <= len(f.raw) {
+			decoded := &layers.DNS{}
+			if err := decoded.DecodeFromBytes(f.raw[ranges[0].Start:ranges[0].End], gopacket.NilDecodeFeedback); err == nil {
+				dns = decoded
+			}
+		}
+	}
+	if dns != nil {
 		f.decoded.DNSResponse = dns.QR
 		for _, question := range dns.Questions {
 			if len(f.decoded.DNSNames) == 64 {
@@ -408,6 +427,38 @@ func (f *Frame) decodeApplication() {
 			}
 			if f.decoded.DNSType == 0 {
 				f.decoded.DNSType = uint16(question.Type)
+			}
+		}
+		if dns.QR {
+			records := make([]layers.DNSResourceRecord, 0, len(dns.Answers)+len(dns.Additionals))
+			records = append(records, dns.Answers...)
+			records = append(records, dns.Additionals...)
+			for _, record := range records {
+				if len(f.decoded.DNSRecords) == 64 {
+					break
+				}
+				name := boundedDNSName(record.Name)
+				if name == "" {
+					continue
+				}
+				answer := DNSRecord{Name: name, Type: uint16(record.Type)}
+				switch record.Type {
+				case layers.DNSTypeA, layers.DNSTypeAAAA:
+					answer.Target = record.IP.String()
+				case layers.DNSTypeCNAME:
+					answer.Target = boundedDNSName(record.CNAME)
+				case layers.DNSTypePTR:
+					answer.Target = boundedDNSName(record.PTR)
+				case layers.DNSTypeSRV:
+					answer.Target = boundedDNSName(record.SRV.Name)
+					answer.Port = record.SRV.Port
+				default:
+					continue
+				}
+				if answer.Target == "" {
+					continue
+				}
+				f.decoded.DNSRecords = append(f.decoded.DNSRecords, answer)
 			}
 		}
 	}
@@ -503,6 +554,7 @@ func cloneDecoded(in DecodedFields) DecodedFields {
 	out := in
 	out.VLANs = append([]VLAN(nil), in.VLANs...)
 	out.DNSNames = append([]string(nil), in.DNSNames...)
+	out.DNSRecords = append([]DNSRecord(nil), in.DNSRecords...)
 	if in.HTTPHeader != nil {
 		out.HTTPHeader = make(map[string][]string, len(in.HTTPHeader))
 		keys := make([]string, 0, len(in.HTTPHeader))
@@ -515,6 +567,19 @@ func cloneDecoded(in DecodedFields) DecodedFields {
 		}
 	}
 	return out
+}
+
+func boundedDNSName(value []byte) string {
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(string(value))), ".")
+	if name == "" || len(name) > 253 {
+		return ""
+	}
+	for _, char := range name {
+		if char < 0x20 || char == 0x7f {
+			return ""
+		}
+	}
+	return name
 }
 
 func normalizeSide(side TopologySide) TopologySide {

@@ -314,7 +314,7 @@ func (p *Profile) Reset() {
 	p.Bridge = BridgeConfig{}
 }
 
-// BridgeAdapter returns the editable bridge-level takeover config.
+// BridgeAdapter returns the editable bridge-level nat config.
 func (p *Profile) BridgeAdapter() *AdapterConfig {
 	ensureBridgeAdapterDefaults(&p.Bridge.Config)
 	return &p.Bridge.Config
@@ -382,14 +382,7 @@ func (p *Profile) sortRoles() {
 
 // CanonicalAdapterRole normalizes a user-facing inline adapter role.
 func CanonicalAdapterRole(adapterRole string) string {
-	switch strings.ToLower(strings.TrimSpace(adapterRole)) {
-	case "1", "host":
-		return AdapterRoleHost
-	case "2", "switch":
-		return AdapterRoleSwitch
-	default:
-		return strings.ToLower(strings.TrimSpace(adapterRole))
-	}
+	return strings.ToLower(strings.TrimSpace(adapterRole))
 }
 
 // ValidAdapterRole reports whether adapterRole identifies an inline side.
@@ -772,7 +765,7 @@ func normalizeCSV(value string) string {
 	return strings.Join(out, ", ")
 }
 
-// CanonicalKey maps user-facing command aliases to stored property names.
+// CanonicalKey normalizes one stored property name.
 func CanonicalKey(key string) string {
 	return canonicalKey(key)
 }
@@ -783,14 +776,7 @@ func KnownField(key string) bool {
 }
 
 func canonicalKey(key string) string {
-	switch strings.ToLower(strings.TrimSpace(key)) {
-	case "ipv4", "addr", "address":
-		return "ip"
-	case "link":
-		return "state"
-	default:
-		return strings.ToLower(strings.TrimSpace(key))
-	}
+	return strings.ToLower(strings.TrimSpace(key))
 }
 
 func isAuto(value string) bool {

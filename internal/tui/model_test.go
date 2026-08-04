@@ -24,7 +24,7 @@ func TestExecuteCommandSelectSetAndConfirm(t *testing.T) {
 	m := NewModel()
 	m.adapters = []adapters.Adapter{{Name: "en0", Kind: "ethernet"}}
 
-	m.executeCommand("set en0 host")
+	m.executeCommand("set adapter en0 host")
 	if len(m.profile.Adapters) != 1 {
 		t.Fatalf("selected adapters = %d", len(m.profile.Adapters))
 	}
@@ -43,21 +43,24 @@ func TestExecuteCommandSelectSetAndConfirm(t *testing.T) {
 	}
 }
 
-func TestCommandRejectsThirdAdapter(t *testing.T) {
+func TestCommandReplacesAdapterWithSameRole(t *testing.T) {
 	m := NewModel()
 	m.adapters = []adapters.Adapter{{Name: "en0"}, {Name: "en1"}, {Name: "en2"}}
 
-	m.executeCommand("set en0 host")
+	m.executeCommand("set adapter en0 host")
 	delete(m.lockPending, "en0")
-	m.executeCommand("set en1 switch")
+	m.executeCommand("set adapter en1 switch")
 	delete(m.lockPending, "en1")
-	m.executeCommand("set adapter en2")
+	m.executeCommand("set adapter en2 host")
 
 	if len(m.profile.Adapters) != 2 {
 		t.Fatalf("selected adapters = %d", len(m.profile.Adapters))
 	}
-	if !containsOutput(m.output, "maximum of 2 adapters") {
-		t.Fatalf("max adapter output missing: %v", m.output)
+	if _, ok := m.profile.ByName("en0"); ok {
+		t.Fatalf("old host adapter was retained: %+v", m.profile.Adapters)
+	}
+	if cfg, ok := m.profile.ByName("en2"); !ok || cfg.AdapterRole != profile.AdapterRoleHost {
+		t.Fatalf("replacement host adapter missing: %+v", m.profile.Adapters)
 	}
 }
 
@@ -66,14 +69,13 @@ func TestCommandsRejectAmbiguousArity(t *testing.T) {
 		command string
 		want    string
 	}{
-		{command: "show adapters extra", want: "use: show adapters|config|bridge|takeover|edge|project|rules|health"},
+		{command: "show adapters extra", want: "use: show adapters|config|bridge|nat|edge|project|rules|health|captures"},
 		{command: "load lab extra", want: "use: load [name]"},
 		{command: "load <> extra", want: "use: load [name]"},
-		{command: "start listen extra", want: "use: start listen|bridge [fast|controlled]|takeover|nat|edge <mode>"},
-		{command: "stop listen extra", want: "use: stop listen|bridge|takeover|nat|edge"},
-		{command: "set adapter en11 host extra", want: "use: set adapter <name> [host|switch]"},
-		{command: "set en11 host extra", want: "use: set <adapter> <host|switch>"},
-		{command: "unset adapter en11 extra", want: "use: unset | unset adapter <name>"},
+		{command: "start listen extra", want: "use: start listen"},
+		{command: "stop listen extra", want: "use: stop listen|bridge|nat|edge"},
+		{command: "set adapter en11 host extra", want: "use: set adapter <name> <host|switch>"},
+		{command: "unset adapter en11 extra", want: "use: unset adapter <name>"},
 	}
 	for _, test := range tests {
 		m := NewModel()
@@ -93,7 +95,7 @@ func TestCommandsRejectAmbiguousArity(t *testing.T) {
 func TestUpdateCLIExecutesCommand(t *testing.T) {
 	m := NewModel()
 	m.adapters = []adapters.Adapter{{Name: "en0"}}
-	m.input = "set en0 host"
+	m.input = "set adapter en0 host"
 
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	got := next.(Model)
@@ -334,7 +336,7 @@ func TestSetAdapterStagesRoleWithoutContext(t *testing.T) {
 	m := NewModel()
 	m.adapters = []adapters.Adapter{{Name: "en11"}}
 
-	m.executeCommand("set en11 host")
+	m.executeCommand("set adapter en11 host")
 	if got := m.profile.Adapters[0].AdapterRole; got != profile.AdapterRoleHost {
 		t.Fatalf("adapter role = %q", got)
 	}
@@ -350,7 +352,7 @@ func TestSetAdapterStagesRoleWithoutContext(t *testing.T) {
 func TestActiveAdapterStateReturnsCommand(t *testing.T) {
 	m := NewModel()
 	m.adapters = []adapters.Adapter{{Name: "en11"}}
-	m.executeCommand("set en11 host")
+	m.executeCommand("set adapter en11 host")
 	delete(m.lockPending, "en11")
 	m.executeCommand("conf en11")
 
@@ -440,17 +442,17 @@ func TestAutocompleteAdapterName(t *testing.T) {
 func TestAutocompleteSetAdapterRole(t *testing.T) {
 	m := NewModel()
 	m.adapters = []adapters.Adapter{{Name: "en11"}}
-	m.input = "set en11 "
+	m.input = "set adapter en11 "
 	m.refreshCompletions()
 	m.applyCompletion()
-	if m.input != "set en11 host" {
+	if m.input != "set adapter en11 host" {
 		t.Fatalf("input = %q", m.input)
 	}
 	if !containsString(m.completions, "host") || !containsString(m.completions, "switch") {
 		t.Fatalf("completions = %v", m.completions)
 	}
 	m.applyCompletion()
-	if m.input != "set en11 switch" {
+	if m.input != "set adapter en11 switch" {
 		t.Fatalf("cycled input = %q", m.input)
 	}
 }
@@ -458,10 +460,10 @@ func TestAutocompleteSetAdapterRole(t *testing.T) {
 func TestUnsetDeselectsActiveAdapter(t *testing.T) {
 	m := NewModel()
 	m.adapters = []adapters.Adapter{{Name: "en11"}}
-	m.executeCommand("set en11 host")
+	m.executeCommand("set adapter en11 host")
 	delete(m.lockPending, "en11")
 	m.executeCommand("conf en11")
-	m.executeCommand("unset")
+	m.executeCommand("unset adapter en11")
 	if m.activeAdapter != "" {
 		t.Fatalf("active adapter = %q", m.activeAdapter)
 	}
@@ -475,7 +477,7 @@ func TestSaveAndLoadConfig(t *testing.T) {
 	t.Setenv("GOLAN_CONFIG_DIR", dir)
 	m := NewModel()
 	m.adapters = []adapters.Adapter{{Name: "en11"}}
-	m.executeCommand("set en11 host")
+	m.executeCommand("set adapter en11 host")
 	m.executeCommand("conf en11")
 	m.executeCommand("set ip 192.0.2.10")
 	m.eapolSuppressLogoff = false
@@ -506,7 +508,7 @@ func TestLoadRejectsAdapterMissingFromInventory(t *testing.T) {
 	t.Setenv("GOLAN_CONFIG_DIR", dir)
 	m := NewModel()
 	m.adapters = []adapters.Adapter{{Name: "en11"}}
-	m.executeCommand("set en11 host")
+	m.executeCommand("set adapter en11 host")
 	m.saveConfig("lab")
 
 	loaded := NewModel()
@@ -540,7 +542,7 @@ func TestFailedAdapterIsolationBlocksBridgeStart(t *testing.T) {
 	if !got.lockFailed["en11"] || got.lockPending["en11"] {
 		t.Fatal("failed isolation was not retained as a startup gate")
 	}
-	if cmd := got.executeCommand("start bridge"); cmd != nil {
+	if cmd := got.executeCommand("start bridge fast"); cmd != nil {
 		t.Fatal("bridge start proceeded after failed isolation")
 	}
 	if !containsOutput(got.output, "bridge err: adapter isolate pending en11") {
@@ -579,10 +581,68 @@ func TestSuccessfulAdapterRestoreClearsMatchingState(t *testing.T) {
 
 func TestRemovedCommandsAreNotSuggested(t *testing.T) {
 	commands := topLevelCommands()
-	for _, removed := range []string{"reset", "confirm", "save", "listen", "bridge", "repeater", "intercept", "logger", "flow", "findings"} {
+	for _, removed := range []string{"?", "cls", "config", "configure", "exit", "reset", "confirm", "save", "listen", "bridge", "repeater", "intercept", "logger", "flow", "findings"} {
 		if containsString(commands, removed) {
 			t.Fatalf("removed command %q was suggested: %v", removed, commands)
 		}
+	}
+	m := NewModel()
+	m.adapters = []adapters.Adapter{{Name: "en11"}}
+	if got := m.completionCandidates("bridge "); len(got) != 0 {
+		t.Fatalf("removed bridge command still completes: %v", got)
+	}
+	if got := m.completionCandidates("set "); containsString(got, "en11") {
+		t.Fatalf("adapter shorthand still completes: %v", got)
+	}
+}
+
+func TestCLIRejectsRetiredAliases(t *testing.T) {
+	tests := []struct {
+		command string
+		want    string
+	}{
+		{command: "?", want: "unknown: ?"},
+		{command: "cls", want: "unknown: cls"},
+		{command: "config", want: "unknown: config"},
+		{command: "configure", want: "unknown: configure"},
+		{command: "exit", want: "unknown: exit"},
+		{command: "show adapter", want: "use: show adapters|config|bridge|nat|edge|project|rules|health|captures"},
+		{command: "show conf", want: "use: show adapters|config|bridge|nat|edge|project|rules|health|captures"},
+		{command: "show policy", want: "use: show adapters|config|bridge|nat|edge|project|rules|health|captures"},
+		{command: "show status", want: "use: show adapters|config|bridge|nat|edge|project|rules|health|captures"},
+		{command: "show capture", want: "use: show adapters|config|bridge|nat|edge|project|rules|health|captures"},
+		{command: "set en11 host", want: "ctx: none; use: conf <adapter>"},
+		{command: "set adapter en11", want: "use: set adapter <name> <host|switch>"},
+		{command: "set adapter en11 1", want: "role err: host|switch"},
+		{command: "unset", want: "use: unset adapter <name>"},
+		{command: "start bridge", want: "use: start bridge <fast|controlled>"},
+		{command: "start edge", want: "use: start edge <observe|route>"},
+		{command: "network filter risk", want: "use: network show"},
+		{command: "network filter action", want: "use: network show"},
+		{command: "canvas rebuild", want: "use: canvas build"},
+		{command: "canvas export destination.canvas", want: "use: canvas build"},
+	}
+
+	for _, test := range tests {
+		m := NewModel()
+		m.adapters = []adapters.Adapter{{Name: "en11"}}
+		if cmd := m.executeCommand(test.command); cmd != nil {
+			t.Errorf("%q returned a command", test.command)
+		}
+		if !containsOutput(m.output, test.want) {
+			t.Errorf("%q output=%v, want %q", test.command, m.output, test.want)
+		}
+		if len(m.profile.Adapters) != 0 || m.bridge != nil || m.edgeSession != nil {
+			t.Errorf("%q changed runtime state: profile=%+v bridge=%v edge=%v", test.command, m.profile, m.bridge, m.edgeSession)
+		}
+	}
+}
+
+func TestPolicyPresetAutocompleteMatchesBuiltins(t *testing.T) {
+	m := NewModel()
+	want := []string{"block-internet", "controlled-bridge", "high-latency", "observe-everything", "open-internet", "packet-loss", "web-only"}
+	if got := m.completionCandidates("policy use "); !reflect.DeepEqual(got, want) {
+		t.Fatalf("policy preset completions=%v, want %v", got, want)
 	}
 }
 
@@ -971,7 +1031,7 @@ func TestMACsecDiscoveryIsAggregatedInNetwork(t *testing.T) {
 
 func TestBridgeStartRequiresHostAndSwitch(t *testing.T) {
 	m := NewModel()
-	cmd := m.executeCommand("start bridge")
+	cmd := m.executeCommand("start bridge fast")
 	if cmd != nil {
 		t.Fatal("expected no command without host+switch")
 	}
@@ -988,7 +1048,7 @@ func TestBridgeStartReturnsBridgeCommandForStagedAdapters(t *testing.T) {
 		host,
 		adaptersToConfig("en12", profile.AdapterRoleSwitch),
 	)
-	cmd := m.executeCommand("start bridge")
+	cmd := m.executeCommand("start bridge fast")
 	if cmd == nil {
 		t.Fatal("expected bridge capture command")
 	}
@@ -1008,10 +1068,10 @@ func TestBridgeStartCannotOverlapPendingStart(t *testing.T) {
 		adaptersToConfig("en12", profile.AdapterRoleSwitch),
 	)
 
-	if cmd := m.executeCommand("start bridge"); cmd == nil {
+	if cmd := m.executeCommand("start bridge fast"); cmd == nil {
 		t.Fatal("first bridge start command is nil")
 	}
-	if cmd := m.executeCommand("start bridge"); cmd != nil {
+	if cmd := m.executeCommand("start bridge fast"); cmd != nil {
 		t.Fatal("second bridge start overlapped the first")
 	}
 	if !containsOutput(m.output, "bridge err: operation pending: bridge start") {
@@ -1026,7 +1086,7 @@ func TestBridgeStartAllowsAutoHostMAC(t *testing.T) {
 		adaptersToConfig("en12", profile.AdapterRoleSwitch),
 	)
 
-	cmd := m.executeCommand("start bridge")
+	cmd := m.executeCommand("start bridge fast")
 	if cmd == nil {
 		t.Fatal("expected bridge command with auto host mac")
 	}
@@ -1044,7 +1104,7 @@ func TestBridgeStartIgnoresAdapterAddresses(t *testing.T) {
 	sw.Addrs = []string{"fe80::1/64", "169.254.10.20/16"}
 	m.profile.Adapters = append(m.profile.Adapters, host, sw)
 
-	cmd := m.executeCommand("start bridge")
+	cmd := m.executeCommand("start bridge fast")
 	if cmd == nil {
 		t.Fatal("expected bridge command despite adapter addresses")
 	}
@@ -1057,7 +1117,7 @@ func TestBridgeStartRefusesActiveListen(t *testing.T) {
 	m := NewModel()
 	m.listener = &listen.Session{}
 	m.capMode = "listen"
-	cmd := m.executeCommand("start bridge")
+	cmd := m.executeCommand("start bridge fast")
 	if cmd != nil {
 		t.Fatal("expected no bridge command while listen active")
 	}
@@ -1071,7 +1131,7 @@ func TestStartNATRequiresActiveBridge(t *testing.T) {
 	if cmd := m.executeCommand("start nat"); cmd != nil {
 		t.Fatal("expected no command without active bridge")
 	}
-	if !containsOutput(m.output, "takeover err: bridge") {
+	if !containsOutput(m.output, "nat err: bridge") {
 		t.Fatalf("output = %v", m.output)
 	}
 
@@ -1089,7 +1149,7 @@ func TestStopBridgeRefusesActiveNAT(t *testing.T) {
 	if cmd := m.executeCommand("stop bridge"); cmd != nil {
 		t.Fatal("expected no bridge stop command while nat active")
 	}
-	if !containsOutput(m.output, "bridge err: takeover; use: stop takeover") {
+	if !containsOutput(m.output, "bridge err: nat; use: stop nat") {
 		t.Fatalf("output = %v", m.output)
 	}
 }

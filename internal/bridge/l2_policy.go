@@ -8,7 +8,7 @@ import (
 )
 
 // bridgeRuleManager owns only rules on the per-session bridge interface. The
-// indirection keeps Takeover transitions testable without invoking ifconfig.
+// indirection keeps NAT transitions testable without invoking ifconfig.
 type bridgeRuleManager interface {
 	Reset(string) error
 	InstallSafety(string, []net.HardwareAddr) error

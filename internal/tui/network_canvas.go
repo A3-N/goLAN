@@ -9,7 +9,7 @@ import (
 
 func (m *Model) buildNetworkCanvas(args []string) {
 	if len(args) > 1 {
-		m.print("use: canvas build|rebuild [network-session-id]")
+		m.print("use: canvas build [network-session-id]")
 		return
 	}
 	var session networkobs.Session

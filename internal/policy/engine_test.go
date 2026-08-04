@@ -171,36 +171,36 @@ func TestEdgeRouteCompatibilityMatchesPFCompilerBoundary(t *testing.T) {
 	}
 }
 
-func TestTakeoverCompatibilityMatchesEndpointPFBoundary(t *testing.T) {
+func TestNATCompatibilityMatchesEndpointPFBoundary(t *testing.T) {
 	live := Rule{
-		ID: "block-takeover-web", Enabled: true,
+		ID: "block-nat-web", Enabled: true,
 		Match: Match{
-			Modes:      []dataplane.Mode{dataplane.ModeTakeover},
+			Modes:      []dataplane.Mode{dataplane.ModeNAT},
 			Directions: []traffic.Direction{traffic.DirectionOutbound},
 			IPVersions: []uint8{4}, Protocols: []uint8{6},
 			DstPorts: PortSet{Values: []uint16{80}},
 		},
 		Actions: []Action{{Kind: ActionBlock}},
 	}
-	status, capability, reason := Compatibility(live, dataplane.ForMode(dataplane.ModeTakeover))
-	if status != dataplane.StatusLive || capability != dataplane.CapabilityStatefulFilter || reason != "" || !TakeoverPFCompatible(live) {
-		t.Fatalf("live status=%s capability=%s compatible=%t reason=%q", status, capability, TakeoverPFCompatible(live), reason)
+	status, capability, reason := Compatibility(live, dataplane.ForMode(dataplane.ModeNAT))
+	if status != dataplane.StatusLive || capability != dataplane.CapabilityStatefulFilter || reason != "" || !NATPFCompatible(live) {
+		t.Fatalf("live status=%s capability=%s compatible=%t reason=%q", status, capability, NATPFCompatible(live), reason)
 	}
 
 	application := live
 	application.ID = "http-semantic"
 	application.Match.HTTPMethods = []string{"POST"}
-	status, _, reason = Compatibility(application, dataplane.ForMode(dataplane.ModeTakeover))
-	if status != dataplane.StatusShadow || reason == "" || TakeoverPFCompatible(application) {
-		t.Fatalf("application status=%s PF=%t reason=%q", status, TakeoverPFCompatible(application), reason)
+	status, _, reason = Compatibility(application, dataplane.ForMode(dataplane.ModeNAT))
+	if status != dataplane.StatusShadow || reason == "" || NATPFCompatible(application) {
+		t.Fatalf("application status=%s PF=%t reason=%q", status, NATPFCompatible(application), reason)
 	}
 
 	ethernet := live
 	ethernet.ID = "ethernet-only"
 	ethernet.Match = Match{EtherTypes: []uint16{0x0806}}
-	status, _, reason = Compatibility(ethernet, dataplane.ForMode(dataplane.ModeTakeover))
-	if status != dataplane.StatusShadow || reason == "" || TakeoverPFCompatible(ethernet) {
-		t.Fatalf("ethernet status=%s compatible=%t reason=%q", status, TakeoverPFCompatible(ethernet), reason)
+	status, _, reason = Compatibility(ethernet, dataplane.ForMode(dataplane.ModeNAT))
+	if status != dataplane.StatusShadow || reason == "" || NATPFCompatible(ethernet) {
+		t.Fatalf("ethernet status=%s compatible=%t reason=%q", status, NATPFCompatible(ethernet), reason)
 	}
 }
 

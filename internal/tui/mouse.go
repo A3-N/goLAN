@@ -1,5 +1,7 @@
 package tui
 
+import "strconv"
+
 import tea "github.com/charmbracelet/bubbletea"
 
 type cellRect struct {
@@ -268,10 +270,27 @@ func (m *Model) selectWorkspacePaneRow(pane paneCell, mouseX, mouseY int) (tea.C
 			m.selectedNetworkDevice = devices[itemIndex].Key
 		}
 	case m.workspace == workspaceNetwork && pane.Card == cardInspector:
-		if contentRow >= 7 && contentRow < 7+len(networkCategories) {
-			m.networkSection = contentRow - 6
-			m.toggleNetworkSection()
-			return nil, true
+		if contentRow == 1 {
+			if button, ok := textButtonAt(m.networkInsightButtonBar(), contentColumn); ok {
+				switch button.ID {
+				case "overview":
+					m.networkInsight = ""
+				case "explain", "access", "fate":
+					m.networkInsight = button.ID
+				case "rule":
+					if device, selected := m.selectedNetworkDeviceSnapshot(); selected {
+						m.executeNetworkRule([]string{"draft", strconv.FormatUint(device.Number, 10)})
+					}
+				}
+				return nil, true
+			}
+		}
+		if m.networkInsight == "" {
+			if section, ok := m.networkSectionAtInspectorRow(contentRow); ok {
+				m.networkSection = section
+				m.toggleNetworkSection()
+				return nil, true
+			}
 		}
 	case m.workspace == workspaceRules && pane.Card == cardOutput:
 		rules, _ := m.activeRules()

@@ -1,6 +1,6 @@
 [fast-bridge]
 pass in quick on en11 inet proto tcp from any to any port { 80, 443 } keep state
-[takeover]
+[nat]
 pass out quick on bridge7 inet proto udp from any port 68 to any port 67 keep state
 pass in quick on bridge7 inet proto udp from any port 67 to any port 68 keep state
 block drop quick on bridge7 inet6 all

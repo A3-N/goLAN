@@ -220,12 +220,12 @@ func TestHelpRegistryUsesProgressiveDisclosureAndCurrentScope(t *testing.T) {
 	m.help.selected = helpGroupID("Network", "Observe")
 	m.updateHelpKey("enter")
 	view = m.renderHelp()
-	if !strings.Contains(view, "[+] Network view") || strings.Contains(view, "Filter the device inventory") {
+	if !strings.Contains(view, "[+] Filter Network") || strings.Contains(view, "Show one readable observation category") {
 		t.Fatalf("group disclosure boundary is incorrect:\n%s", view)
 	}
-	m.help.selected = helpTopicID(helpEntry{Topic: "Network view"})
+	m.help.selected = helpTopicID(helpEntry{Topic: "Filter Network"})
 	m.updateHelpKey("enter")
-	if !strings.Contains(m.renderHelp(), "Filter the device inventory") {
+	if !strings.Contains(m.renderHelp(), "Show one readable observation category") {
 		t.Fatalf("topic detail did not expand:\n%s", m.renderHelp())
 	}
 }
@@ -235,6 +235,9 @@ func TestHelpTaxonomyClassifiesEveryTopicUniquely(t *testing.T) {
 	for _, entry := range helpRegistry {
 		if entry.Category == "" || entry.Group == "" || entry.Group == "Other" {
 			t.Errorf("help topic %q has no deliberate taxonomy path: category=%q group=%q", entry.Topic, entry.Category, entry.Group)
+		}
+		if strings.Contains(entry.Command, " | ") {
+			t.Errorf("help topic %q combines multiple commands: %q", entry.Topic, entry.Command)
 		}
 		id := helpTopicID(entry)
 		if seen[id] {

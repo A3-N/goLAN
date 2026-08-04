@@ -182,12 +182,12 @@ func (r RuleSet) Evaluate(frame traffic.Frame, flow traffic.Flow, capabilities d
 			decision.Status = dataplane.StatusShadow
 			decision.Explanation = fmt.Sprintf("rule %s matched but requires controlled bridge evaluation (SHADOW)", rule.source.ID)
 		}
-		if mode == dataplane.ModeTakeover && !TakeoverPFCompatible(rule.source) {
+		if mode == dataplane.ModeNAT && !NATPFCompatible(rule.source) {
 			decision.Status = dataplane.StatusShadow
-			decision.Explanation = fmt.Sprintf("rule %s matched but is outside the takeover endpoint PF boundary (SHADOW)", rule.source.ID)
-		} else if mode == dataplane.ModeTakeover && frame.Decoded().IPVersion != 4 {
+			decision.Explanation = fmt.Sprintf("rule %s matched but is outside the nat endpoint PF boundary (SHADOW)", rule.source.ID)
+		} else if mode == dataplane.ModeNAT && frame.Decoded().IPVersion != 4 {
 			decision.Status = dataplane.StatusShadow
-			decision.Explanation = fmt.Sprintf("rule %s matched outside the takeover IPv4 endpoint PF boundary (SHADOW)", rule.source.ID)
+			decision.Explanation = fmt.Sprintf("rule %s matched outside the nat IPv4 endpoint PF boundary (SHADOW)", rule.source.ID)
 		}
 		if mode == dataplane.ModeEdgeRoute && !EdgeRouteCompatible(rule.source) {
 			decision.Status = dataplane.StatusShadow
@@ -217,8 +217,8 @@ func Compatibility(rule Rule, capabilities dataplane.Capabilities) (dataplane.St
 	if capabilities.Mode() == dataplane.ModeFastBridge && !FastBridgeCompatible(rule) {
 		return dataplane.StatusShadow, required, "rule requires controlled bridge evaluation"
 	}
-	if capabilities.Mode() == dataplane.ModeTakeover && !TakeoverPFCompatible(rule) {
-		return dataplane.StatusShadow, required, "rule is outside the takeover endpoint PF boundary"
+	if capabilities.Mode() == dataplane.ModeNAT && !NATPFCompatible(rule) {
+		return dataplane.StatusShadow, required, "rule is outside the nat endpoint PF boundary"
 	}
 	if capabilities.Mode() == dataplane.ModeEdgeRoute && !EdgeRouteCompatible(rule) {
 		return dataplane.StatusShadow, required, "rule cannot be compiled into the edge PF anchor"
@@ -235,12 +235,12 @@ func EdgeRouteCompatible(rule Rule) bool {
 	return endpointPFCompatible(rule, dataplane.ModeEdgeRoute)
 }
 
-// TakeoverPFCompatible reports whether a rule can be represented exactly by
+// NATPFCompatible reports whether a rule can be represented exactly by
 // the IPv4 PF boundary on the authenticated bridge endpoint. Link-layer,
 // topology, application-message, and transformation rules remain visible in
 // SHADOW instead of being silently approximated.
-func TakeoverPFCompatible(rule Rule) bool {
-	if !endpointPFCompatible(rule, dataplane.ModeTakeover) {
+func NATPFCompatible(rule Rule) bool {
+	if !endpointPFCompatible(rule, dataplane.ModeNAT) {
 		return false
 	}
 	m := rule.Match
@@ -892,7 +892,7 @@ func requiredCapability(rule Rule, terminal Action, hasTerminal bool, frame traf
 	if hasTerminal {
 		switch terminal.Kind {
 		case ActionAllow, ActionBlock:
-			if mode == dataplane.ModeTakeover || mode == dataplane.ModeEdgeRoute {
+			if mode == dataplane.ModeNAT || mode == dataplane.ModeEdgeRoute {
 				required = dataplane.CapabilityStatefulFilter
 			} else {
 				required = dataplane.CapabilityFrameFilter

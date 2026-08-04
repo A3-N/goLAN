@@ -13,7 +13,7 @@ func TestCapabilityMatrixNeverSilentlyOmitsEnforcement(t *testing.T) {
 		CapabilityNAT, CapabilityRedirect,
 		CapabilityPortForward, CapabilityTrafficShape,
 	}
-	for _, mode := range []Mode{ModeListen, ModeFastBridge, ModeControlledBridge, ModeTakeover, ModeEdgeObserve, ModeEdgeRoute} {
+	for _, mode := range []Mode{ModeListen, ModeFastBridge, ModeControlledBridge, ModeNAT, ModeEdgeObserve, ModeEdgeRoute} {
 		matrix := ForMode(mode)
 		for _, capability := range capabilities {
 			switch got := matrix.Support(capability); got {
@@ -27,7 +27,7 @@ func TestCapabilityMatrixNeverSilentlyOmitsEnforcement(t *testing.T) {
 
 func TestModesReturnsStableIndependentInventory(t *testing.T) {
 	want := []Mode{
-		ModeListen, ModeFastBridge, ModeControlledBridge, ModeTakeover,
+		ModeListen, ModeFastBridge, ModeControlledBridge, ModeNAT,
 		ModeEdgeObserve, ModeEdgeRoute,
 	}
 	first := Modes()

@@ -20,7 +20,7 @@ func TestCompatibilityMatrixUsesStableDocumentedModeOrder(t *testing.T) {
 		dataplane.ModeListen:           dataplane.StatusShadow,
 		dataplane.ModeFastBridge:       dataplane.StatusLive,
 		dataplane.ModeControlledBridge: dataplane.StatusLive,
-		dataplane.ModeTakeover:         dataplane.StatusShadow,
+		dataplane.ModeNAT:              dataplane.StatusShadow,
 		dataplane.ModeEdgeObserve:      dataplane.StatusShadow,
 		dataplane.ModeEdgeRoute:        dataplane.StatusLive,
 	}

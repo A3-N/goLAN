@@ -27,7 +27,13 @@ const (
 	MaxDevices = 2048
 	// MaxObservationsPerDevice bounds persisted metadata for one device.
 	MaxObservationsPerDevice = 512
-	maxTextRunes             = 255
+	// MaxServicesPerDevice bounds readable service identities for one device.
+	MaxServicesPerDevice = 128
+	// MaxAccessEventsPerDevice bounds the ordered authentication story.
+	MaxAccessEventsPerDevice = 256
+	// MaxPacketFates bounds payload-free flow outcomes for one session.
+	MaxPacketFates = 4096
+	maxTextRunes   = 255
 )
 
 // Category identifies one readable class of network observation.
@@ -59,14 +65,68 @@ type Observation struct {
 	Protocol    string    `json:"protocol,omitempty"`
 	Source      string    `json:"source,omitempty"`
 	Destination string    `json:"destination,omitempty"`
+	Value       string    `json:"value,omitempty"`
 	Severity    Severity  `json:"severity"`
 	FirstSeen   time.Time `json:"first_seen"`
 	LastSeen    time.Time `json:"last_seen"`
 	Count       uint64    `json:"count"`
 }
 
+// Service is one readable local service identity observed directly from a
+// device. Arbitrary TXT data and payloads are never retained.
+type Service struct {
+	Type      string    `json:"type"`
+	Name      string    `json:"name,omitempty"`
+	Target    string    `json:"target,omitempty"`
+	Port      uint16    `json:"port,omitempty"`
+	Protocol  string    `json:"protocol"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+	Count     uint64    `json:"count"`
+}
+
+// AccessEvent is one bounded ordered 802.1X or MACsec state transition.
+type AccessEvent struct {
+	Kind       string    `json:"kind"`
+	Label      string    `json:"label"`
+	Protocol   string    `json:"protocol"`
+	Severity   Severity  `json:"severity"`
+	ObservedAt time.Time `json:"observed_at"`
+}
+
+// FateConfidence states how directly goLAN observed a packet outcome.
+type FateConfidence string
+
+const (
+	FateExact     FateConfidence = "exact"
+	FateEstimated FateConfidence = "estimated"
+	FateObserved  FateConfidence = "observed"
+)
+
+// PacketFate is a payload-free flow outcome aggregate. It explains policy
+// effects without turning Network into a packet or flow timeline.
+type PacketFate struct {
+	FlowID      traffic.FlowID   `json:"flow_id"`
+	EndpointA   traffic.Endpoint `json:"endpoint_a"`
+	EndpointB   traffic.Endpoint `json:"endpoint_b"`
+	Protocol    uint8            `json:"protocol"`
+	Observed    uint64           `json:"observed"`
+	Forwarded   uint64           `json:"forwarded,omitempty"`
+	Blocked     uint64           `json:"blocked,omitempty"`
+	Edited      uint64           `json:"edited,omitempty"`
+	Unsupported uint64           `json:"unsupported,omitempty"`
+	Unresolved  uint64           `json:"unresolved,omitempty"`
+	LastRuleID  string           `json:"last_rule_id,omitempty"`
+	Confidence  FateConfidence   `json:"confidence"`
+	FirstSeen   time.Time        `json:"first_seen"`
+	LastSeen    time.Time        `json:"last_seen"`
+}
+
 // Device is a sanitized snapshot of one directly observed Layer 2 identity.
 type Device struct {
+	// Number is the stable, session-local discovery order used by the live UI.
+	// It is reconstructed for saved sessions and is not evidence metadata.
+	Number       uint64        `json:"-"`
 	Key          string        `json:"key"`
 	MAC          string        `json:"mac"`
 	Adapter      string        `json:"adapter,omitempty"`
@@ -75,6 +135,8 @@ type Device struct {
 	IPs          []string      `json:"ips,omitempty"`
 	Hostnames    []string      `json:"hostnames,omitempty"`
 	Protocols    []string      `json:"protocols,omitempty"`
+	Services     []Service     `json:"services,omitempty"`
+	AccessEvents []AccessEvent `json:"access_events,omitempty"`
 	FirstSeen    time.Time     `json:"first_seen"`
 	LastSeen     time.Time     `json:"last_seen"`
 	Observations []Observation `json:"observations,omitempty"`
@@ -82,13 +144,14 @@ type Device struct {
 
 // Session is the immutable, sanitized summary persisted beside live captures.
 type Session struct {
-	Version      int       `json:"version"`
-	ID           string    `json:"id"`
-	Mode         string    `json:"mode"`
-	StartedAt    time.Time `json:"started_at"`
-	EndedAt      time.Time `json:"ended_at,omitempty"`
-	CapturePaths []string  `json:"capture_paths,omitempty"`
-	Devices      []Device  `json:"devices,omitempty"`
+	Version      int          `json:"version"`
+	ID           string       `json:"id"`
+	Mode         string       `json:"mode"`
+	StartedAt    time.Time    `json:"started_at"`
+	EndedAt      time.Time    `json:"ended_at,omitempty"`
+	CapturePaths []string     `json:"capture_paths,omitempty"`
+	Devices      []Device     `json:"devices,omitempty"`
+	PacketFates  []PacketFate `json:"packet_fates,omitempty"`
 }
 
 // DecodeSession strictly decodes and validates one persisted session.
@@ -123,7 +186,8 @@ func ValidateSession(session Session) error {
 	seen := make(map[string]bool, len(session.Devices))
 	for _, device := range session.Devices {
 		if cleanText(device.Key) == "" || !validUnicastMAC(device.MAC) || seen[device.Key] ||
-			len(device.Observations) > MaxObservationsPerDevice {
+			len(device.Observations) > MaxObservationsPerDevice || len(device.Services) > MaxServicesPerDevice ||
+			len(device.AccessEvents) > MaxAccessEventsPerDevice {
 			return fmt.Errorf("network session device %q is invalid", device.Key)
 		}
 		seen[device.Key] = true
@@ -138,7 +202,7 @@ func ValidateSession(session Session) error {
 			}
 			if cleanText(observation.Kind) != observation.Kind || cleanText(observation.Summary) != observation.Summary ||
 				cleanText(observation.Protocol) != observation.Protocol || cleanText(observation.Source) != observation.Source ||
-				cleanText(observation.Destination) != observation.Destination {
+				cleanText(observation.Destination) != observation.Destination || cleanText(observation.Value) != observation.Value {
 				return fmt.Errorf("network observation contains unsafe text")
 			}
 			switch observation.Severity {
@@ -155,6 +219,41 @@ func ValidateSession(session Session) error {
 			if observation.Category == CategoryRisk && (observation.Source != "" || observation.Destination != "") {
 				return fmt.Errorf("network risk observation contains endpoint detail")
 			}
+		}
+		for _, service := range device.Services {
+			if cleanText(service.Type) == "" || cleanText(service.Protocol) == "" || service.Count == 0 ||
+				cleanText(service.Type) != service.Type || cleanText(service.Name) != service.Name ||
+				cleanText(service.Target) != service.Target || cleanText(service.Protocol) != service.Protocol {
+				return fmt.Errorf("network service is invalid")
+			}
+		}
+		for _, event := range device.AccessEvents {
+			if cleanText(event.Kind) == "" || cleanText(event.Label) == "" || cleanText(event.Protocol) == "" ||
+				cleanText(event.Kind) != event.Kind || cleanText(event.Label) != event.Label || cleanText(event.Protocol) != event.Protocol {
+				return fmt.Errorf("network access event is invalid")
+			}
+			switch event.Severity {
+			case SeverityInfo, SeverityWarn, SeverityError:
+			default:
+				return fmt.Errorf("network access event severity is invalid")
+			}
+		}
+	}
+	if len(session.PacketFates) > MaxPacketFates {
+		return fmt.Errorf("network packet fate count is invalid")
+	}
+	seenFates := make(map[traffic.FlowID]bool, len(session.PacketFates))
+	for _, fate := range session.PacketFates {
+		if fate.FlowID == "" || seenFates[fate.FlowID] || fate.Observed == 0 || fate.Protocol == 0 ||
+			fate.Forwarded+fate.Blocked+fate.Unsupported+fate.Unresolved > fate.Observed ||
+			cleanText(fate.LastRuleID) != fate.LastRuleID || !validFateEndpoint(fate.EndpointA) || !validFateEndpoint(fate.EndpointB) {
+			return fmt.Errorf("network packet fate %q is invalid", fate.FlowID)
+		}
+		seenFates[fate.FlowID] = true
+		switch fate.Confidence {
+		case FateExact, FateEstimated, FateObserved:
+		default:
+			return fmt.Errorf("network packet fate confidence is invalid")
 		}
 	}
 	return nil
@@ -187,13 +286,17 @@ type deviceState struct {
 	hostnames    map[string]bool
 	protocols    map[string]bool
 	observations map[string]*Observation
+	services     map[string]*Service
+	accessEvents []AccessEvent
 }
 
 // Tracker owns one bounded live observation session.
 type Tracker struct {
-	mu      sync.RWMutex
-	session Session
-	devices map[string]*deviceState
+	mu               sync.RWMutex
+	session          Session
+	devices          map[string]*deviceState
+	fates            map[traffic.FlowID]*PacketFate
+	nextDeviceNumber uint64
 }
 
 // NewTracker starts an empty observation session.
@@ -208,6 +311,7 @@ func NewTracker(id, mode string, started time.Time) *Tracker {
 	return &Tracker{
 		session: Session{Version: CurrentVersion, ID: id, Mode: cleanText(mode), StartedAt: started.UTC()},
 		devices: make(map[string]*deviceState),
+		fates:   make(map[traffic.FlowID]*PacketFate),
 	}
 }
 
@@ -216,10 +320,25 @@ func LoadTracker(session Session) *Tracker {
 	tracker := NewTracker(session.ID, session.Mode, session.StartedAt)
 	tracker.session.EndedAt = session.EndedAt
 	tracker.session.CapturePaths = cleanStrings(session.CapturePaths)
-	for _, device := range session.Devices {
+	devices := append([]Device(nil), session.Devices...)
+	if !hasStableDeviceNumbers(devices) {
+		sort.SliceStable(devices, func(i, j int) bool {
+			if devices[i].FirstSeen.Equal(devices[j].FirstSeen) {
+				return devices[i].Key < devices[j].Key
+			}
+			return devices[i].FirstSeen.Before(devices[j].FirstSeen)
+		})
+	} else {
+		sort.SliceStable(devices, func(i, j int) bool { return devices[i].Number < devices[j].Number })
+	}
+	for _, device := range devices {
 		state := tracker.ensureDevice(device.Adapter, device.Role, device.MAC, device.VLANs, device.FirstSeen)
 		if state == nil {
 			continue
+		}
+		if device.Number > 0 {
+			state.device.Number = device.Number
+			tracker.nextDeviceNumber = max(tracker.nextDeviceNumber, device.Number)
 		}
 		state.device.FirstSeen = device.FirstSeen.UTC()
 		state.device.LastSeen = device.LastSeen.UTC()
@@ -236,6 +355,15 @@ func LoadTracker(session Session) *Tracker {
 			copy := observation
 			state.observations[observationKey(copy)] = &copy
 		}
+		for _, service := range device.Services {
+			copy := service
+			state.services[serviceKey(copy)] = &copy
+		}
+		state.accessEvents = append([]AccessEvent(nil), device.AccessEvents...)
+	}
+	for _, fate := range session.PacketFates {
+		copy := fate
+		tracker.fates[fate.FlowID] = &copy
 	}
 	return tracker
 }
@@ -270,6 +398,7 @@ func (t *Tracker) ObserveFrame(frame traffic.Frame, role string, decision policy
 		return false
 	}
 	changed := t.touch(state, now)
+	t.observePacketFate(frame, decision, now)
 
 	if directlyAssociatesSource(frame.Direction) && clientMAC == decoded.SrcMAC && validIP(decoded.SrcIP) {
 		changed = addSet(state.ips, decoded.SrcIP) || changed
@@ -290,6 +419,26 @@ func (t *Tracker) ObserveFrame(frame traffic.Frame, role string, decision policy
 			Protocol: "DNS", Source: decoded.SrcIP, Destination: decoded.DstIP,
 			Severity: SeverityInfo, FirstSeen: now, LastSeen: now, Count: 1,
 		}) || changed
+	}
+	if decoded.DNSResponse && (decoded.SrcPort == 5353 || decoded.DstPort == 5353) {
+		serviceState := t.ensureDevice(frame.Ingress, role, decoded.SrcMAC, vlans, now)
+		if serviceState != nil {
+			changed = t.observeDNSService(serviceState, decoded.DNSRecords, now) || changed
+		}
+	}
+	if decoded.IPProtocol == 17 && decoded.SrcPort == 1900 && decoded.HTTPStatus != 0 {
+		serviceState := t.ensureDevice(frame.Ingress, role, decoded.SrcMAC, vlans, now)
+		if serviceState != nil {
+			serviceType := firstHTTPHeader(decoded.HTTPHeader, "St")
+			if serviceType == "" {
+				serviceType = "SSDP"
+			}
+			changed = t.addService(serviceState, Service{
+				Type: serviceType, Name: firstHTTPHeader(decoded.HTTPHeader, "Server"),
+				Target: firstHTTPHeader(decoded.HTTPHeader, "Location"), Protocol: "SSDP",
+				FirstSeen: now, LastSeen: now, Count: 1,
+			}) || changed
+		}
 	}
 
 	if decoded.HTTPMethod != "" {
@@ -319,16 +468,22 @@ func (t *Tracker) ObserveFrame(frame traffic.Frame, role string, decision policy
 		label := eapolTypeLabel(decoded.EAPOLType)
 		changed = t.addObservation(state, Observation{
 			Category: CategoryAccess, Kind: "eapol", Summary: "EAPOL " + label,
-			Protocol: "EAPOL", Source: decoded.SrcMAC, Destination: decoded.DstMAC,
+			Protocol: "EAPOL", Source: decoded.SrcMAC, Destination: decoded.DstMAC, Value: label,
 			Severity: SeverityInfo, FirstSeen: now, LastSeen: now, Count: 1,
+		}) || changed
+		changed = t.addAccessEvent(state, AccessEvent{
+			Kind: "eapol", Label: "EAPOL " + label, Protocol: "EAPOL", Severity: SeverityInfo, ObservedAt: now,
 		}) || changed
 	}
 	if decoded.EtherType == 0x88e5 {
 		state.protocols["MACSEC"] = true
 		changed = t.addObservation(state, Observation{
 			Category: CategoryAccess, Kind: "macsec", Summary: "MACsec traffic observed",
-			Protocol: "MACsec", Source: decoded.SrcMAC, Destination: decoded.DstMAC,
+			Protocol: "MACsec", Source: decoded.SrcMAC, Destination: decoded.DstMAC, Value: "observed",
 			Severity: SeverityWarn, FirstSeen: now, LastSeen: now, Count: 1,
+		}) || changed
+		changed = t.addAccessEvent(state, AccessEvent{
+			Kind: "macsec", Label: "MACsec negotiation observed", Protocol: "MACSEC", Severity: SeverityWarn, ObservedAt: now,
 		}) || changed
 	}
 	if notableDecision(decision) {
@@ -376,14 +531,14 @@ func (t *Tracker) ObserveDiscovery(item Discovery) bool {
 			changed = addSet(state.ips, value) || changed
 			changed = t.addObservation(state, Observation{
 				Category: CategoryAddressing, Kind: "address", Summary: "address " + value + " via " + cleanText(item.Packet),
-				Protocol: cleanText(item.Packet), Severity: SeverityInfo,
+				Protocol: cleanText(item.Packet), Value: value, Severity: SeverityInfo,
 				FirstSeen: now, LastSeen: now, Count: 1,
 			}) || changed
 		}
 	case "gateway", "dns", "cidr":
 		changed = t.addObservation(state, Observation{
 			Category: CategoryAddressing, Kind: field, Summary: field + " " + value + " via " + cleanText(item.Packet),
-			Protocol: cleanText(item.Packet), Severity: SeverityInfo,
+			Protocol: cleanText(item.Packet), Value: value, Severity: SeverityInfo,
 			FirstSeen: now, LastSeen: now, Count: 1,
 		}) || changed
 	case "vlan":
@@ -391,10 +546,29 @@ func (t *Tracker) ObserveDiscovery(item Discovery) bool {
 			changed = addSet(state.vlans, uint16(vlan)) || changed
 			changed = t.addObservation(state, Observation{
 				Category: CategoryAddressing, Kind: "vlan", Summary: "VLAN " + value,
-				Protocol: "802.1Q", Severity: SeverityInfo,
+				Protocol: "802.1Q", Value: value, Severity: SeverityInfo,
 				FirstSeen: now, LastSeen: now, Count: 1,
 			}) || changed
 		}
+	case "hostname", "dhcp_hostname", "mdns_hostname", "lldp_system_name":
+		if value != "" {
+			changed = addSet(state.hostnames, strings.ToLower(value)) || changed
+			changed = t.addObservation(state, Observation{
+				Category: CategoryAddressing, Kind: field, Summary: strings.ReplaceAll(field, "_", " ") + " " + value,
+				Protocol: cleanText(item.Packet), Value: value, Severity: SeverityInfo,
+				FirstSeen: now, LastSeen: now, Count: 1,
+			}) || changed
+		}
+	case "dhcp_server", "dhcp_message", "ipv6_router", "ipv6_prefix", "lldp_chassis", "lldp_port", "stp_root":
+		severity := SeverityInfo
+		if field == "dhcp_server" || field == "ipv6_router" || field == "stp_root" {
+			severity = SeverityWarn
+		}
+		changed = t.addObservation(state, Observation{
+			Category: CategoryAddressing, Kind: field, Summary: strings.ReplaceAll(field, "_", " ") + " " + value,
+			Protocol: cleanText(item.Packet), Value: value, Severity: severity,
+			FirstSeen: now, LastSeen: now, Count: 1,
+		}) || changed
 	case "eapol", "eapol_type", "eapol_version", "eap_code", "eap_type", "macsec":
 		protocol := "EAPOL"
 		if field == "macsec" {
@@ -407,8 +581,12 @@ func (t *Tracker) ObserveDiscovery(item Discovery) bool {
 		}
 		changed = t.addObservation(state, Observation{
 			Category: CategoryAccess, Kind: field, Summary: strings.ToUpper(field) + " " + value,
-			Protocol: protocol, Severity: severity,
+			Protocol: protocol, Value: value, Severity: severity,
 			FirstSeen: now, LastSeen: now, Count: 1,
+		}) || changed
+		changed = t.addAccessEvent(state, AccessEvent{
+			Kind: field, Label: accessEventLabel(field, value), Protocol: protocol,
+			Severity: severity, ObservedAt: now,
 		}) || changed
 	}
 	return changed
@@ -507,7 +685,8 @@ func (t *Tracker) Finish(ended time.Time) {
 	t.mu.Unlock()
 }
 
-// Snapshot returns an ownership-independent deterministic session.
+// Snapshot returns an ownership-independent deterministic session with the
+// newest device discovery first. Later activity never reorders devices.
 func (t *Tracker) Snapshot() Session {
 	if t == nil {
 		return Session{Version: CurrentVersion}
@@ -523,6 +702,17 @@ func (t *Tracker) Snapshot() Session {
 		device.IPs = sortedStringKeys(state.ips)
 		device.Hostnames = sortedStringKeys(state.hostnames)
 		device.Protocols = sortedStringKeys(state.protocols)
+		device.Services = make([]Service, 0, len(state.services))
+		for _, service := range state.services {
+			device.Services = append(device.Services, *service)
+		}
+		sort.Slice(device.Services, func(i, j int) bool {
+			if device.Services[i].Type == device.Services[j].Type {
+				return device.Services[i].Name < device.Services[j].Name
+			}
+			return device.Services[i].Type < device.Services[j].Type
+		})
+		device.AccessEvents = append([]AccessEvent(nil), state.accessEvents...)
 		device.Observations = make([]Observation, 0, len(state.observations))
 		for _, observation := range state.observations {
 			device.Observations = append(device.Observations, *observation)
@@ -536,11 +726,16 @@ func (t *Tracker) Snapshot() Session {
 		out.Devices = append(out.Devices, device)
 	}
 	sort.Slice(out.Devices, func(i, j int) bool {
-		if out.Devices[i].LastSeen.Equal(out.Devices[j].LastSeen) {
+		if out.Devices[i].Number == out.Devices[j].Number {
 			return out.Devices[i].Key < out.Devices[j].Key
 		}
-		return out.Devices[i].LastSeen.After(out.Devices[j].LastSeen)
+		return out.Devices[i].Number > out.Devices[j].Number
 	})
+	out.PacketFates = make([]PacketFate, 0, len(t.fates))
+	for _, fate := range t.fates {
+		out.PacketFates = append(out.PacketFates, *fate)
+	}
+	sort.Slice(out.PacketFates, func(i, j int) bool { return out.PacketFates[i].FlowID < out.PacketFates[j].FlowID })
 	return out
 }
 
@@ -557,10 +752,11 @@ func (t *Tracker) ensureDevice(adapter, role, mac string, vlans []uint16, now ti
 		if len(t.devices) >= MaxDevices {
 			return nil
 		}
+		t.nextDeviceNumber++
 		state = &deviceState{
-			device: Device{Key: key, MAC: mac, Adapter: adapter, Role: role, FirstSeen: now.UTC(), LastSeen: now.UTC()},
+			device: Device{Number: t.nextDeviceNumber, Key: key, MAC: mac, Adapter: adapter, Role: role, FirstSeen: now.UTC(), LastSeen: now.UTC()},
 			vlans:  make(map[uint16]bool), ips: make(map[string]bool), hostnames: make(map[string]bool),
-			protocols: make(map[string]bool), observations: make(map[string]*Observation),
+			protocols: make(map[string]bool), observations: make(map[string]*Observation), services: make(map[string]*Service),
 		}
 		t.devices[key] = state
 	}
@@ -570,6 +766,20 @@ func (t *Tracker) ensureDevice(adapter, role, mac string, vlans []uint16, now ti
 		}
 	}
 	return state
+}
+
+func hasStableDeviceNumbers(devices []Device) bool {
+	if len(devices) == 0 {
+		return false
+	}
+	seen := make(map[uint64]bool, len(devices))
+	for _, device := range devices {
+		if device.Number == 0 || device.Number > MaxDevices || seen[device.Number] {
+			return false
+		}
+		seen[device.Number] = true
+	}
+	return true
 }
 
 func (t *Tracker) touch(state *deviceState, now time.Time) bool {
@@ -585,6 +795,7 @@ func (t *Tracker) addObservation(state *deviceState, observation Observation) bo
 	observation.Protocol = cleanText(observation.Protocol)
 	observation.Source = cleanText(observation.Source)
 	observation.Destination = cleanText(observation.Destination)
+	observation.Value = cleanText(observation.Value)
 	if observation.Summary == "" || observation.Kind == "" {
 		return false
 	}
@@ -606,8 +817,221 @@ func observationKey(observation Observation) string {
 	return strings.Join([]string{
 		string(observation.Category), strings.ToLower(observation.Kind),
 		strings.ToLower(observation.Summary), strings.ToLower(observation.Source),
-		strings.ToLower(observation.Destination),
+		strings.ToLower(observation.Destination), strings.ToLower(observation.Value),
 	}, "\x00")
+}
+
+func (t *Tracker) addService(state *deviceState, service Service) bool {
+	service.Type = cleanText(service.Type)
+	service.Name = cleanText(service.Name)
+	service.Target = cleanServiceTarget(service.Target)
+	service.Protocol = strings.ToUpper(cleanText(service.Protocol))
+	if service.Type == "" || service.Protocol == "" {
+		return false
+	}
+	state.protocols[service.Protocol] = true
+	key := serviceKey(service)
+	if existing := state.services[key]; existing != nil {
+		existing.Count++
+		existing.LastSeen = service.LastSeen.UTC()
+		if existing.Target == "" {
+			existing.Target = service.Target
+		}
+		if existing.Port == 0 {
+			existing.Port = service.Port
+		}
+		return true
+	}
+	if len(state.services) >= MaxServicesPerDevice {
+		return false
+	}
+	service.Count = max(uint64(1), service.Count)
+	service.FirstSeen = service.FirstSeen.UTC()
+	service.LastSeen = service.LastSeen.UTC()
+	copy := service
+	state.services[key] = &copy
+	return true
+}
+
+func serviceKey(service Service) string {
+	return strings.ToLower(strings.Join([]string{service.Protocol, service.Type, service.Name}, "\x00"))
+}
+
+func (t *Tracker) observeDNSService(state *deviceState, records []traffic.DNSRecord, now time.Time) bool {
+	changed := false
+	srv := make(map[string]traffic.DNSRecord)
+	for _, record := range records {
+		if record.Type == 33 {
+			srv[strings.ToLower(record.Name)] = record
+		}
+		if (record.Type == 1 || record.Type == 28) && record.Name != "" {
+			changed = addSet(state.hostnames, strings.ToLower(record.Name)) || changed
+		}
+	}
+	for _, record := range records {
+		switch record.Type {
+		case 12:
+			serviceType := serviceTypeFromDNSName(record.Name)
+			if serviceType == "" {
+				continue
+			}
+			service := Service{Type: serviceType, Name: record.Target, Protocol: "mDNS", FirstSeen: now, LastSeen: now, Count: 1}
+			if endpoint, ok := srv[strings.ToLower(record.Target)]; ok {
+				service.Target = endpoint.Target
+				service.Port = endpoint.Port
+			}
+			changed = t.addService(state, service) || changed
+		case 33:
+			serviceType := serviceTypeFromDNSName(record.Name)
+			if serviceType == "" {
+				continue
+			}
+			changed = t.addService(state, Service{
+				Type: serviceType, Name: record.Name, Target: record.Target, Port: record.Port,
+				Protocol: "mDNS", FirstSeen: now, LastSeen: now, Count: 1,
+			}) || changed
+		}
+	}
+	return changed
+}
+
+func serviceTypeFromDNSName(value string) string {
+	labels := strings.Split(strings.ToLower(strings.TrimSuffix(value, ".")), ".")
+	for index := 0; index+1 < len(labels); index++ {
+		if strings.HasPrefix(labels[index], "_") && (labels[index+1] == "_tcp" || labels[index+1] == "_udp") {
+			return labels[index] + "." + labels[index+1]
+		}
+	}
+	return ""
+}
+
+func firstHTTPHeader(header map[string][]string, name string) string {
+	for key, values := range header {
+		if !strings.EqualFold(key, name) || len(values) == 0 {
+			continue
+		}
+		return cleanText(values[0])
+	}
+	return ""
+}
+
+func cleanServiceTarget(value string) string {
+	value = cleanText(value)
+	if parsed, err := url.Parse(value); err == nil {
+		parsed.RawQuery = ""
+		parsed.ForceQuery = false
+		parsed.Fragment = ""
+		parsed.RawFragment = ""
+		value = parsed.String()
+	}
+	return cleanText(value)
+}
+
+func (t *Tracker) addAccessEvent(state *deviceState, event AccessEvent) bool {
+	event.Kind = cleanText(event.Kind)
+	event.Label = cleanText(event.Label)
+	event.Protocol = strings.ToUpper(cleanText(event.Protocol))
+	event.ObservedAt = event.ObservedAt.UTC()
+	if event.Kind == "" || event.Label == "" || event.Protocol == "" {
+		return false
+	}
+	if count := len(state.accessEvents); count > 0 {
+		last := state.accessEvents[count-1]
+		if last.Kind == event.Kind && last.Label == event.Label && event.ObservedAt.Sub(last.ObservedAt) < 250*time.Millisecond {
+			return false
+		}
+	}
+	if len(state.accessEvents) >= MaxAccessEventsPerDevice {
+		copy(state.accessEvents, state.accessEvents[1:])
+		state.accessEvents = state.accessEvents[:len(state.accessEvents)-1]
+	}
+	state.accessEvents = append(state.accessEvents, event)
+	return true
+}
+
+func accessEventLabel(field, value string) string {
+	value = cleanText(value)
+	switch field {
+	case "eapol":
+		return "EAPOL " + value
+	case "eap_code":
+		return "EAP " + value
+	case "eap_type":
+		return "EAP method " + value
+	case "macsec":
+		return "MACsec negotiation observed"
+	default:
+		return strings.ToUpper(strings.ReplaceAll(field, "_", " ")) + " " + value
+	}
+}
+
+func (t *Tracker) observePacketFate(frame traffic.Frame, decision policy.DecisionSummary, now time.Time) {
+	if decision.Status != dataplane.StatusLive && decision.Status != dataplane.StatusUnsupported && decision.ForwardedPacketID == "" {
+		return
+	}
+	decoded := frame.Decoded()
+	if decoded.IPProtocol == 0 || decoded.SrcIP == "" || decoded.DstIP == "" {
+		return
+	}
+	flow := traffic.CanonicalFlow(frame)
+	fate := t.fates[flow.ID]
+	if fate == nil {
+		if len(t.fates) >= MaxPacketFates {
+			return
+		}
+		fate = &PacketFate{
+			FlowID: flow.ID, EndpointA: flow.EndpointA, EndpointB: flow.EndpointB, Protocol: flow.Protocol,
+			Confidence: FateObserved, FirstSeen: now,
+		}
+		t.fates[flow.ID] = fate
+	}
+	fate.Observed++
+	fate.LastSeen = now
+	if decision.WinningRuleID != "" {
+		fate.LastRuleID = cleanText(decision.WinningRuleID)
+	}
+	if decision.Edited {
+		fate.Edited++
+	}
+	switch {
+	case decision.Status == dataplane.StatusUnsupported:
+		fate.Unsupported++
+		fate.Confidence = strongerFateConfidence(fate.Confidence, FateExact)
+	case decision.Status == dataplane.StatusLive && decision.EffectiveVerdict == policy.VerdictBlock:
+		fate.Blocked++
+		fate.Confidence = strongerFateConfidence(fate.Confidence, FateExact)
+	case decision.ForwardedPacketID != "":
+		fate.Forwarded++
+		fate.Confidence = strongerFateConfidence(fate.Confidence, FateExact)
+	case decision.EffectiveVerdict == policy.VerdictAllow && decision.Status == dataplane.StatusLive:
+		fate.Forwarded++
+		confidence := FateEstimated
+		if strings.Contains(t.session.Mode, "controlled") || strings.Contains(t.session.Mode, "edge-route") {
+			confidence = FateExact
+		}
+		fate.Confidence = strongerFateConfidence(fate.Confidence, confidence)
+	default:
+		fate.Unresolved++
+	}
+}
+
+func strongerFateConfidence(current, next FateConfidence) FateConfidence {
+	rank := map[FateConfidence]int{FateObserved: 0, FateEstimated: 1, FateExact: 2}
+	if rank[next] > rank[current] {
+		return next
+	}
+	return current
+}
+
+func validFateEndpoint(endpoint traffic.Endpoint) bool {
+	if cleanText(endpoint.IP) != endpoint.IP || cleanText(endpoint.MAC) != endpoint.MAC || !validIP(endpoint.IP) {
+		return false
+	}
+	if endpoint.MAC == "" {
+		return true
+	}
+	mac, err := net.ParseMAC(endpoint.MAC)
+	return err == nil && len(mac) == 6
 }
 
 func directlyAssociatesSource(direction traffic.Direction) bool {

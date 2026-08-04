@@ -54,8 +54,8 @@ func TestPrivilegedMacOSHardware(t *testing.T) {
 				runFast(t, cfg, inventory, true)
 			case caseControlled:
 				runControlled(t, cfg, inventory)
-			case caseTakeover:
-				runTakeover(t, cfg, inventory)
+			case caseNAT:
+				runNAT(t, cfg, inventory)
 			case caseEdgeRoute:
 				runEdge(t, cfg, inventory, edge.ModeRoute)
 			case caseEdgeForward:
@@ -131,7 +131,7 @@ func selectedLiveCases(cases []hardwareCase) selectedCases {
 	var result selectedCases
 	for _, candidate := range cases {
 		switch candidate {
-		case caseFast, caseFastDiscovery, caseControlled, caseTakeover:
+		case caseFast, caseFastDiscovery, caseControlled, caseNAT:
 			result.inline = true
 		case caseEdgeRoute, caseEdgeForward:
 			result.edge = true
@@ -191,9 +191,9 @@ func runPFSyntax(t *testing.T, cfg config) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	takeoverRule := rule
-	takeoverRule.Match.Modes = []dataplane.Mode{dataplane.ModeTakeover}
-	takeoverRules, err := stealth.CompileTakeoverPF("bridge0", "hardware-pf", []policy.Rule{takeoverRule})
+	natRule := rule
+	natRule.Match.Modes = []dataplane.Mode{dataplane.ModeNAT}
+	natRules, err := stealth.CompileNATPF("bridge0", "hardware-pf", []policy.Rule{natRule})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func runPFSyntax(t *testing.T, cfg config) {
 	}
 	for name, rules := range map[string]string{
 		"fast bridge": fastRules,
-		"takeover":    takeoverRules,
+		"nat":         natRules,
 		"edge route":  edgeRules,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -306,7 +306,7 @@ func runControlled(t *testing.T, cfg config, inventory inventory) {
 	t.Logf("controlled bridge artifacts=%s original=%d forwarded=%d blocked=%d", session.Dir, stats.OriginalPackets, stats.ForwardedPackets, stats.BlockedPackets)
 }
 
-func runTakeover(t *testing.T, cfg config, inventory inventory) {
+func runNAT(t *testing.T, cfg config, inventory inventory) {
 	t.Helper()
 	host := bridgeAdapter(requirePhysicalAdapter(t, inventory, cfg.Host, "host"), "host")
 	host.TargetMAC = cfg.TargetMAC
@@ -320,43 +320,43 @@ func runTakeover(t *testing.T, cfg config, inventory inventory) {
 	defer func() {
 		if !stopped {
 			if stopErr := session.Stop(); stopErr != nil {
-				t.Errorf("emergency takeover cleanup: %v", stopErr)
+				t.Errorf("emergency nat cleanup: %v", stopErr)
 			}
 		}
 	}()
 	monitor := monitorBridge(session.Events)
 	waitForActive(t, monitor, cfg.ActiveTimeout)
-	takeover := bridge.TakeoverConfig{
-		MAC: cfg.TargetMAC, IP: cfg.TakeoverIP, CIDR: cfg.TakeoverCIDR,
-		Gateway: cfg.TakeoverGateway, DNS: cfg.TakeoverDNS,
+	nat := bridge.NATConfig{
+		MAC: cfg.TargetMAC, IP: cfg.NATIP, CIDR: cfg.NATCIDR,
+		Gateway: cfg.NATGateway, DNS: cfg.NATDNS,
 	}
-	if cfg.TakeoverIP == "" {
-		takeover.DHCP = "auto"
+	if cfg.NATIP == "" {
+		nat.DHCP = "auto"
 	}
-	if err := session.StartTakeover(takeover); err != nil {
+	if err := session.StartNAT(nat); err != nil {
 		t.Fatal(err)
 	}
-	snapshot := session.TakeoverSnapshot()
+	snapshot := session.NATSnapshot()
 	if !snapshot.Active || !snapshot.PFEndpointRules || !snapshot.PFRestorationOwned || !snapshot.L2EndpointRules || !snapshot.L2RestorationOwned || !snapshot.ProxyActive || !snapshot.ProxyStopOwned {
-		t.Fatalf("incomplete active takeover ownership: %#v", snapshot)
+		t.Fatalf("incomplete active nat ownership: %#v", snapshot)
 	}
 	waitForExercise(t, monitor.stopped, cfg.Duration)
-	if err := session.StopTakeover(); err != nil {
-		t.Fatalf("stop takeover: %v", err)
+	if err := session.StopNAT(); err != nil {
+		t.Fatalf("stop nat: %v", err)
 	}
-	if snapshot := session.TakeoverSnapshot(); snapshot.Active || snapshot.CleanupPending || snapshot.PFRestorationOwned || snapshot.L2RestorationOwned || snapshot.ProxyStopOwned {
-		t.Fatalf("takeover cleanup remains owned: %#v", snapshot)
+	if snapshot := session.NATSnapshot(); snapshot.Active || snapshot.CleanupPending || snapshot.PFRestorationOwned || snapshot.L2RestorationOwned || snapshot.ProxyStopOwned {
+		t.Fatalf("nat cleanup remains owned: %#v", snapshot)
 	}
 	if err := session.Stop(); err != nil {
-		t.Fatalf("stop takeover bridge: %v", err)
+		t.Fatalf("stop nat bridge: %v", err)
 	}
 	stopped = true
 	if session.CleanupPending() {
-		t.Fatal("takeover bridge reports cleanup pending")
+		t.Fatal("nat bridge reports cleanup pending")
 	}
 	verifyRestored(t, baselines)
 	stats := verifyFastArtifacts(t, session.Dir, cfg)
-	t.Logf("takeover artifacts=%s packets=%d eapol=%d vlan=%d", session.Dir, stats.packets, stats.eapol, stats.vlan)
+	t.Logf("nat artifacts=%s packets=%d eapol=%d vlan=%d", session.Dir, stats.packets, stats.eapol, stats.vlan)
 }
 
 func runEdge(t *testing.T, cfg config, inventory inventory, mode edge.Mode) {
@@ -438,10 +438,10 @@ func inlineHardwareRules() []policy.Rule {
 	fast := base
 	fast.ID = "hardware-fast-pf"
 	fast.Match.Modes = []dataplane.Mode{dataplane.ModeFastBridge}
-	takeover := base
-	takeover.ID = "hardware-takeover-pf"
-	takeover.Match.Modes = []dataplane.Mode{dataplane.ModeTakeover}
-	return []policy.Rule{fast, takeover}
+	nat := base
+	nat.ID = "hardware-nat-pf"
+	nat.Match.Modes = []dataplane.Mode{dataplane.ModeNAT}
+	return []policy.Rule{fast, nat}
 }
 
 type eventMonitor struct {

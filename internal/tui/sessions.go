@@ -66,7 +66,7 @@ func (m Model) compatibilityForCapabilities(rule policy.Rule, capabilities datap
 	return policy.Compatibility(rule, capabilities)
 }
 
-func (m Model) bridgeTakeoverConfig() bridge.TakeoverConfig {
+func (m Model) bridgeNATConfig() bridge.NATConfig {
 	cfg := m.profile.BridgeAdapterSnapshot()
 	var host profile.AdapterConfig
 	if hostCfg, ok := m.profile.Role(profile.AdapterRoleHost); ok {
@@ -83,7 +83,7 @@ func (m Model) bridgeTakeoverConfig() bridge.TakeoverConfig {
 		}
 		return cfg.Value(key)
 	}
-	return bridge.TakeoverConfig{
+	return bridge.NATConfig{
 		MAC:     pick("mac"),
 		IP:      pick("ip"),
 		CIDR:    pick("cidr"),
@@ -462,15 +462,15 @@ func stopBridgeCmd(session *bridge.Session) tea.Cmd {
 	}
 }
 
-func startNATCmd(session *bridge.Session, cfg bridge.TakeoverConfig) tea.Cmd {
+func startNATCmd(session *bridge.Session, cfg bridge.NATConfig) tea.Cmd {
 	return func() tea.Msg {
-		return bridgeNATMsg{session: session, active: true, err: session.StartTakeover(cfg)}
+		return bridgeNATMsg{session: session, active: true, err: session.StartNAT(cfg)}
 	}
 }
 
 func stopNATCmd(session *bridge.Session) tea.Cmd {
 	return func() tea.Msg {
-		return bridgeNATMsg{session: session, active: false, err: session.StopTakeover()}
+		return bridgeNATMsg{session: session, active: false, err: session.StopNAT()}
 	}
 }
 

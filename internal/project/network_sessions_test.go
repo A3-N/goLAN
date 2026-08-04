@@ -23,6 +23,9 @@ func TestNetworkSessionsAreIncludedOnlyInFullBundles(t *testing.T) {
 	if _, err := project.SaveNetworkSession(tracker.Snapshot()); err != nil {
 		t.Fatal(err)
 	}
+	if err := project.SetNetworkBaseline("bundle-session"); err != nil {
+		t.Fatal(err)
+	}
 	if err := project.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -42,12 +45,18 @@ func TestNetworkSessionsAreIncludedOnlyInFullBundles(t *testing.T) {
 	if _, _, err := fullProject.ReadNetworkSession("bundle-session"); err != nil {
 		t.Fatalf("full bundle session: %v", err)
 	}
+	if reference, ok := fullProject.NetworkBaseline(); !ok || reference.ID != "bundle-session" {
+		t.Fatalf("full bundle baseline=%#v ok=%t", reference, ok)
+	}
 	metadataProject, err := ImportBundle(context.Background(), metadata, t.TempDir(), "MetadataImport")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if sessions := metadataProject.Manifest().NetworkSessions; len(sessions) != 0 {
 		t.Fatalf("metadata bundle sessions=%#v", sessions)
+	}
+	if _, ok := metadataProject.NetworkBaseline(); ok || metadataProject.Manifest().Preferences.NetworkBaselineSessionID != "" {
+		t.Fatal("metadata bundle retained a dangling Network baseline")
 	}
 }
 
@@ -103,6 +112,45 @@ func TestNetworkSessionIsImmutableVerifiedAndRestored(t *testing.T) {
 	}
 	if _, _, err := opened.ReadNetworkSession(session.ID); err == nil {
 		t.Fatal("tampered network session passed fingerprint verification")
+	}
+}
+
+func TestNetworkBaselineReferencesAnIndexedSessionAndPersists(t *testing.T) {
+	project, err := New(t.TempDir(), "NetworkBaseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracker := networkobs.NewTracker("baseline-session", "listen", time.Unix(1, 0))
+	tracker.ObserveDiscovery(networkobs.Discovery{
+		Adapter: "en0", Role: "host", DeviceMAC: "02:00:00:00:00:01", Field: "ip", Value: "192.0.2.10", Packet: "DHCP",
+	})
+	if _, err := project.SaveNetworkSession(tracker.Snapshot()); err != nil {
+		t.Fatal(err)
+	}
+	if err := project.SetNetworkBaseline("missing"); err == nil {
+		t.Fatal("unindexed baseline was accepted")
+	}
+	if err := project.SetNetworkBaseline("baseline-session"); err != nil {
+		t.Fatal(err)
+	}
+	if reference, ok := project.NetworkBaseline(); !ok || reference.ID != "baseline-session" || !project.Dirty() {
+		t.Fatalf("reference=%#v ok=%t dirty=%t", reference, ok, project.Dirty())
+	}
+	if err := project.Save(); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := Open(project.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reference, ok := opened.NetworkBaseline(); !ok || reference.ID != "baseline-session" {
+		t.Fatalf("restored reference=%#v ok=%t", reference, ok)
+	}
+	if err := opened.SetNetworkBaseline(""); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := opened.NetworkBaseline(); ok {
+		t.Fatal("baseline was not cleared")
 	}
 }
 

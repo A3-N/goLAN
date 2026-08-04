@@ -100,12 +100,12 @@ func TestCompileFastBridgePFRejectsOverlappingL2BoundaryBeforeMutation(t *testin
 	}
 }
 
-func TestCompileTakeoverPFOrdersEndpointPolicyBeforeSafeDefaults(t *testing.T) {
+func TestCompileNATPFOrdersEndpointPolicyBeforeSafeDefaults(t *testing.T) {
 	rules := []policy.Rule{
 		{
 			ID: "block-admin", Priority: 200, Enabled: true,
 			Match: policy.Match{
-				Modes: []dataplane.Mode{dataplane.ModeTakeover}, Directions: []traffic.Direction{traffic.DirectionOutbound},
+				Modes: []dataplane.Mode{dataplane.ModeNAT}, Directions: []traffic.Direction{traffic.DirectionOutbound},
 				IPVersions: []uint8{4}, Protocols: []uint8{6}, DstPorts: policy.PortSet{Values: []uint16{22}},
 			},
 			Actions: []policy.Action{{Kind: policy.ActionBlock}},
@@ -116,7 +116,7 @@ func TestCompileTakeoverPFOrdersEndpointPolicyBeforeSafeDefaults(t *testing.T) {
 			Actions: []policy.Action{{Kind: policy.ActionBlock}},
 		},
 	}
-	got, err := CompileTakeoverPF("bridge7", "takeover-1", rules)
+	got, err := CompileNATPF("bridge7", "nat-1", rules)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,10 +130,10 @@ func TestCompileTakeoverPFOrdersEndpointPolicyBeforeSafeDefaults(t *testing.T) {
 		"",
 	}, "\n")
 	if got != want {
-		t.Fatalf("compiled takeover PF rules:\n%s\nwant:\n%s", got, want)
+		t.Fatalf("compiled nat PF rules:\n%s\nwant:\n%s", got, want)
 	}
-	if _, err := CompileTakeoverPF("-a", "invalid", rules); err == nil {
-		t.Fatal("unsafe takeover interface accepted")
+	if _, err := CompileNATPF("-a", "invalid", rules); err == nil {
+		t.Fatal("unsafe nat interface accepted")
 	}
 }
 

@@ -117,14 +117,14 @@ func CompileFastBridgePF(hostInterface, switchInterface, revision string, rules 
 	return strings.Join(lines, "\n") + "\n", nil
 }
 
-// CompileTakeoverPF returns the complete IPv4 endpoint policy for a bridge
+// CompileNATPF returns the complete IPv4 endpoint policy for a bridge
 // whose authenticated identity has moved into the local kernel. It preserves
 // outbound state, permits DHCP acquisition, blocks unsolicited inbound IPv4,
-// and blocks IPv6 on only the takeover interface. Exactly representable
+// and blocks IPv6 on only the nat interface. Exactly representable
 // allow/block rules precede those defaults in shared policy order.
-func CompileTakeoverPF(interfaceName, revision string, rules []policy.Rule) (string, error) {
+func CompileNATPF(interfaceName, revision string, rules []policy.Rule) (string, error) {
 	if err := validateInterfaceName(interfaceName); err != nil {
-		return "", fmt.Errorf("takeover interface: %w", err)
+		return "", fmt.Errorf("nat interface: %w", err)
 	}
 	interfaceName = strings.TrimSpace(interfaceName)
 	lines := []string{
@@ -135,17 +135,17 @@ func CompileTakeoverPF(interfaceName, revision string, rules []policy.Rule) (str
 	if len(rules) > 0 {
 		compiled, err := policy.Compile(revision, rules)
 		if err != nil {
-			return "", fmt.Errorf("compile takeover PF policy: %w", err)
+			return "", fmt.Errorf("compile nat PF policy: %w", err)
 		}
 		for _, rule := range compiled.Rules() {
-			if !rule.Enabled || !policy.TakeoverPFCompatible(rule) {
+			if !rule.Enabled || !policy.NATPFCompatible(rule) {
 				continue
 			}
 			verdict := fastPFVerdict(rule)
 			if verdict == "" {
 				continue
 			}
-			for _, direction := range takeoverPFDirections(rule.Match.Directions) {
+			for _, direction := range natPFDirections(rule.Match.Directions) {
 				parts := []string{verdict, direction, "quick", "on", interfaceName, "inet"}
 				if protocols := fastPFProtocols(rule.Match); protocols != "" {
 					parts = append(parts, "proto", protocols)
@@ -172,7 +172,7 @@ func CompileTakeoverPF(interfaceName, revision string, rules []policy.Rule) (str
 	return strings.Join(lines, "\n") + "\n", nil
 }
 
-func takeoverPFDirections(values []traffic.Direction) []string {
+func natPFDirections(values []traffic.Direction) []string {
 	seen := make(map[string]bool)
 	for _, value := range values {
 		switch value {

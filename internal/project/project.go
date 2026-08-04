@@ -138,8 +138,9 @@ type CaptureJournal struct {
 
 // Preferences stores the small amount of project-scoped Workbench state.
 type Preferences struct {
-	Workspace            string `json:"workspace,omitempty"`
-	ActivePolicyRevision string `json:"active_policy_revision,omitempty"`
+	Workspace                string `json:"workspace,omitempty"`
+	ActivePolicyRevision     string `json:"active_policy_revision,omitempty"`
+	NetworkBaselineSessionID string `json:"network_baseline_session_id,omitempty"`
 }
 
 // Project owns one working directory and its explicit-save state.
@@ -287,6 +288,50 @@ func (p *Project) SetActivePolicyRevision(revision string) error {
 		p.dirty = true
 	}
 	return nil
+}
+
+// SetNetworkBaseline records one already-indexed sanitized session as the
+// comparison baseline. An empty ID explicitly clears the baseline.
+func (p *Project) SetNetworkBaseline(id string) error {
+	if p == nil {
+		return fmt.Errorf("project is nil")
+	}
+	id = strings.TrimSpace(id)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if id != "" {
+		found := false
+		for _, candidate := range p.manifest.NetworkSessions {
+			if candidate.ID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("network session %q is not indexed", id)
+		}
+	}
+	if p.manifest.Preferences.NetworkBaselineSessionID != id {
+		p.manifest.Preferences.NetworkBaselineSessionID = id
+		p.dirty = true
+	}
+	return nil
+}
+
+// NetworkBaseline returns the indexed baseline reference, when configured.
+func (p *Project) NetworkBaseline() (NetworkSessionReference, bool) {
+	if p == nil {
+		return NetworkSessionReference{}, false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	id := p.manifest.Preferences.NetworkBaselineSessionID
+	for _, candidate := range p.manifest.NetworkSessions {
+		if candidate.ID == id {
+			return candidate, true
+		}
+	}
+	return NetworkSessionReference{}, false
 }
 
 // Save atomically writes project.json and clears PROJECT* state.
@@ -914,6 +959,9 @@ func validateManifest(manifest Manifest) error {
 			return fmt.Errorf("network session record %q is invalid", session.ID)
 		}
 		seenNetworkSessions[session.ID] = true
+	}
+	if baseline := manifest.Preferences.NetworkBaselineSessionID; baseline != "" && !seenNetworkSessions[baseline] {
+		return fmt.Errorf("network baseline session %q is not indexed", baseline)
 	}
 	return nil
 }

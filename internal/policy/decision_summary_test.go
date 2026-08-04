@@ -13,7 +13,7 @@ func TestDecisionSummaryIsPayloadFreeAndReportsOutcome(t *testing.T) {
 	decision := Decision{
 		PacketID:          "original",
 		ForwardedPacketID: "edited",
-		DataPlane:         dataplane.ModeTakeover,
+		DataPlane:         dataplane.ModeNAT,
 		EvidenceKind:      traffic.EvidencePacket,
 		Verdict:           VerdictBlock,
 		EffectiveVerdict:  VerdictAllow,
@@ -30,7 +30,7 @@ func TestDecisionSummaryIsPayloadFreeAndReportsOutcome(t *testing.T) {
 	summary := decision.Summary()
 	if summary.PacketID != traffic.PacketID("original") ||
 		summary.ForwardedPacketID != traffic.PacketID("edited") ||
-		summary.DataPlane != dataplane.ModeTakeover ||
+		summary.DataPlane != dataplane.ModeNAT ||
 		summary.EvidenceKind != traffic.EvidencePacket ||
 		!summary.Edited ||
 		summary.Status != dataplane.StatusLive ||

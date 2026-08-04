@@ -6,30 +6,46 @@ import (
 	"strings"
 
 	networkobs "golan/internal/network"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
-func (m *Model) executeNetwork(args []string) {
-	usage := "use: network show | network filter <all|addressing|dns|http|access|risks|actions> | network search <term|clear> | network reset | network session list|show <id>"
+func (m *Model) executeNetwork(args []string) tea.Cmd {
+	usage := "use: network show|infrastructure|services | network identity|explain|access|fate <device> | network filter <all|addressing|dns|http|access|risks|actions> | network search <term|clear> | network reset | network session <list|show> | network baseline <show|set|clear> | network compare <baseline|session> | network passport <save|verify|compare> | network probe <plan|run> | network rule draft <device>"
 	if len(args) == 0 {
 		m.print(usage)
-		return
+		return nil
 	}
 	switch strings.ToLower(args[0]) {
 	case "show":
 		if len(args) != 1 {
 			m.print(usage)
-			return
+			return nil
 		}
 		devices := m.networkDevices()
 		observations := 0
+		services := 0
+		accessEvents := 0
 		for _, device := range devices {
 			observations += len(device.Observations)
+			services += len(device.Services)
+			accessEvents += len(device.AccessEvents)
 		}
-		m.print(fmt.Sprintf("network: devices=%d observations=%d filter=%s search=%s", len(devices), observations, networkFilterLabel(m.networkFilter), emptyNetworkValue(m.networkSearch)))
+		fates := 0
+		if m.networkTracker != nil {
+			fates = len(m.networkTracker.Snapshot().PacketFates)
+		}
+		m.print(fmt.Sprintf("network: devices=%d observations=%d services=%d access-events=%d fates=%d filter=%s search=%s", len(devices), observations, services, accessEvents, fates, networkFilterLabel(m.networkFilter), emptyNetworkValue(m.networkSearch)))
+	case "infrastructure":
+		m.showNetworkInfrastructure(args[1:])
+	case "services":
+		m.showNetworkServices(args[1:])
+	case "identity", "explain", "access", "fate":
+		m.showNetworkDeviceIntelligence(strings.ToLower(args[0]), args[1:])
 	case "filter":
 		if len(args) != 2 {
 			m.print(usage)
-			return
+			return nil
 		}
 		value := strings.ToLower(args[1])
 		switch value {
@@ -43,20 +59,20 @@ func (m *Model) executeNetwork(args []string) {
 			m.networkFilter = networkobs.CategoryHTTP
 		case "access":
 			m.networkFilter = networkobs.CategoryAccess
-		case "risk", "risks":
+		case "risks":
 			m.networkFilter = networkobs.CategoryRisk
-		case "action", "actions":
+		case "actions":
 			m.networkFilter = networkobs.CategoryAction
 		default:
 			m.print(usage)
-			return
+			return nil
 		}
 		m.ensureNetworkSelection()
 		m.print("network filter: " + networkFilterLabel(m.networkFilter))
 	case "search":
 		if len(args) < 2 {
 			m.print(usage)
-			return
+			return nil
 		}
 		value := strings.TrimSpace(strings.Join(args[1:], " "))
 		if strings.EqualFold(value, "clear") {
@@ -64,7 +80,7 @@ func (m *Model) executeNetwork(args []string) {
 		}
 		if len([]rune(value)) > 128 {
 			m.print("network search err: term is limited to 128 characters")
-			return
+			return nil
 		}
 		m.networkSearch = value
 		m.ensureNetworkSelection()
@@ -72,7 +88,7 @@ func (m *Model) executeNetwork(args []string) {
 	case "reset":
 		if len(args) != 1 {
 			m.print(usage)
-			return
+			return nil
 		}
 		m.networkFilter = ""
 		m.networkSearch = ""
@@ -80,9 +96,20 @@ func (m *Model) executeNetwork(args []string) {
 		m.print("network view: reset")
 	case "session":
 		m.executeNetworkSession(args[1:])
+	case "baseline":
+		m.executeNetworkBaseline(args[1:])
+	case "compare":
+		m.executeNetworkCompare(args[1:])
+	case "passport":
+		m.executeNetworkPassport(args[1:])
+	case "probe":
+		return m.executeNetworkProbe(args[1:])
+	case "rule":
+		m.executeNetworkRule(args[1:])
 	default:
 		m.print(usage)
 	}
+	return nil
 }
 
 func (m *Model) executeNetworkSession(args []string) {

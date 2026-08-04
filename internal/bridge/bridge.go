@@ -102,7 +102,7 @@ type Session struct {
 	eapolPolicy       EAPOLPolicy
 	targetMAC         net.HardwareAddr
 	nat               *NATState
-	takeoverGate      syncgate.Gate
+	natGate           syncgate.Gate
 	controlMu         sync.Mutex
 	origIPv6Fwd       string
 	inspector         *inspect.Inspector
@@ -126,7 +126,7 @@ type Session struct {
 // Mode selects the fast kernel or controlled userspace forwarding path.
 type Mode string
 
-// Bridge modes preserve start bridge compatibility by defaulting to fast.
+// Bridge modes name the supported forwarding implementations.
 const (
 	ModeFast       Mode = "fast"
 	ModeControlled Mode = "controlled"
@@ -154,10 +154,9 @@ func DefaultEAPOLPolicy() EAPOLPolicy {
 	return EAPOLPolicy{SuppressLogoff: true, DowngradeMACsec: true}
 }
 
-// TakeoverConfig describes the settings used to move the authenticated host
-// identity onto the bridge endpoint. NATConfig remains a source-compatible
-// alias for older callers and commands.
-type TakeoverConfig struct {
+// NATConfig describes the settings used to move the authenticated host
+// identity onto the bridge endpoint.
+type NATConfig struct {
 	MAC     string
 	IP      string
 	CIDR    string
@@ -166,13 +165,10 @@ type TakeoverConfig struct {
 	DHCP    string
 }
 
-// NATConfig is the legacy name for TakeoverConfig.
-type NATConfig = TakeoverConfig
-
-// TakeoverState records every reversible identity and PF change made by
-// StartTakeover. PF restoration remains explicit and retryable after a partial
+// NATState records every reversible identity and PF change made by
+// StartNAT. PF restoration remains explicit and retryable after a partial
 // stop; the complete rules themselves are intentionally not exposed.
-type TakeoverState struct {
+type NATState struct {
 	BridgeName             string
 	MAC                    string
 	IP                     string
@@ -195,11 +191,8 @@ type TakeoverState struct {
 	LivePolicyRules        int
 	ShadowPolicyRules      int
 	UnsupportedPolicyRules int
-	takeoverPFRules        string
+	natPFRules             string
 }
-
-// NATState is the legacy name for TakeoverState.
-type NATState = TakeoverState
 
 // StartModeWithPolicyOptions starts a bridge with immutable, preflighted
 // controlled forwarding bounds. Fast mode retains them only as session
@@ -568,15 +561,15 @@ func (s *Session) cleanupLocked() error {
 			errs = append(errs, fmt.Errorf("EAPOL passthrough stop timed out"))
 		}
 	}
-	if err := s.StopTakeover(); err != nil {
-		errs = append(errs, fmt.Errorf("stop takeover: %w", err))
+	if err := s.StopNAT(); err != nil {
+		errs = append(errs, fmt.Errorf("stop nat: %w", err))
 	}
 	s.controlMu.Lock()
-	takeoverPending := s.nat != nil
+	natPending := s.nat != nil
 	s.controlMu.Unlock()
 	boundaryRestored := false
-	if takeoverPending {
-		errs = append(errs, fmt.Errorf("takeover cleanup remains pending; bridge retained for retry"))
+	if natPending {
+		errs = append(errs, fmt.Errorf("nat cleanup remains pending; bridge retained for retry"))
 	} else {
 		bridgeErr := s.destroyBridge()
 		if bridgeErr != nil {
@@ -1078,20 +1071,20 @@ func (s *Session) processFastCapturedPacket(adapter Adapter, packet gopacket.Pac
 	targetMAC := append(net.HardwareAddr(nil), s.targetMAC...)
 	mode := dataplane.ModeFastBridge
 	if s.nat != nil && s.nat.HostDetached {
-		mode = dataplane.ModeTakeover
+		mode = dataplane.ModeNAT
 	}
 	s.controlMu.Unlock()
 	direction := traffic.DirectionUnknown
 	if ethernet, ok := packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet); ok && len(targetMAC) == 6 {
 		switch {
 		case macEqual(ethernet.SrcMAC, targetMAC):
-			if mode == dataplane.ModeTakeover {
+			if mode == dataplane.ModeNAT {
 				direction = traffic.DirectionOutbound
 			} else {
 				direction = traffic.DirectionHostToSwitch
 			}
 		case macEqual(ethernet.DstMAC, targetMAC):
-			if mode == dataplane.ModeTakeover {
+			if mode == dataplane.ModeNAT {
 				direction = traffic.DirectionInbound
 			} else {
 				direction = traffic.DirectionSwitchToHost

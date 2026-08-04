@@ -172,7 +172,7 @@ func TestNetworkWorkspaceIsDeviceCentricAndUsesGuidedSections(t *testing.T) {
 	m.ensureNetworkSelection()
 
 	view := m.View()
-	for _, want := range []string{"network devices", "device inspector", "02:00:00:00:00:01", "192.0.2.10", "[-] ADDRESSING", "[+] DNS", "[+] HTTP", "CAPTURES (1)"} {
+	for _, want := range []string{"network devices", "device inspector", "DISCOVERY #1", "02:00:00:00:00:01", "192.0.2.10", "[-] ADDRESSING", "[+] DNS", "[+] HTTP", "CAPTURES (1)"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("Network view missing %q:\n%s", want, view)
 		}
@@ -187,6 +187,63 @@ func TestNetworkWorkspaceIsDeviceCentricAndUsesGuidedSections(t *testing.T) {
 	if !strings.Contains(view, "[-] HTTP") || !strings.Contains(view, "HTTP GET example.test/login") ||
 		!strings.Contains(view, "[+] ADDRESSING") || strings.Contains(view, "address 192.0.2.10 via DHCP") {
 		t.Fatalf("accordion disclosure is not focused:\n%s", view)
+	}
+}
+
+func TestNetworkRowsAndSelectionStayPutWhenOlderDeviceIsActive(t *testing.T) {
+	m := NewModelWithSize(120, 30)
+	m.workspace = workspaceNetwork
+	m.activeCard = cardOutput
+	m.networkTracker = networkobs.LoadTracker(networkobs.Session{
+		Version: networkobs.CurrentVersion, ID: "stable-rows", Mode: "listen", StartedAt: time.Unix(1, 0),
+		Devices: []networkobs.Device{
+			{Key: "en0/02:00:00:00:00:01", MAC: "02:00:00:00:00:01", Adapter: "en0", FirstSeen: time.Unix(2, 0), LastSeen: time.Unix(2, 0)},
+			{Key: "en0/02:00:00:00:00:02", MAC: "02:00:00:00:00:02", Adapter: "en0", FirstSeen: time.Unix(3, 0), LastSeen: time.Unix(3, 0)},
+		},
+	})
+	m.ensureNetworkSelection()
+	m.moveNetworkSelection(1)
+	selected := m.selectedNetworkDevice
+
+	m.networkTracker.ObserveDiscovery(networkobs.Discovery{
+		Adapter: "en0", Role: "host", DeviceMAC: "02:00:00:00:00:01",
+		Field: "ip", Value: "192.0.2.10", Packet: "DHCP",
+	})
+	m.ensureNetworkSelection()
+	devices := m.networkDevices()
+	if len(devices) != 2 || devices[0].Number != 2 || devices[1].Number != 1 ||
+		devices[0].MAC != "02:00:00:00:00:02" || devices[1].MAC != "02:00:00:00:00:01" {
+		t.Fatalf("activity reordered rows: %#v", devices)
+	}
+	if m.selectedNetworkDevice != selected || selected != devices[1].Key {
+		t.Fatalf("selection moved: selected=%q want=%q", m.selectedNetworkDevice, selected)
+	}
+	view := m.renderNetworkDevices(118, 20)
+	newer := strings.Index(view, "02:00:00:00:00:02")
+	older := strings.Index(view, "02:00:00:00:00:01")
+	if newer < 0 || older < 0 || newer >= older {
+		t.Fatalf("highest discovery number is not rendered first:\n%s", view)
+	}
+	if row := networkDeviceRow("> ", devices[1], 118); !strings.HasPrefix(row, "> 1") {
+		t.Fatalf("selected row does not retain discovery number: %q", row)
+	}
+	m.networkFilter = networkobs.CategoryAddressing
+	filtered := m.networkDevices()
+	if len(filtered) != 1 || filtered[0].Key != selected || filtered[0].Number != 1 {
+		t.Fatalf("filter renumbered the selected device: %#v", filtered)
+	}
+	m.networkFilter = ""
+	m.networkTracker.ObserveDiscovery(networkobs.Discovery{
+		Adapter: "en0", Role: "host", DeviceMAC: "02:00:00:00:00:03",
+		Field: "ip", Value: "192.0.2.30", Packet: "DHCP",
+	})
+	m.ensureNetworkSelection()
+	devices = m.networkDevices()
+	if len(devices) != 3 || devices[0].Number != 3 || devices[1].Number != 2 || devices[2].Number != 1 {
+		t.Fatalf("new discovery is not ordered highest to lowest: %#v", devices)
+	}
+	if m.selectedNetworkDevice != selected {
+		t.Fatalf("new discovery stole selection: selected=%q want=%q", m.selectedNetworkDevice, selected)
 	}
 }
 

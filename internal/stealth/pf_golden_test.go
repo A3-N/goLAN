@@ -24,10 +24,10 @@ func TestPFCompilerGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	takeover, err := CompileTakeoverPF("bridge7", "pf-v1", []policy.Rule{{
-		ID: "takeover-admin", Priority: 100, Enabled: true,
+	nat, err := CompileNATPF("bridge7", "pf-v1", []policy.Rule{{
+		ID: "nat-admin", Priority: 100, Enabled: true,
 		Match: policy.Match{
-			Modes: []dataplane.Mode{dataplane.ModeTakeover}, Directions: []traffic.Direction{traffic.DirectionOutbound},
+			Modes: []dataplane.Mode{dataplane.ModeNAT}, Directions: []traffic.Direction{traffic.DirectionOutbound},
 			IPVersions: []uint8{4}, Protocols: []uint8{6}, DstPorts: policy.PortSet{Values: []uint16{22}},
 		},
 		Actions: []policy.Action{{Kind: policy.ActionBlock}},
@@ -53,7 +53,7 @@ func TestPFCompilerGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual := "[fast-bridge]\n" + fast + "[takeover]\n" + takeover + "[edge-route]\n" + edgePF
+	actual := "[fast-bridge]\n" + fast + "[nat]\n" + nat + "[edge-route]\n" + edgePF
 	goldenPath := filepath.Join("testdata", "pf-v1.golden.txt")
 	expected, err := os.ReadFile(goldenPath)
 	if err != nil {

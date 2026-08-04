@@ -1,2 +1,2 @@
-// Package bridge owns reversible macOS bridge, takeover, capture, and adapter-isolation lifecycles.
+// Package bridge owns reversible macOS bridge, nat, capture, and adapter-isolation lifecycles.
 package bridge

@@ -26,6 +26,23 @@ sudo golan
 Opening a project never starts networking. Live interface, bridge, PF, route,
 and forwarding changes require macOS and root.
 
+## Examples
+
+The root README stays focused on the product and interface. Task-focused
+command flows live under [`examples/`](examples/README.md):
+
+| Goal | Guide |
+| --- | --- |
+| Observe without forwarding | [Passive listen](examples/passive-listen.md) |
+| Give one host DHCP and routed internet access | [Edge route](examples/edge-route.md) |
+| Forward transparently between a host and switch | [Bridge](examples/bridge.md) |
+| Use authenticated-identity forwarding | [NAT](examples/nat.md) |
+| Review the stable device inventory | [Network review](examples/network-review.md) |
+| Baseline, explain, verify, and act on observations | [Network intelligence](examples/network-intelligence.md) |
+| Manage rules, projects, recovery, or Canvas | [All examples](examples/README.md) |
+
+Run `help` in Main or press `F1` for the complete command reference.
+
 ## UI tour
 
 The top bar has three direct destinations:
@@ -36,9 +53,13 @@ The top bar has three direct destinations:
 
 Network is not a packet timeline. Each directly observed Layer 2 device gets
 one row with its MAC, associated IPs and VLANs, useful protocols, alert count,
-and last-seen time. Repeated facts update counts instead of adding traffic
-rows. The Inspector uses collapsible Addressing, DNS, HTTP, Access, Risk, and
-Action sections so only one detail branch needs attention at a time.
+and last-seen time. `#` is a stable session-local discovery number: the newest
+device has the highest number at the top, and later activity updates that row
+without moving it. Repeated facts update counts instead of adding traffic rows.
+The Inspector uses collapsible Addressing, DNS, HTTP, Access, Risk, and Action
+sections so only one detail branch needs attention at a time. Its compact
+`O Overview`, `E Explain`, `A Access`, `F Fate`, and `R Rule` actions keep
+deeper analysis attached to the selected device.
 
 Help follows the same progressive pattern: category, group, then one topic.
 `Ctrl+P` searches documented commands and stages the selected command in
@@ -69,7 +90,10 @@ goLAN keeps only facts that remain useful without becoming another Wireshark:
 
 - new device identities and strong MAC/IP/VLAN associations;
 - DHCP, ARP, and related addressing discoveries;
+- infrastructure actors and changes, including gateways, DHCP/DNS servers,
+  IPv6 routers, LLDP switches, STP roots, and authenticators;
 - DNS query names and types;
+- useful mDNS and SSDP service identities without arbitrary TXT content;
 - plaintext HTTP method, host, query-free path, and response status;
 - EAPOL and MACsec access events;
 - categorical risky-authentication signals such as NTLM or cleartext login;
@@ -86,9 +110,58 @@ journals, bundles, config diffs, or Main Output. Opaque hashes, challenges,
 encrypted values, card data, and raw detector detail are not decoded into the
 UI.
 
-Use `network filter ...`, `network search ...`, and
-`network session list|show ...` to review the inventory. `show captures
-[session-id]` prints the full paths of captures saved during a session.
+### Network CLI
+
+Device selectors accept the visible discovery number, exact MAC, associated
+IP, or exact observed hostname. These are the canonical commands; there are no
+command aliases.
+
+```text
+# Inventory and focused analysis
+network show
+network filter <all|addressing|dns|http|access|risks|actions>
+network search <term|clear>
+network reset
+network identity <device>
+network infrastructure
+network services
+network explain <device>
+network access <device>
+network fate <device>
+
+# Saved sessions and Network Time Machine
+network session list
+network session show <session-id>
+network baseline show
+network baseline set <session-id>
+network baseline clear
+network compare baseline
+network compare session <session-id>
+
+# Checksummed portable fingerprints
+network passport save <destination.golanpass>
+network passport verify <path.golanpass>
+network passport compare <path.golanpass>
+
+# Reviewable, bounded probes: plan first, run once second
+network probe plan gateway <ip>
+network probe plan dns <hostname>
+network probe plan route <ip>
+network probe plan device <ip> <tcp-port>
+network probe plan dhcp <adapter>
+network probe run
+
+# Turn retained evidence into a review-only typed rule draft
+network rule draft <device>
+```
+
+`network explain` labels link-through-application evidence as PASS, WARN,
+FAIL, or SKIP and never guesses encrypted content. `network fate` is a
+payload-free outcome aggregate, not a packet timeline. Passport files exclude
+captures, raw observations, paths, packet outcomes, and secrets. Probe plans
+have a fixed three-second deadline; the macOS DHCP probe reads the existing
+lease and does not solicit or renew one. Rule drafts do not commit or enforce
+themselves. `show captures [session-id]` prints captures saved by goLAN.
 
 ## Rules and Canvas
 
@@ -98,7 +171,7 @@ length-preserving and repair applicable checksums. Rule previews use only the
 bounded in-memory sample collected by a live session; there is no file picker
 or offline replay path.
 
-`canvas build|rebuild [network-session-id]` derives deterministic topology from
+`canvas build [network-session-id]` derives deterministic topology from
 sanitized Network observations. Canvas, Doctor, and Health report through Main
 Output and do not add workspaces.
 
@@ -109,7 +182,7 @@ Output and do not add workspaces.
 | Listen | Passive observation, automatic capture, and shadow rule evaluation |
 | Fast bridge | Reversible macOS kernel bridge with compatible filter rules |
 | Controlled bridge | Bounded userspace allow/block, shaping, and safe frame edits |
-| Takeover | Reversible authenticated bridge identity with endpoint PF filtering |
+| NAT | Reversible authenticated bridge identity with endpoint PF filtering |
 | Edge Observe | Single-adapter passive observation |
 | Edge Route | DHCPv4, routed NAT, stateful filtering, and explicit port forwards |
 

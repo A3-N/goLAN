@@ -128,7 +128,7 @@ func guidedConditionSpecFor(kind guidedConditionKind) guidedConditionSpec {
 func guidedModeOptions() []string {
 	return []string{
 		string(dataplane.ModeListen), string(dataplane.ModeFastBridge), string(dataplane.ModeControlledBridge),
-		string(dataplane.ModeTakeover), string(dataplane.ModeEdgeObserve), string(dataplane.ModeEdgeRoute),
+		string(dataplane.ModeNAT), string(dataplane.ModeEdgeObserve), string(dataplane.ModeEdgeRoute),
 	}
 }
 

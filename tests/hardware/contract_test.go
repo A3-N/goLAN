@@ -73,7 +73,7 @@ func TestLoadConfigValidatesCaseRequirementsAndBounds(t *testing.T) {
 		{name: "duration", set: map[string]string{envCases: string(casePFSyntax), envDuration: "500ms"}, want: envDuration},
 		{name: "packet count", set: map[string]string{envCases: string(casePFSyntax), envMinPackets: "0"}, want: envMinPackets},
 		{name: "boolean", set: map[string]string{envCases: string(casePFSyntax), envExpectVLAN: "sometimes"}, want: envExpectVLAN},
-		{name: "takeover cidr", set: map[string]string{envCases: string(casePFSyntax), envTakeoverIP: "192.0.2.4"}, want: envTakeoverCIDR},
+		{name: "nat cidr", set: map[string]string{envCases: string(casePFSyntax), envNATIP: "192.0.2.4"}, want: envNATCIDR},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -105,8 +105,8 @@ func TestLoadConfigAcceptsCompleteSelection(t *testing.T) {
 		envActiveTimeout:     "2m",
 		envMinPackets:        "25",
 		envAllowDefaultRoute: "true",
-		envTakeoverIP:        "192.0.2.4",
-		envTakeoverCIDR:      "192.0.2.0/24",
+		envNATIP:             "192.0.2.4",
+		envNATCIDR:           "192.0.2.0/24",
 		envPortForwardProto:  "tcp",
 		envPortForwardListen: "18443",
 		envPortForwardTarget: "8443",
