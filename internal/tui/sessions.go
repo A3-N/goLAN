@@ -122,7 +122,10 @@ func (m Model) pendingLocks() []string {
 	return names
 }
 
-const projectCaptureIndexOperation = "project capture indexing"
+const (
+	projectCaptureIndexOperation = "project capture indexing"
+	cleanupOperation             = "cleanup"
+)
 
 func (m *Model) startProjectCaptureIndex(directory string) tea.Cmd {
 	directory = strings.TrimSpace(directory)
@@ -328,6 +331,203 @@ func stopEdgeCmd(session *edge.Session) tea.Cmd {
 		err := session.Stop()
 		return edgeStoppedMsg{session: session, artifactDir: session.Dir, cleanupPending: session.CleanupPending(), err: err}
 	}
+}
+
+func cleanupOwnedStateCmd(
+	listener *listen.Session,
+	listenInterfaces []string,
+	edgeSession *edge.Session,
+	bridgeSession *bridge.Session,
+	states map[string]bridge.InterfaceRestoreState,
+) tea.Cmd {
+	return cleanupOwnedStateCmdWith(
+		listener,
+		listenInterfaces,
+		edgeSession,
+		bridgeSession,
+		states,
+		bridge.SetInterfaceState,
+		bridge.RestoreInterfaceState,
+	)
+}
+
+func cleanupOwnedStateCmdWith(
+	listener *listen.Session,
+	listenInterfaces []string,
+	edgeSession *edge.Session,
+	bridgeSession *bridge.Session,
+	states map[string]bridge.InterfaceRestoreState,
+	setInterfaceState func(string, string) error,
+	restoreInterfaceState func(bridge.InterfaceRestoreState) error,
+) tea.Cmd {
+	interfaces := append([]string(nil), listenInterfaces...)
+	restoreStates := make(map[string]bridge.InterfaceRestoreState, len(states))
+	for name, state := range states {
+		restoreStates[name] = state
+	}
+	return func() tea.Msg {
+		msg := cleanupMsg{
+			listener:         listener,
+			listenInterfaces: interfaces,
+			edge:             edgeSession,
+			bridge:           bridgeSession,
+		}
+		if listener != nil {
+			msg.listenArtifactDir = listener.Dir
+			msg.listenErr = listener.Stop()
+			msg.listenSessionPending = !listener.Stopped()
+		}
+		var restoreErr error
+		msg.listenCleanupPending, restoreErr = lowerInterfaces(interfaces, setInterfaceState)
+		msg.listenErr = errors.Join(msg.listenErr, restoreErr)
+		if edgeSession != nil {
+			msg.edgeArtifactDir = edgeSession.Dir
+			msg.edgeErr = edgeSession.Stop()
+			msg.edgeCleanupPending = edgeSession.CleanupPending()
+		}
+		if bridgeSession != nil {
+			msg.bridgeArtifactDir = bridgeSession.Dir
+			msg.bridgeErr = bridgeSession.Stop()
+			msg.bridgeCleanupPending = bridgeSession.CleanupPending()
+		}
+		if msg.runtimeCleanupPending() {
+			return msg
+		}
+
+		names := make([]string, 0, len(restoreStates))
+		for name := range restoreStates {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			state := restoreStates[name]
+			msg.adapters = append(msg.adapters, cleanupAdapterResult{
+				name: name, state: state, err: restoreInterfaceState(state),
+			})
+		}
+		return msg
+	}
+}
+
+func (msg cleanupMsg) runtimeCleanupPending() bool {
+	return msg.listenSessionPending || len(msg.listenCleanupPending) > 0 || msg.edgeCleanupPending || msg.bridgeCleanupPending
+}
+
+func (msg cleanupMsg) restorationIncomplete() bool {
+	if msg.runtimeCleanupPending() {
+		return true
+	}
+	for _, result := range msg.adapters {
+		if result.err != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) applyCleanup(msg cleanupMsg) tea.Cmd {
+	m.clearRuntimeOperation(cleanupOperation)
+	if msg.listenSessionPending {
+		m.listener = msg.listener
+	} else {
+		m.listener = nil
+		m.capMode = ""
+		m.edgeMode = ""
+	}
+	m.listenInterfaces = append([]string(nil), msg.listenCleanupPending...)
+	m.listenStopPending = false
+	m.updateListenInterfaceStates(msg.listenInterfaces, msg.listenCleanupPending)
+	if msg.edgeCleanupPending {
+		m.edgeSession = msg.edge
+	} else {
+		m.edgeSession = nil
+		m.edgeMode = ""
+	}
+	if msg.bridgeCleanupPending {
+		m.bridge = msg.bridge
+		m.bridgeState = "cleanup-pending"
+	} else {
+		m.bridge = nil
+		m.bridgeState = ""
+		m.bridgeMode = ""
+		m.natActive = false
+	}
+
+	for _, result := range msg.adapters {
+		if result.err != nil {
+			if m.lockFailed == nil {
+				m.lockFailed = make(map[string]bool)
+			}
+			m.lockFailed[result.name] = true
+			m.print(fmt.Sprintf("cleanup warn: restore adapter %s: %v", result.name, result.err))
+			continue
+		}
+		if current, ok := m.restoreState[result.name]; ok && current == result.state {
+			delete(m.restoreState, result.name)
+		}
+		delete(m.lockPending, result.name)
+		delete(m.lockFailed, result.name)
+		delete(m.restorePending, result.name)
+		if result.state.InterfaceStateKnown {
+			m.updateAdapterStatus(result.name, result.state.InterfaceUp)
+		}
+		m.print("cleanup: adapter restored " + result.name)
+	}
+
+	if msg.listenErr != nil {
+		m.print("cleanup warn: listen: " + msg.listenErr.Error())
+	}
+	if msg.edgeErr != nil {
+		m.print("cleanup warn: edge: " + msg.edgeErr.Error())
+	}
+	if msg.bridgeErr != nil {
+		m.print("cleanup warn: bridge: " + msg.bridgeErr.Error())
+	}
+	m.finishNetworkSession()
+
+	if !msg.runtimeCleanupPending() {
+		m.resetStagedNetworking()
+	}
+	if msg.restorationIncomplete() {
+		m.print("cleanup [WARN]: restoration remains pending; run cleanup again")
+	} else {
+		m.lockPending = make(map[string]bool)
+		m.lockFailed = make(map[string]bool)
+		m.restorePending = make(map[string]bool)
+		m.print("cleanup [PASS]: owned runtime state restored; staged networking reset")
+	}
+
+	var cmds []tea.Cmd
+	seenDirs := make(map[string]bool)
+	for _, directory := range []string{msg.listenArtifactDir, msg.edgeArtifactDir, msg.bridgeArtifactDir} {
+		directory = strings.TrimSpace(directory)
+		if directory == "" || seenDirs[directory] {
+			continue
+		}
+		seenDirs[directory] = true
+		if cmd := m.startProjectCaptureIndex(directory); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	if !msg.runtimeCleanupPending() && !m.offline {
+		m.loading = true
+		m.refreshPending = true
+		cmds = append(cmds, discoverAdaptersCmd)
+	}
+	return tea.Batch(cmds...)
+}
+
+func (m *Model) resetStagedNetworking() {
+	m.profile.Reset()
+	m.profileNeedsRehydrate = false
+	m.activeAdapter = ""
+	m.edgeConfiguredMode = string(edge.ModeObserve)
+	m.edgeUpstream = "auto"
+	m.edgeForwards = nil
+	m.bridgeControlledOptions = bridge.DefaultControlledOptions()
+	defaults := bridge.DefaultEAPOLPolicy()
+	m.eapolSuppressLogoff = defaults.SuppressLogoff
+	m.eapolDowngradeMACsec = defaults.DowngradeMACsec
 }
 
 func waitEdgeEventCmd(session *edge.Session) tea.Cmd {

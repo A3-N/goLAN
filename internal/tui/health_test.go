@@ -30,6 +30,7 @@ func TestShowHealthPrintsPayloadFreeSummaryInMainOutput(t *testing.T) {
 	view := strings.Join(m.output, "\n")
 	for _, want := range []string{
 		"health: adapters=0 runtime=bridge controlled",
+		"restoration snapshots=0 isolate-pending=0 restore-pending=0 failed=0",
 		"edge path=en7>en0 subnet=10.77.2.0/24",
 		"dhcp server=10.77.2.1 endpoint=10.77.2.2 gateway=10.77.2.1 replies=0",
 		"pf anchor=com.apple/golan.edge loaded=false enable-token-owned=false",

@@ -200,6 +200,30 @@ type edgeStoppedMsg struct {
 	err            error
 }
 
+type cleanupAdapterResult struct {
+	name  string
+	state bridge.InterfaceRestoreState
+	err   error
+}
+
+type cleanupMsg struct {
+	listener             *listen.Session
+	listenArtifactDir    string
+	listenInterfaces     []string
+	listenCleanupPending []string
+	listenSessionPending bool
+	listenErr            error
+	edge                 *edge.Session
+	edgeArtifactDir      string
+	edgeCleanupPending   bool
+	edgeErr              error
+	bridge               *bridge.Session
+	bridgeArtifactDir    string
+	bridgeCleanupPending bool
+	bridgeErr            error
+	adapters             []cleanupAdapterResult
+}
+
 type projectCapturesIndexedMsg struct {
 	project   *workproject.Project
 	directory string
@@ -530,6 +554,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingNetworkProbe = nil
 		m.printNetworkProbeResult(msg.result)
 		return m, nil
+	case cleanupMsg:
+		return m, m.applyCleanup(msg)
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height

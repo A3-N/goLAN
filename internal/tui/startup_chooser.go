@@ -80,7 +80,8 @@ func (m Model) startupChoices() []startupChoice {
 		{label: "Open Project Directory", description: "Open an existing .golan directory"},
 		{label: "Import Project Bundle", description: "Import a portable .golanproj bundle"},
 		{label: "Start from Config", description: "Snapshot editable config values into a new project"},
-		{label: "Quick Live Session", description: "Choose mode and adapters, then review a staged start command", disabled: m.offline},
+		{label: "Quick Live Session (Manual)", description: "Open the projectless CLI with nothing selected or started"},
+		{label: "Quick Live Session (Guided)", description: "Choose mode and adapters, then review a staged start command", disabled: m.offline},
 	}
 }
 
@@ -229,7 +230,7 @@ func (m *Model) selectStartupMenu() {
 	choices := m.startupChoices()
 	index := clamp(m.startup.cursor, 0, len(choices)-1)
 	if choices[index].disabled {
-		m.startup.err = "Quick Live requires macOS root privileges; project work remains available."
+		m.startup.err = "Guided Quick Live requires macOS root privileges; manual and project work remain available."
 		return
 	}
 	switch index {
@@ -246,6 +247,10 @@ func (m *Model) selectStartupMenu() {
 		m.startup.view = startupConfigs
 		m.startup.cursor = 0
 	case 5:
+		m.closeStartupChooser()
+		m.workspace = workspaceMain
+		m.print("quick live manual: projectless CLI ready; nothing selected or started")
+	case 6:
 		m.startup.view = startupLiveModes
 		m.startup.cursor = 0
 		m.startup.liveMode = ""

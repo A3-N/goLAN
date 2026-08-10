@@ -26,6 +26,11 @@ sudo golan
 Opening a project never starts networking. Live interface, bridge, PF, route,
 and forwarding changes require macOS and root.
 
+At the Workbench chooser, `Quick Live Session (Manual)` opens the projectless
+Main CLI immediately with nothing selected, staged, or started. The separate
+guided Quick Live path asks for a mode and adapters before staging a reviewable
+Start command.
+
 ## Examples
 
 The root README stays focused on the product and interface. Task-focused
@@ -33,6 +38,8 @@ command flows live under [`examples/`](examples/README.md):
 
 | Goal | Guide |
 | --- | --- |
+| Manually test en11 with en0 Wi-Fi upstream | [One device to a Mac](examples/1tomac.md) |
+| Manually test en11-to-en12 inline operation | [One device through a Mac to a switch](examples/2tomac.md) |
 | Observe without forwarding | [Passive listen](examples/passive-listen.md) |
 | Give one host DHCP and routed internet access | [Edge route](examples/edge-route.md) |
 | Forward transparently between a host and switch | [Bridge](examples/bridge.md) |
@@ -188,6 +195,12 @@ Output and do not add workspaces.
 
 Stop and shutdown restore only state owned by the live session. Incomplete
 restoration remains visible and retryable.
+
+Use `cleanup` to stop all live work owned by the current Workbench, retry scoped
+PF and interface restoration, restore every staged adapter to its recorded
+pre-goLAN service and administrative state, and clear the staged live setup
+without quitting. It does not delete saved configurations, policies, projects,
+captures, or observations.
 
 ## Projects and evidence
 

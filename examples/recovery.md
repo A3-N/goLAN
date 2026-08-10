@@ -1,5 +1,19 @@
 # Recovery
 
+Restore live networking owned by the current Workbench session without
+quitting:
+
+```text
+cleanup
+show adapters
+show health
+```
+
+Cleanup stops active goLAN runtimes, retries their scoped restoration, restores
+staged adapters to their recorded pre-goLAN state, and clears staged live
+settings. It preserves saved configs, policy history, project metadata, and
+evidence. A `[WARN]` result remains safe to retry with `cleanup`.
+
 Review interrupted or stale goLAN session directories:
 
 ```text

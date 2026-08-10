@@ -818,6 +818,9 @@ func (m *Model) mutateRule(id, operation string) tea.Cmd {
 }
 
 func (m *Model) commitRules(revision, name string, rules []policy.Rule) error {
+	if m.runtimeOperation != "" {
+		return fmt.Errorf("operation pending: %s", m.runtimeOperation)
+	}
 	if _, err := policy.Compile(revision, rules); err != nil {
 		return err
 	}

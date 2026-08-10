@@ -83,6 +83,11 @@ session-*.json
 .idea/
 .vscode/
 .history/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.golan-packet-venv/
+*.py[cod]
 *.swp
 *.swo
 *~

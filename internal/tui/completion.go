@@ -389,7 +389,7 @@ func (m Model) edgePortForwardListenPorts(protocol string) []string {
 }
 
 func topLevelCommands() []string {
-	return []string{"show", "settings", "set", "unset", "conf", "load", "project", "policy", "canvas", "network", "enable", "disable", "delete", "start", "stop", "send", "clear", "refresh", "doctor", "help", "up", "down", "quit"}
+	return []string{"show", "settings", "set", "unset", "conf", "load", "project", "policy", "canvas", "network", "enable", "disable", "delete", "start", "stop", "send", "cleanup", "clear", "refresh", "doctor", "help", "up", "down", "quit"}
 }
 
 func (m Model) ruleIDs() []string {

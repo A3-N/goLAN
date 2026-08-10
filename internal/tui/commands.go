@@ -48,6 +48,8 @@ func (m *Model) executeCommand(raw string) tea.Cmd {
 		m.outputLiteral = nil
 		m.clearLiveEvidence()
 		m.outputScroll = 0
+	case "cleanup":
+		return m.executeCleanup(fields[1:])
 	case "set":
 		return m.executeSet(fields[1:])
 	case "unset":
@@ -163,6 +165,10 @@ func (m *Model) showHealth() {
 		runtime = "listen " + m.capMode
 	}
 	m.print(fmt.Sprintf("health: adapters=%d runtime=%s operation=%s", len(m.adapters), runtime, emptyHealthValue(m.runtimeOperation)))
+	m.print(fmt.Sprintf(
+		"  restoration snapshots=%d isolate-pending=%d restore-pending=%d failed=%d",
+		len(m.restoreState), len(m.inFlightLocks()), countPendingStates(m.restorePending), countPendingStates(m.lockFailed),
+	))
 	if m.edgeSession != nil {
 		health := m.edgeSession.Health()
 		m.print(fmt.Sprintf("  edge path=%s>%s subnet=%s", health.Downstream, health.Upstream, health.Subnet))
@@ -198,6 +204,16 @@ func countSessions(sessions []workproject.AssociatedSession, recoverable bool) i
 	count := 0
 	for _, session := range sessions {
 		if session.Recoverable == recoverable {
+			count++
+		}
+	}
+	return count
+}
+
+func countPendingStates(states map[string]bool) int {
+	count := 0
+	for _, pending := range states {
+		if pending {
 			count++
 		}
 	}
@@ -568,12 +584,7 @@ func (m Model) adapterMutationBlocker() string {
 }
 
 func anyPending(states map[string]bool) bool {
-	for _, pending := range states {
-		if pending {
-			return true
-		}
-	}
-	return false
+	return countPendingStates(states) > 0
 }
 
 func (m *Model) beginRuntimeOperation(operation string) {
@@ -1058,6 +1069,50 @@ func (m *Model) executeStop(args []string) tea.Cmd {
 		m.print("use: stop listen|bridge|nat|edge")
 		return nil
 	}
+}
+
+func (m *Model) executeCleanup(args []string) tea.Cmd {
+	if len(args) != 0 {
+		m.print("use: cleanup")
+		return nil
+	}
+	if m.runtimeOperation != "" {
+		m.print("cleanup err: operation pending: " + m.runtimeOperation)
+		return nil
+	}
+	if m.refreshPending {
+		m.print("cleanup err: adapter refresh pending")
+		return nil
+	}
+	if m.adapterStatePending != "" {
+		m.print("cleanup err: adapter state pending: " + m.adapterStatePending)
+		return nil
+	}
+	if pending := m.inFlightLocks(); len(pending) > 0 {
+		m.print("cleanup err: adapter isolation pending: " + strings.Join(pending, ","))
+		return nil
+	}
+	if anyPending(m.restorePending) {
+		m.print("cleanup err: adapter restoration is already pending")
+		return nil
+	}
+
+	states := make(map[string]bridge.InterfaceRestoreState, len(m.restoreState))
+	for name, state := range m.restoreState {
+		states[name] = state
+	}
+	if m.listener != nil || len(m.listenInterfaces) > 0 {
+		m.listenStopPending = true
+	}
+	m.beginRuntimeOperation(cleanupOperation)
+	m.print("cleanup: stopping owned runtimes and restoring original adapter state")
+	return m.trackEffect(cleanupOwnedStateCmd(
+		m.listener,
+		m.listenInterfaces,
+		m.edgeSession,
+		m.bridge,
+		states,
+	))
 }
 
 func (m *Model) executeSend(args []string) tea.Cmd {

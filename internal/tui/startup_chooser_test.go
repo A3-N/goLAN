@@ -16,7 +16,7 @@ import (
 
 func TestStartupChooserRendersAllChoicesAndNavigates(t *testing.T) {
 	t.Setenv(paths.EnvConfigDir, t.TempDir())
-	m := NewStartupModelWithSize(100, 30, true)
+	m := NewStartupModelWithSize(140, 30, true)
 	view := m.View()
 	for _, choice := range []string{
 		"New Project",
@@ -24,7 +24,8 @@ func TestStartupChooserRendersAllChoicesAndNavigates(t *testing.T) {
 		"Open Project Directory",
 		"Import Project Bundle",
 		"Start from Config",
-		"Quick Live Session",
+		"Quick Live Session (Manual)",
+		"Quick Live Session (Guided)",
 	} {
 		if !strings.Contains(view, choice) {
 			t.Fatalf("startup view missing %q:\n%s", choice, view)
@@ -151,7 +152,7 @@ func TestStartupChooserQuickLiveNeverStartsSession(t *testing.T) {
 	t.Setenv(paths.EnvConfigDir, t.TempDir())
 	for _, offline := range []bool{true, false} {
 		m := NewStartupModelWithSize(100, 30, offline)
-		for range 5 {
+		for range 6 {
 			m = startupKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
 		}
 		m = startupKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
@@ -167,11 +168,38 @@ func TestStartupChooserQuickLiveNeverStartsSession(t *testing.T) {
 	}
 }
 
+func TestStartupChooserManualQuickLiveOpensBlankCommandMode(t *testing.T) {
+	t.Setenv(paths.EnvConfigDir, t.TempDir())
+	for _, offline := range []bool{true, false} {
+		m := NewStartupModelWithSize(100, 30, offline)
+		m.adapters = []adapters.Adapter{{Name: "en11", HardwarePort: "USB Ethernet"}}
+		for range 5 {
+			m = startupKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+		}
+		m = startupKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+		if m.startup.open || m.workspace != workspaceMain || m.activeCard != cardCLI || m.inputMode != modeCommand {
+			t.Fatalf("manual startup = open:%v workspace:%v card:%v mode:%v", m.startup.open, m.workspace, m.activeCard, m.inputMode)
+		}
+		if m.project != nil || m.input != "" || len(m.profile.Adapters) != 0 || m.activeAdapter != "" || m.profileNeedsRehydrate {
+			t.Fatalf("manual startup staged state: project=%v input=%q profile=%+v active=%q needs=%v", m.project != nil, m.input, m.profile, m.activeAdapter, m.profileNeedsRehydrate)
+		}
+		if len(m.adapters) != 1 || m.adapters[0].Name != "en11" {
+			t.Fatalf("manual startup lost discovered adapters: %+v", m.adapters)
+		}
+		if m.listener != nil || m.bridge != nil || m.edgeSession != nil || m.runtimeOperation != "" || len(m.lockPending) != 0 || len(m.restoreState) != 0 {
+			t.Fatal("manual Quick Live mutated networking state")
+		}
+		if output := strings.Join(m.output, "\n"); !strings.Contains(output, "projectless CLI ready") || !strings.Contains(output, "nothing selected or started") {
+			t.Fatalf("manual startup output = %q", output)
+		}
+	}
+}
+
 func TestQuickLiveWizardStagesControlledBridgeWithoutStartingIt(t *testing.T) {
 	t.Setenv(paths.EnvConfigDir, t.TempDir())
 	m := NewStartupModelWithSize(120, 36, false)
 	m.adapters = []adapters.Adapter{{Name: "en1", HardwarePort: "USB"}, {Name: "en0", HardwarePort: "Ethernet"}}
-	for range 5 {
+	for range 6 {
 		m = startupKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	}
 	m = startupKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
@@ -206,7 +234,7 @@ func TestQuickLiveWizardStagesEdgeAutoUpstreamWithoutStartingIt(t *testing.T) {
 	t.Setenv(paths.EnvConfigDir, t.TempDir())
 	m := NewStartupModelWithSize(120, 36, false)
 	m.adapters = []adapters.Adapter{{Name: "en7"}}
-	for range 5 {
+	for range 6 {
 		m = startupKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	}
 	m = startupKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
@@ -232,7 +260,7 @@ func TestQuickLiveReviewBackRestoresExplicitSecondarySelection(t *testing.T) {
 	t.Setenv(paths.EnvConfigDir, t.TempDir())
 	m := NewStartupModelWithSize(120, 36, false)
 	m.adapters = []adapters.Adapter{{Name: "en2"}, {Name: "en0"}, {Name: "en1"}}
-	for range 5 {
+	for range 6 {
 		m = startupKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	}
 	m = startupKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})

@@ -10,6 +10,7 @@ import (
 	"golan/internal/adapters"
 	bridge "golan/internal/bridge"
 	"golan/internal/configs"
+	"golan/internal/edge"
 	"golan/internal/inspect"
 	"golan/internal/listen"
 	networkobs "golan/internal/network"
@@ -76,6 +77,7 @@ func TestCommandsRejectAmbiguousArity(t *testing.T) {
 		{command: "stop listen extra", want: "use: stop listen|bridge|nat|edge"},
 		{command: "set adapter en11 host extra", want: "use: set adapter <name> <host|switch>"},
 		{command: "unset adapter en11 extra", want: "use: unset adapter <name>"},
+		{command: "cleanup now", want: "use: cleanup"},
 	}
 	for _, test := range tests {
 		m := NewModel()
@@ -213,6 +215,140 @@ func TestEdgeSettingsStageWithoutStartingNetworking(t *testing.T) {
 	m.executeCommand("show edge")
 	if !containsOutput(m.output, "next mode=route upstream=en0") {
 		t.Fatalf("staged route settings are not visible: %v", m.output)
+	}
+}
+
+func TestCleanupResetsStagedNetworkingWithoutDeletingPersistentState(t *testing.T) {
+	m := NewModel()
+	m.offline = true
+	m.profile.Adapters = []profile.AdapterConfig{adaptersToConfig("en11", profile.AdapterRoleHost)}
+	m.profile.Bridge.Config.Label = "staged bridge"
+	m.activeAdapter = "en11"
+	m.edgeConfiguredMode = string(edge.ModeRoute)
+	m.edgeUpstream = "en0"
+	m.edgeForwards = []edgeForwardSetting{{Protocol: "tcp", ListenPort: 8443, TargetPort: 443}}
+	m.bridgeControlledOptions.QueueDepth = 2048
+	m.eapolSuppressLogoff = false
+	m.eapolDowngradeMACsec = false
+	project := m.project
+	policyStore := m.policyStore
+
+	cmd := m.executeCommand("cleanup")
+	if cmd == nil || m.runtimeOperation != "cleanup" {
+		t.Fatalf("cleanup command=%v operation=%q", cmd != nil, m.runtimeOperation)
+	}
+	next, _ := m.Update(cmd())
+	got := next.(Model)
+	defaults := bridge.DefaultEAPOLPolicy()
+	if len(got.profile.Adapters) != 0 || got.profile.Bridge.Config.Label != "" || got.activeAdapter != "" ||
+		got.edgeConfiguredMode != string(edge.ModeObserve) || got.edgeUpstream != "auto" || len(got.edgeForwards) != 0 ||
+		got.bridgeControlledOptions != bridge.DefaultControlledOptions() ||
+		got.eapolSuppressLogoff != defaults.SuppressLogoff || got.eapolDowngradeMACsec != defaults.DowngradeMACsec {
+		t.Fatalf("cleanup retained staged state: profile=%#v edge=%s/%s forwards=%#v bridge=%#v eapol=%t/%t",
+			got.profile, got.edgeConfiguredMode, got.edgeUpstream, got.edgeForwards, got.bridgeControlledOptions,
+			got.eapolSuppressLogoff, got.eapolDowngradeMACsec)
+	}
+	if got.project != project || got.policyStore != policyStore || !containsOutput(got.output, "cleanup [PASS]") {
+		t.Fatalf("persistent state changed or completion missing: project=%p policy=%p output=%v", got.project, got.policyStore, got.output)
+	}
+}
+
+func TestCleanupRestoresAdapterSnapshotsInStableOrder(t *testing.T) {
+	states := map[string]bridge.InterfaceRestoreState{
+		"en12": {IfName: "en12", ServiceStateKnown: true, ServiceEnabled: false, InterfaceStateKnown: true, InterfaceUp: false},
+		"en11": {IfName: "en11", ServiceStateKnown: true, ServiceEnabled: true, InterfaceStateKnown: true, InterfaceUp: true},
+	}
+	var restored []bridge.InterfaceRestoreState
+	cmd := cleanupOwnedStateCmdWith(
+		nil,
+		nil,
+		nil,
+		nil,
+		states,
+		func(string, string) error { return nil },
+		func(state bridge.InterfaceRestoreState) error {
+			restored = append(restored, state)
+			return nil
+		},
+	)
+	msg := cmd().(cleanupMsg)
+	if len(restored) != 2 || restored[0] != states["en11"] || restored[1] != states["en12"] || msg.restorationIncomplete() {
+		t.Fatalf("restored=%#v msg=%#v", restored, msg)
+	}
+}
+
+func TestCleanupRetainsFailedAdapterRestorationForRetry(t *testing.T) {
+	state := bridge.InterfaceRestoreState{IfName: "en11", ServiceStateKnown: true, ServiceEnabled: true, InterfaceStateKnown: true, InterfaceUp: true}
+	m := NewModel()
+	m.offline = true
+	m.profile.Adapters = []profile.AdapterConfig{adaptersToConfig("en11", profile.AdapterRoleHost)}
+	m.restoreState["en11"] = state
+	m.beginRuntimeOperation("cleanup")
+	cmd := cleanupOwnedStateCmdWith(
+		nil,
+		nil,
+		nil,
+		nil,
+		m.restoreState,
+		func(string, string) error { return nil },
+		func(bridge.InterfaceRestoreState) error { return errors.New("adapter busy") },
+	)
+	next, _ := m.Update(cmd())
+	got := next.(Model)
+	if _, ok := got.restoreState["en11"]; !ok || !got.lockFailed["en11"] || len(got.profile.Adapters) != 0 ||
+		!containsOutput(got.output, "cleanup [WARN]") || got.runtimeOperation != "" {
+		t.Fatalf("failed cleanup was not retryable: restore=%#v failed=%#v profile=%#v operation=%q output=%v",
+			got.restoreState, got.lockFailed, got.profile, got.runtimeOperation, got.output)
+	}
+	got.showHealth()
+	if !containsOutput(got.output, "restoration snapshots=1 isolate-pending=0 restore-pending=0 failed=1") {
+		t.Fatalf("health did not expose retry state: %v", got.output)
+	}
+}
+
+func TestCleanupDoesNotRestoreAdaptersBeforeRuntimeCleanupFinishes(t *testing.T) {
+	state := bridge.InterfaceRestoreState{IfName: "en11", InterfaceStateKnown: true, InterfaceUp: true}
+	m := NewModel()
+	m.offline = true
+	m.profile.Adapters = []profile.AdapterConfig{adaptersToConfig("en11", profile.AdapterRoleHost)}
+	m.restoreState["en11"] = state
+	m.beginRuntimeOperation("cleanup")
+	next, _ := m.Update(cleanupMsg{edgeCleanupPending: true})
+	got := next.(Model)
+	if _, ok := got.restoreState["en11"]; !ok || len(got.profile.Adapters) != 1 ||
+		!containsOutput(got.output, "cleanup [WARN]") || got.runtimeOperation != "" {
+		t.Fatalf("pending runtime cleanup exposed adapter restoration: restore=%#v profile=%#v operation=%q output=%v",
+			got.restoreState, got.profile, got.runtimeOperation, got.output)
+	}
+}
+
+func TestCleanupStopsCurrentEdgeSessionBeforeReset(t *testing.T) {
+	m := NewModel()
+	m.offline = true
+	m.edgeSession = &edge.Session{}
+	m.edgeMode = string(edge.ModeRoute)
+	m.edgeConfiguredMode = string(edge.ModeRoute)
+	cmd := m.executeCommand("cleanup")
+	if cmd == nil {
+		t.Fatal("cleanup did not schedule edge teardown")
+	}
+	next, _ := m.Update(cmd())
+	got := next.(Model)
+	if got.edgeSession != nil || got.edgeMode != "" || got.edgeConfiguredMode != string(edge.ModeObserve) ||
+		!containsOutput(got.output, "cleanup [PASS]") {
+		t.Fatalf("edge cleanup did not finish: session=%v active=%q configured=%q output=%v",
+			got.edgeSession, got.edgeMode, got.edgeConfiguredMode, got.output)
+	}
+}
+
+func TestCleanupBlocksRuntimePolicyMutation(t *testing.T) {
+	m := NewModel()
+	m.beginRuntimeOperation(cleanupOperation)
+	if cmd := m.executeCommand("policy use open-internet"); cmd != nil {
+		t.Fatal("policy mutation scheduled work during cleanup")
+	}
+	if _, ok := m.policyStore.Active(); ok || !containsOutput(m.output, "policy err: operation pending: cleanup") {
+		t.Fatalf("policy mutation was not blocked: output=%v", m.output)
 	}
 }
 
