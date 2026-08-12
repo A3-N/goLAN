@@ -1,0 +1,285 @@
+name: Go quality
+
+on:
+  merge_group:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ACTIONLINT_VERSION: v1.7.12
+  APT_PACKAGES: libpcap-dev
+  DEADCODE_VERSION: v0.48.0
+  DUPL_VERSION: v1.1.0
+  GITLEAKS_VERSION: v8.30.1
+  GOIMPORTS_VERSION: v0.48.0
+  GOVULNCHECK_VERSION: v1.6.0
+  STATICCHECK_VERSION: "2026.1"
+
+jobs:
+  hygiene:
+    name: Hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install goimports
+        shell: bash
+        run: go install golang.org/x/tools/cmd/goimports@"${GOIMPORTS_VERSION}"
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "${unformatted}" ]]; then
+            echo "The following files are not formatted with gofmt:"
+            echo "${unformatted}"
+            exit 1
+          fi
+
+      - name: Check imports
+        shell: bash
+        run: |
+          unformatted="$("$(go env GOPATH)/bin/goimports" -l .)"
+          if [[ -n "${unformatted}" ]]; then
+            echo "The following files are not formatted with goimports:"
+            echo "${unformatted}"
+            exit 1
+          fi
+
+      - name: Install actionlint
+        shell: bash
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@"${ACTIONLINT_VERSION}"
+
+      - name: Check GitHub Actions workflows
+        shell: bash
+        run: '"$(go env GOPATH)/bin/actionlint"'
+
+      - name: Install Gitleaks
+        shell: bash
+        run: go install github.com/zricethezav/gitleaks/v8@"${GITLEAKS_VERSION}"
+
+      - name: Scan Git history for secrets
+        shell: bash
+        run: '"$(go env GOPATH)/bin/gitleaks" git --redact=100 --no-banner .'
+
+      - name: Verify downloaded modules
+        run: go mod verify
+
+      - name: Check module metadata
+        run: go mod tidy -diff
+
+  analysis:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install native build dependencies
+        shell: bash
+        run: |
+          read -r -a packages <<< "${APT_PACKAGES}"
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes "${packages[@]}"
+
+      - name: Run Vet
+        run: go vet ./...
+
+      - name: Install Staticcheck
+        shell: bash
+        run: go install honnef.co/go/tools/cmd/staticcheck@"${STATICCHECK_VERSION}"
+
+      - name: Run Staticcheck
+        shell: bash
+        run: '"$(go env GOPATH)/bin/staticcheck" ./...'
+
+      - name: Install dead-code analyzer
+        shell: bash
+        run: go install golang.org/x/tools/cmd/deadcode@"${DEADCODE_VERSION}"
+
+      - name: Check test-aware reachability
+        shell: bash
+        run: '"$(go env GOPATH)/bin/deadcode" -test ./...'
+
+      - name: Install duplicate-code analyzer
+        shell: bash
+        run: go install github.com/mibk/dupl@"${DUPL_VERSION}"
+
+      - name: Check for duplicate implementations
+        shell: bash
+        run: |
+          duplicates="$("$(go env GOPATH)/bin/dupl" -plumbing -t 80 .)"
+          if [[ -n "${duplicates}" ]]; then
+            echo "Duplicate implementations found:"
+            echo "${duplicates}"
+            exit 1
+          fi
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install native build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          read -r -a packages <<< "${APT_PACKAGES}"
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes "${packages[@]}"
+
+      - name: Confirm tests run without root
+        shell: bash
+        run: |
+          if [[ "$(id -u)" -eq 0 ]]; then
+            echo "Routine goLAN tests must run without root privileges."
+            exit 1
+          fi
+
+      - name: Build all packages and commands
+        run: go build -trimpath ./...
+
+      - name: Run tests with race detection
+        run: go test -race -shuffle=on -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Compile opt-in macOS hardware suite without enabling it
+        if: runner.os == 'macOS'
+        run: go test -tags=golan_privileged -run='^TestPrivilegedMacOSHardware$' -count=1 ./tests/hardware
+
+      - name: Upload coverage profile
+        if: runner.os == 'Linux' && !cancelled() && hashFiles('coverage.out') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-coverage
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 7
+
+  fuzz:
+    name: Fuzz protocol parsers
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GOMAXPROCS: "2"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install native build dependencies
+        shell: bash
+        run: |
+          read -r -a packages <<< "${APT_PACKAGES}"
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes "${packages[@]}"
+
+      - name: Fuzz EAPOL frame processing
+        run: go test -run='^$' -fuzz=FuzzRelayPacketProcessing -fuzztime=20s ./internal/eapol
+
+      - name: Fuzz observation inspection
+        run: go test -run='^$' -fuzz=FuzzInspectorPacketAndFlow -fuzztime=20s ./internal/inspect
+
+      - name: Fuzz normalized packet decoding
+        run: go test -run='^$' -fuzz=FuzzNormalize -fuzztime=20s ./internal/traffic
+
+      - name: Fuzz decision journal decoding
+        run: go test -run='^$' -fuzz=FuzzDecisionJournalDecode -fuzztime=20s ./internal/policy
+
+      - name: Fuzz policy compilation
+        run: go test -run='^$' -fuzz=FuzzPolicyCompile -fuzztime=20s ./internal/policy
+
+      - name: Fuzz frame transformation previews
+        run: go test -run='^$' -fuzz=FuzzFrameTransformationPreview -fuzztime=20s ./internal/policy
+
+      - name: Fuzz project manifests
+        run: go test -run='^$' -fuzz=FuzzProjectManifestDecode -fuzztime=20s ./internal/project
+
+  vulnerability:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install native build dependencies
+        shell: bash
+        run: |
+          read -r -a packages <<< "${APT_PACKAGES}"
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes "${packages[@]}"
+
+      - name: Install govulncheck
+        shell: bash
+        run: go install golang.org/x/vuln/cmd/govulncheck@"${GOVULNCHECK_VERSION}"
+
+      - name: Scan reachable dependencies
+        shell: bash
+        run: '"$(go env GOPATH)/bin/govulncheck" ./...'

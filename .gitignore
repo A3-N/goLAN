@@ -3,7 +3,9 @@
 #
 # Build output
 bin/
-
+/golan
+build/
+dist/
 # Binaries for programs and plugins
 *.exe
 *.exe~
@@ -29,7 +31,78 @@ go.work.sum
 
 # env file
 .env
+.env.*
+!.env.example
+.envrc
+.direnv/
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# Runtime sessions, captures, and local telemetry
+.golan-session.json
+.golan-*
+.config/goLAN/
+goLAN-sessions/
+config.json
+recent.json
+/configs/
+/projects/
+/canvases/
+sessions/
+pcaps/
+captures/
+logs/
+*.golan/
+*.golanproj
+*.golanpass
+*.canvas
+*.pcap.*
+*.pcap
+*.pcapng
+*.cap
+*.har
+*.log
+*.log.*
+*.jsonl
+*.ndjson
+session.json
+session-*.json
+*.session.json
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+*.csv
+*.tsv
+*.dump
+*.dmp
+
+# Local secrets and lab credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*.kdbx
+.netrc
+.npmrc
+.pypirc
+
+# macOS, editor, and temporary metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.idea/
+.vscode/
+.history/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.golan-packet-venv/
+*.py[cod]
+*.swp
+*.swo
+*~
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej

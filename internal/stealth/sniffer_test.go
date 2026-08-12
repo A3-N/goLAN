@@ -5,41 +5,39 @@ import (
 	"testing"
 )
 
-func TestCandidateReadyStrongSignals(t *testing.T) {
-	mac, _ := net.ParseMAC("00:11:22:33:44:55")
-	candidates := make(map[string]*targetCandidate)
-
-	candidate, ready := recordCandidate(candidates, mac, []string{"ARP"}, 2)
-	if !ready {
-		t.Fatalf("expected ARP candidate ready")
+func TestOptionalMACValidatesUsableUnicastAddress(t *testing.T) {
+	mac, err := optionalMAC("02:00:00:00:00:11")
+	if err != nil {
+		t.Fatalf("optionalMAC: %v", err)
 	}
-	if candidate.Count != 1 {
-		t.Fatalf("candidate count = %d", candidate.Count)
+	if got := mac.String(); got != "02:00:00:00:00:11" {
+		t.Fatalf("MAC = %s", got)
 	}
-}
-
-func TestCandidateRequiresRepeatedWeakSignals(t *testing.T) {
-	mac, _ := net.ParseMAC("00:11:22:33:44:55")
-	candidates := make(map[string]*targetCandidate)
-
-	if _, ready := recordCandidate(candidates, mac, []string{"IPv6"}, 2); ready {
-		t.Fatalf("single weak signal should not lock")
-	}
-	if _, ready := recordCandidate(candidates, mac, []string{"IPv6"}, 2); !ready {
-		t.Fatalf("repeated weak signal should lock")
+	for _, value := range []string{"bad", "ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"} {
+		if _, err := optionalMAC(value); err == nil {
+			t.Errorf("optionalMAC(%q) succeeded", value)
+		}
 	}
 }
 
-func TestParseIgnoreMACsNormalizes(t *testing.T) {
-	ignored := parseIgnoreMACs([]string{
-		"AA:BB:CC:DD:EE:FF",
-		"invalid",
-	})
-
-	if _, ok := ignored["aa:bb:cc:dd:ee:ff"]; !ok {
-		t.Fatalf("expected normalized MAC in ignore set")
+func TestCopyIdentityDoesNotAliasMutableState(t *testing.T) {
+	original := TargetIdentity{
+		MAC:              net.HardwareAddr{0x02, 0, 0, 0, 0, 0x11},
+		IP:               net.IPv4(192, 0, 2, 10),
+		Netmask:          net.CIDRMask(24, 32),
+		Gateway:          net.IPv4(192, 0, 2, 1),
+		AuthenticatorMAC: net.HardwareAddr{0x02, 0, 0, 0, 0, 0x22},
+		VLANs:            []uint16{100},
 	}
-	if len(ignored) != 1 {
-		t.Fatalf("ignored length = %d", len(ignored))
+	copy := copyIdentity(original)
+	copy.MAC[5] = 0xff
+	copy.IP[0] = 0
+	copy.Netmask[0] = 0
+	copy.Gateway[0] = 0
+	copy.AuthenticatorMAC[5] = 0xff
+	copy.VLANs[0] = 200
+
+	if original.MAC[5] != 0x11 || original.IP.String() != "192.0.2.10" || original.Netmask.String() != "ffffff00" || original.Gateway.String() != "192.0.2.1" || original.AuthenticatorMAC[5] != 0x22 || original.VLANs[0] != 100 {
+		t.Fatalf("copy aliased original: %+v", original)
 	}
 }
