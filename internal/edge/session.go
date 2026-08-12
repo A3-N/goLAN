@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -67,21 +68,27 @@ type Stats struct {
 // It exposes ownership and pressure state without command output, packet
 // content, held-message bytes, or a PF restoration token value.
 type HealthSnapshot struct {
-	Mode               Mode     `json:"mode"`
-	Downstream         string   `json:"downstream"`
-	Upstream           string   `json:"upstream"`
-	Subnet             string   `json:"subnet"`
-	LeaseServer        string   `json:"lease_server"`
-	LeaseClient        string   `json:"lease_client"`
-	LeaseGateway       string   `json:"lease_gateway"`
-	DNS                []string `json:"dns,omitempty"`
-	Stats              Stats    `json:"stats"`
-	PF                 PFState  `json:"pf"`
-	ForwardingSnapshot bool     `json:"forwarding_snapshot"`
-	ForwardingChanged  bool     `json:"forwarding_changed"`
-	AliasAdded         bool     `json:"alias_added"`
-	InterfaceRaised    bool     `json:"interface_raised"`
-	CleanupPending     bool     `json:"cleanup_pending"`
+	Mode               Mode       `json:"mode"`
+	Egress             EgressMode `json:"egress"`
+	Downstream         string     `json:"downstream"`
+	Upstream           string     `json:"upstream"`
+	VPNDestinations    []string   `json:"vpn_destinations,omitempty"`
+	VPNRouteAddress    string     `json:"vpn_route_address,omitempty"`
+	EgressMTU          int        `json:"egress_mtu,omitempty"`
+	Subnet             string     `json:"subnet"`
+	LeaseServer        string     `json:"lease_server"`
+	LeaseClient        string     `json:"lease_client"`
+	LeaseGateway       string     `json:"lease_gateway"`
+	DNS                []string   `json:"dns,omitempty"`
+	DNSUpstreams       []string   `json:"dns_upstreams,omitempty"`
+	DNSRelay           bool       `json:"dns_relay"`
+	Stats              Stats      `json:"stats"`
+	PF                 PFState    `json:"pf"`
+	ForwardingSnapshot bool       `json:"forwarding_snapshot"`
+	ForwardingChanged  bool       `json:"forwarding_changed"`
+	AliasAdded         bool       `json:"alias_added"`
+	InterfaceRaised    bool       `json:"interface_raised"`
+	CleanupPending     bool       `json:"cleanup_pending"`
 }
 
 type counters struct {
@@ -135,6 +142,32 @@ func Start(config Config, revision string, rules []policy.Rule) (*Session, error
 	} else if _, err := CompilePF(config); err != nil {
 		return nil, err
 	}
+	if config.EffectiveEgress() == EgressVPN {
+		if err := validateVPNRoute(config.Upstream, config.VPNRouteAddress, config.EgressMTU); err != nil {
+			return nil, err
+		}
+	}
+	if requiresDNSRelay(config.DNS) {
+		loopbackCount, responding := 0, 0
+		var probeErrs []error
+		for _, address := range config.DNS {
+			if !address.IsLoopback() {
+				continue
+			}
+			loopbackCount++
+			probeCtx, cancelProbe := context.WithTimeout(context.Background(), 2*time.Second)
+			probeErr := ProbeDNSResolver(probeCtx, address)
+			cancelProbe()
+			if probeErr == nil {
+				responding++
+			} else {
+				probeErrs = append(probeErrs, probeErr)
+			}
+		}
+		if loopbackCount == len(config.DNS) && responding == 0 {
+			return nil, fmt.Errorf("Mac-side DNS relay has no responding loopback resolver: %w", errors.Join(probeErrs...))
+		}
+	}
 	engine := policy.NewEngine(8192)
 	if len(rules) > 0 {
 		if err := engine.Policies.Activate(revision, rules); err != nil {
@@ -145,6 +178,7 @@ func Start(config Config, revision string, rules []policy.Rule) (*Session, error
 	if err != nil {
 		return nil, err
 	}
+	lease = relayLeaseDNS(lease, config.DNS)
 	directory, err := paths.PcapRunDir()
 	if err != nil {
 		return nil, err
@@ -225,19 +259,29 @@ func (s *Session) Health() HealthSnapshot {
 		pfState = s.pf.State()
 	}
 	health := HealthSnapshot{
-		Mode:         s.Config.Mode,
-		Downstream:   s.Config.Downstream,
-		Upstream:     s.Config.Upstream,
-		Subnet:       s.Config.Subnet.String(),
-		LeaseServer:  s.Lease.ServerIP.String(),
-		LeaseClient:  s.Lease.ClientIP.String(),
-		LeaseGateway: s.Lease.Gateway.String(),
-		Stats:        s.Stats(),
-		PF:           pfState,
+		Mode:            s.Config.Mode,
+		Egress:          s.Config.EffectiveEgress(),
+		Downstream:      s.Config.Downstream,
+		Upstream:        s.Config.Upstream,
+		VPNRouteAddress: validAddrString(s.Config.VPNRouteAddress),
+		EgressMTU:       s.Config.EgressMTU,
+		Subnet:          s.Config.Subnet.String(),
+		LeaseServer:     s.Lease.ServerIP.String(),
+		LeaseClient:     s.Lease.ClientIP.String(),
+		LeaseGateway:    s.Lease.Gateway.String(),
+		Stats:           s.Stats(),
+		PF:              pfState,
+	}
+	for _, destination := range s.Config.VPNDestinations {
+		health.VPNDestinations = append(health.VPNDestinations, destination.Masked().String())
 	}
 	health.DNS = make([]string, 0, len(s.Lease.DNS))
 	for _, address := range s.Lease.DNS {
 		health.DNS = append(health.DNS, address.String())
+	}
+	health.DNSRelay = requiresDNSRelay(s.Config.DNS)
+	for _, address := range s.Config.DNS {
+		health.DNSUpstreams = append(health.DNSUpstreams, address.String())
 	}
 
 	s.mu.Lock()
@@ -308,45 +352,75 @@ func (s *Session) run(ctx context.Context) {
 		s.send(Event{Kind: KindError, Err: runErr})
 		return
 	}
-	if err := s.prepare(ctx); err != nil {
-		runErr = err
-		s.send(Event{Kind: KindError, Err: err})
-		return
+	if s.Config.EffectiveEgress() == EgressVPN {
+		if err := validateVPNRoute(s.Config.Upstream, s.Config.VPNRouteAddress, s.Config.EgressMTU); err != nil {
+			runErr = err
+			s.send(Event{Kind: KindError, Err: err})
+			return
+		}
 	}
+	// Arm both BPF readers while the isolated downstream interface is still
+	// down. macOS clients commonly transmit DHCP immediately on link-up; opening
+	// capture only after prepare raised the interface could miss that first
+	// DISCOVER and leave the client waiting for its retransmission backoff.
 	ingress, err := openDirectionalHandle(s.Config.Downstream, pcap.DirectionIn)
 	if err != nil {
 		runErr = err
 		s.send(Event{Kind: KindError, Err: err})
 		return
 	}
+	defer ingress.close()
 	outbound, err := openDirectionalHandle(s.Config.Downstream, pcap.DirectionOut)
 	if err != nil {
-		ingress.close()
 		runErr = err
 		s.send(Event{Kind: KindError, Err: err})
 		return
 	}
+	defer outbound.close()
 	record, err := openRecorder(s.Dir, ingress.LinkType())
 	if err != nil {
-		ingress.close()
-		outbound.close()
 		runErr = err
 		s.send(Event{Kind: KindError, Err: err})
 		return
 	}
 	defer func() {
-		ingress.close()
-		outbound.close()
 		runErr = errors.Join(runErr, record.Close())
 	}()
+	if err := s.prepare(ctx); err != nil {
+		runErr = err
+		s.send(Event{Kind: KindError, Err: err})
+		return
+	}
+	var relay *dnsRelay
+	if requiresDNSRelay(s.Config.DNS) {
+		relay, err = startDNSRelay(s.Lease.ServerIP, s.Config.DNS)
+		if err != nil {
+			runErr = err
+			s.send(Event{Kind: KindError, Err: err})
+			return
+		}
+		defer relay.Close()
+	}
 	s.send(Event{Kind: KindPcap, Path: filepath.Join(s.Dir, "original.pcap"), Message: "original"})
 	s.send(Event{Kind: KindPcap, Path: filepath.Join(s.Dir, "forwarded.pcap"), Message: "forwarded"})
 	s.send(Event{Kind: KindState, State: "active", Message: "edge route active"})
 
-	const componentCount = 2
+	componentCount := 2
+	if s.Config.EffectiveEgress() == EgressVPN {
+		componentCount++
+	}
+	if relay != nil {
+		componentCount++
+	}
 	errCh := make(chan error, componentCount)
 	go func() { errCh <- s.captureOriginal(ctx, ingress, record, serverMAC) }()
 	go func() { errCh <- s.captureForwarded(ctx, outbound, record) }()
+	if s.Config.EffectiveEgress() == EgressVPN {
+		go func() { errCh <- s.monitorVPNEgress(ctx) }()
+	}
+	if relay != nil {
+		go func() { errCh <- relay.Run(ctx) }()
+	}
 	go func() {
 		<-ctx.Done()
 		ingress.close()
@@ -364,10 +438,64 @@ func (s *Session) run(ctx context.Context) {
 	}
 }
 
-func openDirectionalHandle(name string, direction pcap.Direction) (*liveHandle, error) {
-	handle, err := pcap.OpenLive(name, 65535, true, pcap.BlockForever)
+func (s *Session) monitorVPNEgress(ctx context.Context) error {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := validateVPNRoute(s.Config.Upstream, s.Config.VPNRouteAddress, s.Config.EgressMTU); err != nil {
+				return fmt.Errorf("VPN egress lost; client routing stopped fail-closed: %w", err)
+			}
+		}
+	}
+}
+
+func validateVPNRoute(interfaceName string, expected netip.Addr, expectedMTU int) error {
+	current, err := VPNRouteAddress(interfaceName)
 	if err != nil {
-		return nil, fmt.Errorf("open edge capture on %s: %w", name, err)
+		return err
+	}
+	if current != expected {
+		return fmt.Errorf("VPN tunnel interface %s IPv4 route address changed from %s to %s", interfaceName, expected, current)
+	}
+	if expectedMTU > 0 {
+		currentMTU, mtuErr := InterfaceMTU(interfaceName)
+		if mtuErr != nil {
+			return mtuErr
+		}
+		if currentMTU != expectedMTU {
+			return fmt.Errorf("VPN tunnel interface %s MTU changed from %d to %d", interfaceName, expectedMTU, currentMTU)
+		}
+	}
+	return nil
+}
+
+func openDirectionalHandle(name string, direction pcap.Direction) (*liveHandle, error) {
+	inactive, err := pcap.NewInactiveHandle(name)
+	if err != nil {
+		return nil, fmt.Errorf("create edge capture on %s: %w", name, err)
+	}
+	defer inactive.CleanUp()
+	if err := inactive.SetSnapLen(65535); err != nil {
+		return nil, fmt.Errorf("set edge capture length on %s: %w", name, err)
+	}
+	if err := inactive.SetPromisc(true); err != nil {
+		return nil, fmt.Errorf("set edge capture promiscuous mode on %s: %w", name, err)
+	}
+	if err := inactive.SetTimeout(pcap.BlockForever); err != nil {
+		return nil, fmt.Errorf("set edge capture timeout on %s: %w", name, err)
+	}
+	// Immediate mode is important on macOS BPF: without it, libpcap can batch a
+	// lone DHCP DISCOVER until the read timeout instead of returning it at once.
+	if err := inactive.SetImmediateMode(true); err != nil {
+		return nil, fmt.Errorf("enable immediate edge capture on %s: %w", name, err)
+	}
+	handle, err := inactive.Activate()
+	if err != nil {
+		return nil, fmt.Errorf("activate edge capture on %s: %w", name, err)
 	}
 	if err := handle.SetDirection(direction); err != nil {
 		handle.Close()
@@ -482,6 +610,20 @@ func (s *Session) captureOriginal(ctx context.Context, handle *liveHandle, recor
 			}
 			return fmt.Errorf("read edge ingress: %w", err)
 		}
+		// DHCP is Edge control-plane traffic and PF explicitly permits it before
+		// staged data-plane policy. Reply before capture I/O, normalization,
+		// policy diagnostics, and UI event delivery so address acquisition never
+		// waits behind evidence processing.
+		reply, isDHCP, err := BuildDHCPReply(data, serverMAC, s.Lease)
+		if err != nil {
+			return err
+		}
+		if isDHCP {
+			if err := handle.WritePacketData(reply); err != nil {
+				return fmt.Errorf("inject DHCP reply: %w", err)
+			}
+			s.stats.dhcp.Add(1)
+		}
 		s.stats.original.Add(1)
 		originalOrdinal, err := record.WriteOriginal(info, data)
 		if err != nil {
@@ -508,16 +650,6 @@ func (s *Session) captureOriginal(ctx context.Context, handle *liveHandle, recor
 		if result.Decision.EffectiveVerdict == policy.VerdictBlock {
 			s.stats.blocked.Add(1)
 			continue
-		}
-		reply, ok, err := BuildDHCPReply(data, serverMAC, s.Lease)
-		if err != nil {
-			return err
-		}
-		if ok {
-			if err := handle.WritePacketData(reply); err != nil {
-				return fmt.Errorf("inject DHCP reply: %w", err)
-			}
-			s.stats.dhcp.Add(1)
 		}
 	}
 }
@@ -618,23 +750,32 @@ func (s *Session) cleanup() error {
 
 func (s *Session) writeManifest(started, stopped time.Time, sessionErr error) error {
 	manifest := struct {
-		Version      int       `json:"version"`
-		Mode         Mode      `json:"mode"`
-		StartedAt    time.Time `json:"started_at"`
-		StoppedAt    time.Time `json:"stopped_at"`
-		Downstream   string    `json:"downstream"`
-		Upstream     string    `json:"upstream"`
-		Subnet       string    `json:"subnet"`
-		Server       string    `json:"server"`
-		Client       string    `json:"client"`
-		Capabilities []string  `json:"capabilities"`
-		Stats        Stats     `json:"stats"`
-		Error        string    `json:"error,omitempty"`
+		Version         int        `json:"version"`
+		Mode            Mode       `json:"mode"`
+		Egress          EgressMode `json:"egress"`
+		StartedAt       time.Time  `json:"started_at"`
+		StoppedAt       time.Time  `json:"stopped_at"`
+		Downstream      string     `json:"downstream"`
+		Upstream        string     `json:"upstream"`
+		VPNDestinations []string   `json:"vpn_destinations,omitempty"`
+		VPNRouteAddress string     `json:"vpn_route_address,omitempty"`
+		EgressMTU       int        `json:"egress_mtu,omitempty"`
+		Subnet          string     `json:"subnet"`
+		Server          string     `json:"server"`
+		Client          string     `json:"client"`
+		Capabilities    []string   `json:"capabilities"`
+		Stats           Stats      `json:"stats"`
+		Error           string     `json:"error,omitempty"`
 	}{
-		Version: 1, Mode: s.Config.Mode, StartedAt: started, StoppedAt: stopped,
+		Version: 1, Mode: s.Config.Mode, Egress: s.Config.EffectiveEgress(), StartedAt: started, StoppedAt: stopped,
 		Downstream: s.Config.Downstream, Upstream: s.Config.Upstream,
-		Subnet: s.Config.Subnet.String(), Server: s.Lease.ServerIP.String(), Client: s.Lease.ClientIP.String(),
+		VPNRouteAddress: validAddrString(s.Config.VPNRouteAddress),
+		EgressMTU:       s.Config.EgressMTU,
+		Subnet:          s.Config.Subnet.String(), Server: s.Lease.ServerIP.String(), Client: s.Lease.ClientIP.String(),
 		Capabilities: dataplane.ForMode(dataplane.ModeEdgeRoute).Summary(), Stats: s.Stats(),
+	}
+	for _, destination := range s.Config.VPNDestinations {
+		manifest.VPNDestinations = append(manifest.VPNDestinations, destination.Masked().String())
 	}
 	if sessionErr != nil {
 		manifest.Error = edgeSessionErrorMarker(sessionErr)
@@ -649,6 +790,13 @@ func (s *Session) writeManifest(started, stopped time.Time, sessionErr error) er
 		return err
 	}
 	return os.Rename(temporary, path)
+}
+
+func validAddrString(address netip.Addr) string {
+	if address.IsValid() {
+		return address.String()
+	}
+	return ""
 }
 
 func edgeSessionErrorMarker(err error) string {

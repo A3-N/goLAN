@@ -10,11 +10,13 @@ block drop in quick on bridge7 inet all
 [edge-route]
 nat on en0 inet from 10.77.2.0/24 to any -> (en0)
 rdr pass on en0 inet proto tcp from any to (en0) port 8443 -> 10.77.2.2 port 443
-block drop quick inet6 all
-pass in quick on en7 inet proto udp from any port 68 to 255.255.255.255 port 67
+block drop quick on en7 inet6 all
+pass in quick on en7 inet proto udp from any port 68 to { 255.255.255.255, 10.77.2.1 } port 67
 pass out quick on en7 inet proto udp from 10.77.2.1 port 67 to any port 68
-block drop in quick on en0 inet proto tcp from any to any port 22
+block in quick on en7 inet from ! 10.77.2.0/24 to any
+block in quick on en7 inet from 10.77.2.0/24 to self
+block drop in quick on en0 inet proto tcp from any to 10.77.2.0/24 port 22
 pass in quick on en7 inet from 10.77.2.0/24 to any keep state
 pass out quick on en0 inet from 10.77.2.0/24 to any keep state
 pass out quick on en7 inet from any to 10.77.2.0/24 keep state
-block in quick on en0 inet all
+block in quick on en0 inet from any to 10.77.2.0/24

@@ -107,6 +107,35 @@ func TestRuntimeSettingsRoundTripDefaultsAndValidation(t *testing.T) {
 	if _, err := Decode([]byte(`{"version":2,"profile":{},"settings":{"runtime":{"edge_mode":"route","edge_upstream":"auto","edge_proxy_hold_timeout":"5s","controlled_queue_depth":1024,"controlled_overload":"fail-open"}}}`)); err == nil || !strings.Contains(err.Error(), "unknown field") {
 		t.Fatalf("retired proxy setting error=%v", err)
 	}
+
+	vpn := runtime
+	vpn.EdgeEgress = "vpn"
+	vpn.EdgeUpstream = "utun4"
+	vpn.EdgeVPNDestinations = []string{"10.20.0.0/16"}
+	vpn.EdgeDNS = []string{"10.20.0.53"}
+	settings.Runtime = &vpn
+	if _, err := Save("vpn-runtime", Snapshot{Settings: &settings}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _, err = Load("vpn-runtime")
+	if err != nil || loaded.Settings == nil || !reflect.DeepEqual(loaded.Settings.Runtime, &vpn) {
+		t.Fatalf("VPN runtime round trip=%#v err=%v", loaded.Settings, err)
+	}
+	vpn.EdgeDNS = []string{"192.0.2.53"}
+	settings.Runtime = &vpn
+	if _, err := Save("vpn-bad-dns", Snapshot{Settings: &settings}); err == nil || !strings.Contains(err.Error(), "outside") {
+		t.Fatalf("VPN runtime accepted out-of-scope DNS: %v", err)
+	}
+	vpn.EdgeDNS = []string{"127.0.0.1"}
+	settings.Runtime = &vpn
+	if _, err := Save("vpn-loopback-dns", Snapshot{Settings: &settings}); err != nil {
+		t.Fatalf("VPN runtime rejected Mac-side loopback DNS relay: %v", err)
+	}
+	vpn.EdgeDNS = nil
+	settings.Runtime = &vpn
+	if _, err := Save("vpn-automatic-dns", Snapshot{Settings: &settings}); err != nil {
+		t.Fatalf("VPN runtime rejected automatic macOS DNS discovery: %v", err)
+	}
 }
 
 func pointerRuntime(value RuntimeSettings) *RuntimeSettings {
@@ -122,7 +151,7 @@ func TestLoadRejectsUnknownVersionAndFields(t *testing.T) {
 	}
 
 	tests := map[string]string{
-		"future.json":  `{"version":3,"profile":{}}`,
+		"future.json":  `{"version":4,"profile":{}}`,
 		"unknown.json": `{"version":1,"profile":{},"surprise":true}`,
 		"trailing.json": `{"version":1,"profile":{}}
 {"version":1,"profile":{}}`,

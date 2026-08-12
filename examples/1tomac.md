@@ -231,7 +231,9 @@ show health
 
 Expected: goLAN selects a conflict-free `10.77.x.0/24`, owns `.1` as gateway,
 and leases `.2` to the single client. `show health` identifies `en11` as
-downstream and `en0` as upstream. On the client, verify in this order:
+downstream and `en0` as upstream. The routing rules match the client subnet,
+not host-originated traffic, so the Mac should retain its own Wi-Fi internet
+connection throughout the run. On the client, verify in this order:
 
 1. its lease, mask, gateway, and DNS are present;
 2. it can reach the reported `.1` gateway;
@@ -270,6 +272,34 @@ policy use open-internet
 ```
 
 Press `F2` again before continuing in Main.
+
+### Client-only VPN egress
+
+For a separate run, connect the Mac's VPN first and replace `utun4`, the
+destination, and DNS server below with values from that VPN:
+
+```text
+stop edge
+cleanup
+set adapter en11 host
+set edge egress vpn utun4
+set edge vpn-destination 10.20.0.0/16
+set edge dns 10.20.0.53
+policy use open-internet
+doctor
+start edge route
+```
+
+The client can reach only the staged VPN destinations, through the tunnel;
+the Mac keeps following its own existing routes. The `all` VPN destination
+routes all client IPv4 traffic through the VPN. If the tunnel disappears,
+goLAN stops Edge fail-closed instead of letting the client fall back to Wi-Fi.
+The VPN must expose an up IPv4 point-to-point interface and permit forwarded,
+NATed traffic. See the [Edge route guide](edge-route.md) for the full behavior.
+If `scutil --dns` reports a resolver such as `127.0.0.1`, stage that address:
+goLAN advertises its downstream `.1` gateway and relays UDP/TCP DNS on the Mac
+instead of incorrectly giving the client a loopback address. Use
+`set edge dns clear` for automatic scoped-resolver discovery.
 
 ### Inbound port-forward test
 

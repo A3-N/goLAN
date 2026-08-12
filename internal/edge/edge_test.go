@@ -385,6 +385,9 @@ func TestSelectSubnetAndLease(t *testing.T) {
 	if lease.ServerIP.String() != "10.77.2.1" || lease.ClientIP.String() != "10.77.2.2" {
 		t.Fatalf("lease = %#v", lease)
 	}
+	if len(lease.DNS) != 0 {
+		t.Fatalf("empty DNS input advertised a nonexistent resolver: %v", lease.DNS)
+	}
 }
 
 func testProjectFrameForEdgeRecorder() []byte {
@@ -415,6 +418,52 @@ func TestSystemDNSFiltersIPv6AndDuplicates(t *testing.T) {
 	}
 }
 
+func TestMacOSDNSDiscoverySeparatesDefaultAndScopedVPNResolvers(t *testing.T) {
+	output := `DNS configuration
+
+resolver #1
+  search domain[0] : lan
+  nameserver[0] : 192.0.2.53
+  flags    : Request A records
+  order    : 200000
+
+resolver #2
+  domain   : corp.example
+  nameserver[0] : 127.0.0.1
+  if_index : 18 (utun4)
+  flags    : Scoped, Request A records
+  order    : 101400
+
+DNS configuration (for scoped queries)
+
+resolver #1
+  nameserver[0] : 127.0.0.1
+  if_index : 18 (utun4)
+  flags    : Scoped
+`
+	runner := &edgeLifecycleRunner{outputs: map[string]string{"scutil --dns": output}}
+	defaultDNS, err := discoverMacOSDNS(context.Background(), runner, "")
+	if err != nil || len(defaultDNS) != 1 || defaultDNS[0].String() != "192.0.2.53" {
+		t.Fatalf("default DNS=%v error=%v", defaultDNS, err)
+	}
+	vpnDNS, err := discoverMacOSDNS(context.Background(), runner, "utun4")
+	if err != nil || len(vpnDNS) != 1 || vpnDNS[0].String() != "127.0.0.1" {
+		t.Fatalf("VPN DNS=%v error=%v", vpnDNS, err)
+	}
+	if _, err := discoverMacOSDNS(context.Background(), runner, "utun9"); err == nil || !strings.Contains(err.Error(), "set edge dns explicitly") {
+		t.Fatalf("missing scoped resolver error=%v", err)
+	}
+}
+
+func TestParsePointToPointPeerUsesDestinationAddress(t *testing.T) {
+	peer, ok := parsePointToPointPeer(`utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
+	inet 10.8.0.2 --> 10.8.0.1 netmask 0xffffffff
+`)
+	if !ok || peer.String() != "10.8.0.1" {
+		t.Fatalf("peer=%s ok=%t", peer, ok)
+	}
+}
+
 func TestCompilePFUsesDedicatedAnchorSemantics(t *testing.T) {
 	config := Config{
 		Mode: ModeRoute, Downstream: "en7", Upstream: "en0",
@@ -425,16 +474,151 @@ func TestCompilePFUsesDedicatedAnchorSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"nat on en0", "block drop quick inet6 all", "port 8443 -> 10.77.2.2 port 443"} {
+	for _, want := range []string{
+		"nat on en0",
+		"block drop quick on en7 inet6 all",
+		"block in quick on en0 inet from any to 10.77.2.0/24",
+		"port 8443 -> 10.77.2.2 port 443",
+	} {
 		if !strings.Contains(rules, want) {
 			t.Fatalf("rules missing %q:\n%s", want, rules)
 		}
 	}
-	if strings.Index(rules, "block drop quick inet6") < strings.Index(rules, "nat on") {
+	if strings.Index(rules, "block drop quick on en7 inet6") < strings.Index(rules, "nat on") {
 		t.Fatalf("filter rules precede translation rules:\n%s", rules)
+	}
+	for _, reject := range []string{"block drop quick inet6 all", "block in quick on en0 inet all"} {
+		if strings.Contains(rules, reject) {
+			t.Fatalf("rules contain host-wide block %q:\n%s", reject, rules)
+		}
 	}
 	if strings.Contains(rules, "/etc/pf.conf") || strings.Contains(rules, "-F all") {
 		t.Fatalf("rules contain global mutation: %s", rules)
+	}
+}
+
+func TestCompilePFVPNForcesTunnelAndFailsClosed(t *testing.T) {
+	config := Config{
+		Mode:            ModeRoute,
+		Downstream:      "en7",
+		Upstream:        "utun4",
+		Egress:          EgressVPN,
+		VPNDestinations: []netip.Prefix{netip.MustParsePrefix("10.20.0.0/16"), netip.MustParsePrefix("192.0.2.53/32")},
+		VPNRouteAddress: netip.MustParseAddr("10.8.0.2"),
+		Subnet:          netip.MustParsePrefix("10.77.2.0/24"),
+		DNS:             []netip.Addr{netip.MustParseAddr("10.20.0.53")},
+	}
+	openInternet, err := policy.Preset("open-internet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules, err := CompilePFWithPolicy(config, "vpn-pf", openInternet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"table <golan_edge_vpn_destinations> const { 10.20.0.0/16, 192.0.2.53/32 }",
+		"nat on utun4 inet from 10.77.2.0/24 to <golan_edge_vpn_destinations> -> (utun4)",
+		"block in quick on en7 inet from ! 10.77.2.0/24 to any",
+		"block in quick on en7 inet from 10.77.2.0/24 to ! <golan_edge_vpn_destinations>",
+		"pass in quick on en7 route-to (utun4 10.8.0.2) inet from any to any keep state",
+		"pass in quick on en7 route-to (utun4 10.8.0.2) inet from 10.77.2.0/24 to <golan_edge_vpn_destinations> keep state",
+		"block out quick inet from 10.77.2.0/24 to any",
+	} {
+		if !strings.Contains(rules, want) {
+			t.Fatalf("VPN rules missing %q:\n%s", want, rules)
+		}
+	}
+	if strings.Index(rules, "block in quick on en7 inet from 10.77.2.0/24 to ! <golan_edge_vpn_destinations>") > strings.Index(rules, "pass in quick on en7 route-to") {
+		t.Fatalf("destination guard must precede VPN allow:\n%s", rules)
+	}
+	for _, invalid := range []string{"to ! {", "route-to (utun4)"} {
+		if strings.Contains(rules, invalid) {
+			t.Fatalf("VPN rules retained macOS-incompatible syntax %q:\n%s", invalid, rules)
+		}
+	}
+}
+
+func TestCompilePFRelaysLoopbackDNSAndProtectsMacServices(t *testing.T) {
+	config := Config{
+		Mode: ModeRoute, Downstream: "en7", Upstream: "utun4", Egress: EgressVPN,
+		VPNDestinations: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
+		VPNRouteAddress: netip.MustParseAddr("10.8.0.1"),
+		EgressMTU:       1280,
+		Subnet:          netip.MustParsePrefix("10.77.2.0/24"),
+		DNS:             []netip.Addr{netip.MustParseAddr("127.0.0.1")},
+	}
+	rules, err := CompilePF(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"scrub in on en7 inet proto tcp max-mss 1240",
+		"pass in quick on en7 inet proto { tcp, udp } from 10.77.2.0/24 to 10.77.2.1 port 53 keep state",
+		"block in quick on en7 inet from 10.77.2.0/24 to self",
+		"route-to (utun4 10.8.0.1)",
+	} {
+		if !strings.Contains(rules, want) {
+			t.Fatalf("loopback DNS rules missing %q:\n%s", want, rules)
+		}
+	}
+	if strings.Contains(rules, "127.0.0.1") {
+		t.Fatalf("loopback DNS leaked into PF routing rules:\n%s", rules)
+	}
+}
+
+func TestCompilePFVPNAllDoesNotCreateZeroPrefixTable(t *testing.T) {
+	config := Config{
+		Mode: ModeRoute, Downstream: "en7", Upstream: "utun4", Egress: EgressVPN,
+		VPNDestinations: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")},
+		VPNRouteAddress: netip.MustParseAddr("10.8.0.2"),
+		Subnet:          netip.MustParsePrefix("10.77.2.0/24"),
+		DNS:             []netip.Addr{netip.MustParseAddr("10.20.0.53")},
+	}
+	rules, err := CompilePF(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rules, pfVPNDestinationTable) || !strings.Contains(rules, "nat on utun4 inet from 10.77.2.0/24 to any -> (utun4)") ||
+		!strings.Contains(rules, "route-to (utun4 10.8.0.2) inet from 10.77.2.0/24 to any") {
+		t.Fatalf("full-tunnel VPN rules are invalid:\n%s", rules)
+	}
+}
+
+func TestValidateConfigRejectsUnsafeVPNSettings(t *testing.T) {
+	base := Config{
+		Mode:            ModeRoute,
+		Downstream:      "en7",
+		Upstream:        "utun4",
+		Egress:          EgressVPN,
+		VPNDestinations: []netip.Prefix{netip.MustParsePrefix("10.20.0.0/16")},
+		VPNRouteAddress: netip.MustParseAddr("10.8.0.2"),
+		Subnet:          netip.MustParsePrefix("10.77.2.0/24"),
+		DNS:             []netip.Addr{netip.MustParseAddr("10.20.0.53")},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{name: "missing destination", mutate: func(config *Config) { config.VPNDestinations = nil }, want: "at least one destination"},
+		{name: "missing route address", mutate: func(config *Config) { config.VPNRouteAddress = netip.Addr{} }, want: "route address"},
+		{name: "missing DNS", mutate: func(config *Config) { config.DNS = nil }, want: "at least one IPv4 DNS"},
+		{name: "DNS outside destinations", mutate: func(config *Config) { config.DNS = []netip.Addr{netip.MustParseAddr("192.0.2.53")} }, want: "outside the permitted VPN destinations"},
+		{name: "all mixed with prefix", mutate: func(config *Config) {
+			config.VPNDestinations = append(config.VPNDestinations, netip.MustParsePrefix("0.0.0.0/0"))
+		}, want: "cannot be combined"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := base
+			config.VPNDestinations = append([]netip.Prefix(nil), base.VPNDestinations...)
+			config.DNS = append([]netip.Addr(nil), base.DNS...)
+			test.mutate(&config)
+			if err := ValidateConfig(config); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ValidateConfig() error = %v, want containing %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -465,6 +649,30 @@ func TestCompilePFWithPolicyPreservesFirstMatchAndShadowsIncompatibleRules(t *te
 	}
 	if strings.Index(compiled, line) > strings.Index(compiled, "pass in quick on en7 inet from 10.77.2.0/24") {
 		t.Fatalf("policy did not precede default allow:\n%s", compiled)
+	}
+}
+
+func TestCompilePFScopesInboundPolicyAwayFromMac(t *testing.T) {
+	config := Config{Mode: ModeRoute, Downstream: "en7", Upstream: "en0", Subnet: netip.MustParsePrefix("10.77.2.0/24")}
+	rules := []policy.Rule{{
+		ID: "inbound-admin", Priority: 100, Enabled: true,
+		Match: policy.Match{
+			Directions: []traffic.Direction{traffic.DirectionInbound},
+			Protocols:  []uint8{6},
+			DstPorts:   policy.PortSet{Values: []uint16{22}},
+		},
+		Actions: []policy.Action{{Kind: policy.ActionBlock}},
+	}}
+	compiled, err := CompilePFWithPolicy(config, "edge-1", rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "block drop in quick on en0 inet proto tcp from any to 10.77.2.0/24 port 22"
+	if !strings.Contains(compiled, want) {
+		t.Fatalf("inbound policy missing scoped rule %q:\n%s", want, compiled)
+	}
+	if strings.Contains(compiled, "block drop in quick on en0 inet proto tcp from any to any port 22") {
+		t.Fatalf("inbound Edge policy can affect the Mac:\n%s", compiled)
 	}
 }
 

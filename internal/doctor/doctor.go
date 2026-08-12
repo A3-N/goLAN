@@ -68,6 +68,17 @@ type Input struct {
 	ProjectDirty            bool
 	ProjectCaptures         int
 	Restoration             Restoration
+	Edge                    EdgePlan
+}
+
+// EdgePlan is the staged, non-secret Edge route selection inspected by doctor.
+type EdgePlan struct {
+	Mode            string
+	Egress          string
+	Downstream      string
+	Upstream        string
+	VPNDestinations []string
+	DNS             []string
 }
 
 // Probes contains the read-only system boundaries used by Run. Tests can
@@ -81,6 +92,11 @@ type Probes struct {
 	SelectSubnet         func([]netip.Prefix) (netip.Prefix, error)
 	LookPath             func(string) (string, error)
 	PFInfo               func(context.Context, string) error
+	PFValidate           func(context.Context, string, string) error
+	VPNRouteAddress      func(string) (netip.Addr, error)
+	DiscoverMacOSDNS     func(context.Context, string) ([]netip.Addr, error)
+	InterfaceMTU         func(string) (int, error)
+	ProbeDNSResolver     func(context.Context, netip.Addr) error
 }
 
 // DefaultProbes returns the production read-only probe set.
@@ -94,6 +110,11 @@ func DefaultProbes() Probes {
 		SelectSubnet:         edge.SelectSubnet,
 		LookPath:             exec.LookPath,
 		PFInfo:               probePFInfo,
+		PFValidate:           probePFSyntax,
+		VPNRouteAddress:      edge.VPNRouteAddress,
+		DiscoverMacOSDNS:     edge.DiscoverMacOSDNS,
+		InterfaceMTU:         edge.InterfaceMTU,
+		ProbeDNSResolver:     edge.ProbeDNSResolver,
 	}
 }
 
@@ -215,13 +236,17 @@ func Run(ctx context.Context, input Input, probes Probes) Report {
 		}
 
 		prefixes, err := probes.OccupiedIPv4Prefixes()
+		var edgeSubnet netip.Prefix
 		if err == nil {
-			_, err = probes.SelectSubnet(prefixes)
+			edgeSubnet, err = probes.SelectSubnet(prefixes)
 		}
 		if err != nil {
 			add("DHCP", "edge plan", StatusFail, "cannot select a conflict-free Edge lease subnet: "+err.Error())
 		} else {
 			add("DHCP", "edge plan", StatusPass, "a conflict-free deterministic Edge lease subnet is available")
+		}
+		if strings.EqualFold(input.Edge.Mode, string(edge.ModeRoute)) {
+			addEdgeRouteChecks(ctx, &report, input.Edge, edgeSubnet, pfPath, probes)
 		}
 	}
 
@@ -318,7 +343,140 @@ func completeProbes(probes Probes) Probes {
 	if probes.PFInfo == nil {
 		probes.PFInfo = defaults.PFInfo
 	}
+	if probes.PFValidate == nil {
+		probes.PFValidate = defaults.PFValidate
+	}
+	if probes.VPNRouteAddress == nil {
+		probes.VPNRouteAddress = defaults.VPNRouteAddress
+	}
+	if probes.DiscoverMacOSDNS == nil {
+		probes.DiscoverMacOSDNS = defaults.DiscoverMacOSDNS
+	}
+	if probes.InterfaceMTU == nil {
+		probes.InterfaceMTU = defaults.InterfaceMTU
+	}
+	if probes.ProbeDNSResolver == nil {
+		probes.ProbeDNSResolver = defaults.ProbeDNSResolver
+	}
 	return probes
+}
+
+func addEdgeRouteChecks(ctx context.Context, report *Report, plan EdgePlan, subnet netip.Prefix, pfPath string, probes Probes) {
+	add := func(area, name string, status Status, detail string) {
+		report.Checks = append(report.Checks, Check{Area: area, Name: name, Status: status, Detail: clean(detail)})
+	}
+	if !subnet.IsValid() || strings.TrimSpace(plan.Downstream) == "" {
+		add("Edge", "staged route", StatusFail, "a valid downstream adapter and lease subnet are required")
+		return
+	}
+	egress := edge.EgressMode(strings.ToLower(strings.TrimSpace(plan.Egress)))
+	if egress == "" {
+		egress = edge.EgressSystem
+	}
+	config := edge.Config{
+		Mode: edge.ModeRoute, Downstream: strings.TrimSpace(plan.Downstream),
+		Upstream: strings.TrimSpace(plan.Upstream), Egress: egress, Subnet: subnet,
+	}
+	if egress == edge.EgressVPN {
+		if config.Upstream == "" || strings.EqualFold(config.Upstream, "auto") {
+			add("VPN", "tunnel", StatusFail, "VPN egress requires an explicit tunnel interface")
+			return
+		}
+		nextHop, err := probes.VPNRouteAddress(config.Upstream)
+		if err != nil {
+			add("VPN", "tunnel", StatusFail, err.Error())
+			return
+		}
+		config.VPNRouteAddress = nextHop
+		add("VPN", "tunnel", StatusPass, "interface is up, point-to-point, and has an IPv4 next hop")
+		for _, raw := range plan.VPNDestinations {
+			destination, parseErr := netip.ParsePrefix(strings.TrimSpace(raw))
+			if parseErr != nil || !destination.Addr().Is4() {
+				add("VPN", "destinations", StatusFail, "invalid staged IPv4 destination "+raw)
+				return
+			}
+			config.VPNDestinations = append(config.VPNDestinations, destination.Masked())
+		}
+	}
+	for _, raw := range plan.DNS {
+		address, err := netip.ParseAddr(strings.TrimSpace(raw))
+		if err != nil || !address.Is4() || address.IsUnspecified() || address.IsMulticast() {
+			add("DNS", "Edge resolver", StatusFail, "invalid staged IPv4 DNS address")
+			return
+		}
+		config.DNS = append(config.DNS, address)
+	}
+	if len(config.DNS) == 0 {
+		resolverInterface := ""
+		if egress == edge.EgressVPN {
+			resolverInterface = config.Upstream
+		}
+		addresses, err := probes.DiscoverMacOSDNS(ctx, resolverInterface)
+		if err != nil {
+			add("DNS", "Edge resolver", StatusFail, err.Error())
+			return
+		}
+		config.DNS = addresses
+	}
+	relay := false
+	resolverPasses := 0
+	var resolverProbeErrs []string
+	for _, address := range config.DNS {
+		relay = relay || address.IsLoopback()
+		probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		err := probes.ProbeDNSResolver(probeCtx, address)
+		cancel()
+		if err != nil {
+			resolverProbeErrs = append(resolverProbeErrs, err.Error())
+		} else {
+			resolverPasses++
+		}
+	}
+	if resolverPasses == 0 {
+		add("DNS", "port 53", StatusFail, strings.Join(resolverProbeErrs, "; "))
+		return
+	}
+	if len(resolverProbeErrs) > 0 {
+		add("DNS", "port 53", StatusWarn, fmt.Sprintf("responding=%d failed=%d; %s", resolverPasses, len(resolverProbeErrs), strings.Join(resolverProbeErrs, "; ")))
+	} else {
+		add("DNS", "port 53", StatusPass, fmt.Sprintf("all %d classic UDP DNS resolver(s) answered", resolverPasses))
+	}
+	add("DNS", "Edge resolver", StatusPass, fmt.Sprintf("usable IPv4 resolvers=%d loopback-relay=%t", len(config.DNS), relay))
+	if egress == edge.EgressSystem && (config.Upstream == "" || strings.EqualFold(config.Upstream, "auto")) {
+		route, err := probes.DiscoverDefaultRoute(ctx)
+		if err != nil {
+			add("Edge", "staged route", StatusFail, err.Error())
+			return
+		}
+		config.Upstream = route.Interface
+	}
+	mtu, err := probes.InterfaceMTU(config.Upstream)
+	if err != nil {
+		add("Edge", "egress MTU", StatusFail, err.Error())
+		return
+	}
+	config.EgressMTU = mtu
+	add("Edge", "egress MTU", StatusPass, fmt.Sprintf("IPv4 MTU=%d; TCP MSS clamp=%d", config.EgressMTU, config.EgressMTU-40))
+	rules, err := edge.CompilePF(config)
+	if err != nil {
+		add("PF", "staged Edge syntax", StatusFail, err.Error())
+		return
+	}
+	if pfPath == "" {
+		add("PF", "staged Edge syntax", StatusFail, "pfctl is unavailable")
+		return
+	}
+	validateCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	err = probes.PFValidate(validateCtx, pfPath, rules)
+	cancel()
+	if err != nil {
+		add("PF", "staged Edge syntax", StatusFail, err.Error())
+		return
+	}
+	add("PF", "staged Edge syntax", StatusPass, "the exact staged anchor parses without changing PF")
+	if egress == edge.EgressVPN {
+		add("VPN", "provider forwarding", StatusWarn, "macOS cannot prove that the VPN provider accepts forwarded/NATed client traffic until a live packet test")
+	}
 }
 
 func addPathCheck(report *Report, lstat func(string) (os.FileInfo, error), area, name, path string, missingOK bool) {
@@ -345,6 +503,16 @@ func probePFInfo(ctx context.Context, path string) error {
 		return err
 	}
 	return nil
+}
+
+func probePFSyntax(ctx context.Context, path, rules string) error {
+	command := exec.CommandContext(ctx, path, "-vnf", "-")
+	command.Stdin = strings.NewReader(rules)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("PF syntax validation failed: %w (%s)", err, clean(string(output)))
 }
 
 func clean(value string) string {

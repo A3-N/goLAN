@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -306,11 +307,30 @@ func stopListenCmd(session *listen.Session, interfaces []string) tea.Cmd {
 	return stopListenCmdWithState(session, interfaces, bridge.SetInterfaceState)
 }
 
-func startEdgeCmd(downstream, upstream string, mode edge.Mode, revision string, rules []policy.Rule, forwards []edgeForwardSetting) tea.Cmd {
+func startEdgeCmd(downstream, upstream string, mode edge.Mode, egress edge.EgressMode, vpnDestinations, dnsValues []string, revision string, rules []policy.Rule, forwards []edgeForwardSetting) tea.Cmd {
 	return func() tea.Msg {
+		destinations := make([]netip.Prefix, 0, len(vpnDestinations))
+		for _, raw := range vpnDestinations {
+			destination, err := netip.ParsePrefix(raw)
+			if err != nil || !destination.Addr().Is4() {
+				return edgeStartedMsg{mode: mode, err: fmt.Errorf("invalid staged VPN destination %q", raw)}
+			}
+			destinations = append(destinations, destination.Masked())
+		}
+		dns := make([]netip.Addr, 0, len(dnsValues))
+		for _, raw := range dnsValues {
+			address, err := netip.ParseAddr(raw)
+			if err != nil || !address.Is4() {
+				return edgeStartedMsg{mode: mode, err: fmt.Errorf("invalid staged DNS address %q", raw)}
+			}
+			dns = append(dns, address)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		config, err := edge.AutoConfig(ctx, downstream, upstream, mode)
+		config, err := edge.AutoConfigWithOptions(ctx, edge.AutoOptions{
+			Downstream: downstream, Upstream: upstream, Mode: mode, Egress: egress,
+			VPNDestinations: destinations, DNS: dns,
+		})
 		if err != nil {
 			return edgeStartedMsg{mode: mode, err: err}
 		}
@@ -523,6 +543,9 @@ func (m *Model) resetStagedNetworking() {
 	m.activeAdapter = ""
 	m.edgeConfiguredMode = string(edge.ModeObserve)
 	m.edgeUpstream = "auto"
+	m.edgeEgress = string(edge.EgressSystem)
+	m.edgeVPNDestinations = nil
+	m.edgeDNS = nil
 	m.edgeForwards = nil
 	m.bridgeControlledOptions = bridge.DefaultControlledOptions()
 	defaults := bridge.DefaultEAPOLPolicy()

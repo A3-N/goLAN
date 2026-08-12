@@ -65,6 +65,9 @@ type Model struct {
 	bridgeControlledOptions bridge.ControlledOptions
 	edgeMode                string
 	edgeUpstream            string
+	edgeEgress              string
+	edgeVPNDestinations     []string
+	edgeDNS                 []string
 	edgeConfiguredMode      string
 	edgeSession             *edge.Session
 	edgeForwards            []edgeForwardSetting
@@ -329,6 +332,7 @@ func NewModel() Model {
 		redactObservedSecrets:   true,
 		observedSecrets:         make(map[string]string),
 		edgeUpstream:            "auto",
+		edgeEgress:              string(edge.EgressSystem),
 		edgeConfiguredMode:      "observe",
 		bridgeControlledOptions: bridge.DefaultControlledOptions(),
 	}

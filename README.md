@@ -191,10 +191,19 @@ Output and do not add workspaces.
 | Controlled bridge | Bounded userspace allow/block, shaping, and safe frame edits |
 | NAT | Reversible authenticated bridge identity with endpoint PF filtering |
 | Edge Observe | Single-adapter passive observation |
-| Edge Route | DHCPv4, routed NAT, stateful filtering, and explicit port forwards |
+| Edge Route | DHCPv4, host-safe routed NAT, stateful filtering, optional VPN egress, and explicit port forwards |
 
 Stop and shutdown restore only state owned by the live session. Incomplete
 restoration remains visible and retryable.
+
+Edge Route changes only traffic sourced by its one downstream client. The Mac
+keeps its own connectivity and routing on its existing non-downstream
+interfaces. VPN egress can force that client through an already-connected IPv4
+point-to-point tunnel without moving the Mac's own traffic onto the tunnel; it
+stops fail-closed if the tunnel goes away. macOS scoped DNS is discovered with
+`scutil`; a port-53 loopback resolver is safely exposed through a downstream
+DNS relay instead of advertising `127.0.0.1` to the client. See
+[Edge route](examples/edge-route.md) for the staged commands and limitations.
 
 Use `cleanup` to stop all live work owned by the current Workbench, retry scoped
 PF and interface restoration, restore every staged adapter to its recorded

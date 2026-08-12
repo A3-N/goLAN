@@ -53,6 +53,14 @@ func (m Model) doctorInput() doctor.Input {
 			LockPending:        len(m.lockPending),
 			LockFailed:         len(m.lockFailed),
 		},
+		Edge: doctor.EdgePlan{
+			Mode: m.edgeConfiguredMode, Egress: m.edgeEgress, Upstream: m.edgeUpstream,
+			VPNDestinations: append([]string(nil), m.edgeVPNDestinations...),
+			DNS:             append([]string(nil), m.edgeDNS...),
+		},
+	}
+	if targets := m.listenTargets(); len(targets) > 0 {
+		input.Edge.Downstream = targets[0].Name
 	}
 	if m.bridge != nil {
 		input.Restoration.BridgeCleanup = m.bridge.CleanupPending()

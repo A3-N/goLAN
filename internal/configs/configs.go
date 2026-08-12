@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -24,7 +25,7 @@ const envConfigDir = paths.EnvConfigDir
 
 const (
 	// CurrentVersion is the persisted config schema written by this build.
-	CurrentVersion = 2
+	CurrentVersion = 3
 	maxConfigSize  = 1 << 20
 )
 
@@ -56,11 +57,15 @@ type Settings struct {
 // with a setup snapshot. Strings keep durations and enums human-readable while
 // Decode validates the complete block before it reaches the Workbench model.
 type RuntimeSettings struct {
-	EdgeMode             string        `json:"edge_mode"`
-	EdgeUpstream         string        `json:"edge_upstream"`
-	EdgePortForwards     []PortForward `json:"edge_port_forwards,omitempty"`
-	ControlledQueueDepth int           `json:"controlled_queue_depth"`
-	ControlledOverload   string        `json:"controlled_overload"`
+	EdgeMode            string        `json:"edge_mode"`
+	EdgeUpstream        string        `json:"edge_upstream"`
+	EdgeEgress          string        `json:"edge_egress"`
+	EdgeVPNDestinations []string      `json:"edge_vpn_destinations,omitempty"`
+	EdgeDNS             []string      `json:"edge_dns,omitempty"`
+	EdgePortForwards    []PortForward `json:"edge_port_forwards,omitempty"`
+
+	ControlledQueueDepth int    `json:"controlled_queue_depth"`
+	ControlledOverload   string `json:"controlled_overload"`
 }
 
 type PortForward struct {
@@ -100,6 +105,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 	return RuntimeSettings{
 		EdgeMode:             "observe",
 		EdgeUpstream:         "auto",
+		EdgeEgress:           "system",
 		ControlledQueueDepth: 1024,
 		ControlledOverload:   "fail-open",
 	}
@@ -227,7 +233,7 @@ func Decode(content []byte) (Snapshot, error) {
 	if err := requireJSONEOF(decoder); err != nil {
 		return Snapshot{}, fmt.Errorf("decode config: %w", err)
 	}
-	if snapshot.Version != 1 && snapshot.Version != CurrentVersion {
+	if snapshot.Version != 1 && snapshot.Version != 2 && snapshot.Version != CurrentVersion {
 		return Snapshot{}, fmt.Errorf("unsupported config version %d", snapshot.Version)
 	}
 	if snapshot.Settings != nil {
@@ -360,6 +366,9 @@ func migrateSettings(settings Settings) Settings {
 		if runtime.EdgeMode == "intercept" {
 			runtime.EdgeMode = "route"
 		}
+		if strings.TrimSpace(runtime.EdgeEgress) == "" {
+			runtime.EdgeEgress = "system"
+		}
 		settings.Runtime = &runtime
 	}
 	return settings
@@ -378,6 +387,52 @@ func validateSettings(settings Settings) error {
 	}
 	if !validRuntimeAdapter(runtime.EdgeUpstream) {
 		return fmt.Errorf("edge upstream must be auto or a valid adapter name")
+	}
+	if runtime.EdgeEgress != "system" && runtime.EdgeEgress != "vpn" {
+		return fmt.Errorf("edge egress must be system or vpn")
+	}
+	if runtime.EdgeEgress == "vpn" && runtime.EdgeMode != "route" {
+		return fmt.Errorf("vpn egress requires edge route mode")
+	}
+	if runtime.EdgeEgress == "vpn" && strings.EqualFold(strings.TrimSpace(runtime.EdgeUpstream), "auto") {
+		return fmt.Errorf("vpn egress requires an explicit tunnel interface")
+	}
+	destinations := make(map[netip.Prefix]bool, len(runtime.EdgeVPNDestinations))
+	allDestinations := false
+	for _, raw := range runtime.EdgeVPNDestinations {
+		destination, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil || !destination.Addr().Is4() {
+			return fmt.Errorf("invalid edge VPN destination %q", raw)
+		}
+		destination = destination.Masked()
+		if destinations[destination] {
+			return fmt.Errorf("duplicate edge VPN destination %s", destination)
+		}
+		destinations[destination] = true
+		allDestinations = allDestinations || destination.Bits() == 0
+	}
+	if runtime.EdgeEgress == "system" && len(destinations) != 0 {
+		return fmt.Errorf("edge VPN destinations require vpn egress")
+	}
+	if runtime.EdgeEgress == "vpn" && len(destinations) == 0 {
+		return fmt.Errorf("vpn egress requires at least one destination or all")
+	}
+	if allDestinations && len(destinations) != 1 {
+		return fmt.Errorf("edge VPN destination all cannot be combined with other prefixes")
+	}
+	dnsAddresses := make(map[netip.Addr]bool, len(runtime.EdgeDNS))
+	for _, raw := range runtime.EdgeDNS {
+		address, err := netip.ParseAddr(strings.TrimSpace(raw))
+		if err != nil || !address.Is4() || address.IsUnspecified() || address.IsMulticast() {
+			return fmt.Errorf("invalid edge DNS address %q", raw)
+		}
+		if dnsAddresses[address] {
+			return fmt.Errorf("duplicate edge DNS address %s", address)
+		}
+		dnsAddresses[address] = true
+		if runtime.EdgeEgress == "vpn" && !address.IsLoopback() && !prefixSetContains(destinations, address) {
+			return fmt.Errorf("edge VPN DNS address %s is outside the permitted destinations", address)
+		}
 	}
 	if runtime.ControlledQueueDepth < 1 || runtime.ControlledQueueDepth > 4096 {
 		return fmt.Errorf("controlled queue depth must be between 1 and 4096")
@@ -398,6 +453,15 @@ func validateSettings(settings Settings) error {
 		seenForwards[key] = true
 	}
 	return nil
+}
+
+func prefixSetContains(prefixes map[netip.Prefix]bool, address netip.Addr) bool {
+	for prefix := range prefixes {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
 }
 
 func validRuntimeAdapter(value string) bool {

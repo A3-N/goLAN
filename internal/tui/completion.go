@@ -335,7 +335,7 @@ func (m Model) setCompletions(tokens []string, trailingSpace bool) []string {
 	}
 	if target == "edge" {
 		if len(tokens) == 2 || (len(tokens) == 3 && !trailingSpace) {
-			return []string{"mode", "port-forward", "upstream"}
+			return []string{"dns", "egress", "mode", "port-forward", "upstream", "vpn-destination"}
 		}
 		if (len(tokens) == 3 && trailingSpace) || (len(tokens) == 4 && !trailingSpace) {
 			switch tokens[2] {
@@ -343,8 +343,27 @@ func (m Model) setCompletions(tokens []string, trailingSpace bool) []string {
 				return []string{"observe", "route"}
 			case "upstream":
 				return append([]string{"auto"}, m.adapterNames()...)
+			case "egress":
+				return []string{"system", "vpn"}
+			case "vpn-destination":
+				return []string{"all", "clear", "list", "remove"}
+			case "dns":
+				return []string{"clear", "list", "remove"}
 			case "port-forward":
 				return []string{"clear", "list", "remove", "tcp", "udp"}
+			}
+		}
+		if tokens[2] == "egress" && ((len(tokens) == 4 && trailingSpace) || (len(tokens) == 5 && !trailingSpace)) {
+			if len(tokens) >= 4 && tokens[3] == "system" {
+				return append([]string{"auto"}, m.adapterNames()...)
+			}
+		}
+		if (tokens[2] == "vpn-destination" || tokens[2] == "dns") && len(tokens) >= 4 && tokens[3] == "remove" {
+			if (len(tokens) == 4 && trailingSpace) || (len(tokens) == 5 && !trailingSpace) {
+				if tokens[2] == "vpn-destination" {
+					return append([]string(nil), m.edgeVPNDestinations...)
+				}
+				return append([]string(nil), m.edgeDNS...)
 			}
 		}
 		if tokens[2] == "port-forward" && len(tokens) >= 4 && tokens[3] == "remove" {

@@ -33,17 +33,27 @@ go.work.sum
 .env
 .env.*
 !.env.example
+.envrc
+.direnv/
 
 # Runtime sessions, captures, and local telemetry
 .golan-session.json
+.golan-*
 .config/goLAN/
 goLAN-sessions/
 config.json
+recent.json
 /configs/
+/projects/
+/canvases/
 sessions/
 pcaps/
 captures/
 logs/
+*.golan/
+*.golanproj
+*.golanpass
+*.canvas
 *.pcap.*
 *.pcap
 *.pcapng

@@ -217,10 +217,33 @@ func runPFSyntax(t *testing.T, cfg config) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	vpnRules, err := edge.CompilePFWithPolicy(edge.Config{
+		Mode: edge.ModeRoute, Downstream: downstream, Upstream: "utun98", Egress: edge.EgressVPN,
+		VPNDestinations: []netip.Prefix{netip.MustParsePrefix("10.20.0.0/16")},
+		VPNRouteAddress: netip.MustParseAddr("10.8.0.2"),
+		Subnet:          netip.MustParsePrefix("10.77.253.0/24"),
+		DNS:             []netip.Addr{netip.MustParseAddr("10.20.0.53")},
+	}, "hardware-pf", []policy.Rule{edgeRule})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vpnLoopbackDNSRules, err := edge.CompilePF(edge.Config{
+		Mode: edge.ModeRoute, Downstream: downstream, Upstream: "utun98", Egress: edge.EgressVPN,
+		VPNDestinations: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
+		VPNRouteAddress: netip.MustParseAddr("10.8.0.1"),
+		EgressMTU:       1280,
+		Subnet:          netip.MustParsePrefix("10.77.252.0/24"),
+		DNS:             []netip.Addr{netip.MustParseAddr("127.0.0.1")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, rules := range map[string]string{
-		"fast bridge": fastRules,
-		"nat":         natRules,
-		"edge route":  edgeRules,
+		"fast bridge":                 fastRules,
+		"nat":                         natRules,
+		"edge route":                  edgeRules,
+		"edge VPN egress":             vpnRules,
+		"edge VPN loopback DNS relay": vpnLoopbackDNSRules,
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

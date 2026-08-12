@@ -10,7 +10,7 @@ enter the remaining commands in Main.
 | Manually test en11-to-en12 inline forwarding and packet recognition | [One device through a Mac to a switch](2tomac.md) |
 | Observe traffic without forwarding it | [Passive listen](passive-listen.md) |
 | Observe one directly connected host | [Edge observe](edge-observe.md) |
-| Give one host DHCP and route it to a LAN or the web | [Edge route](edge-route.md) |
+| Give one host DHCP and route it to a LAN, the web, or a VPN | [Edge route](edge-route.md) |
 | Forward transparently between a host and switch | [Bridge](bridge.md) |
 | Forward using the authenticated endpoint identity | [NAT](nat.md) |
 | Review devices and useful observations | [Network review](network-review.md) |

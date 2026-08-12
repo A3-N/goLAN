@@ -3,6 +3,7 @@ package edge
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,8 +18,9 @@ const (
 	// PFAnchor is a dedicated child of macOS's pre-wired com.apple wildcard.
 	// Using that existing namespace activates translation and filtering without
 	// rewriting /etc/pf.conf or changing unrelated anchors.
-	PFAnchor  = "com.apple/golan.edge"
-	pfTimeout = 5 * time.Second
+	PFAnchor              = "com.apple/golan.edge"
+	pfTimeout             = 5 * time.Second
+	pfVPNDestinationTable = "<golan_edge_vpn_destinations>"
 )
 
 var edgePFOperations = pfutil.AnchorOperations{
@@ -54,8 +56,23 @@ func compilePF(config Config, policyFilters []string) (string, error) {
 		return "", nil
 	}
 	subnet := config.Subnet.Masked().String()
+	server := config.Subnet.Masked().Addr().Next().String()
+	destinations := "any"
+	var definitions []string
+	if config.EffectiveEgress() == EgressVPN {
+		if entries := pfVPNDestinationEntries(config.VPNDestinations); len(entries) > 0 {
+			definitions = append(definitions, fmt.Sprintf("table %s const { %s }", pfVPNDestinationTable, strings.Join(entries, ", ")))
+			destinations = pfVPNDestinationTable
+		}
+	}
+	if config.EgressMTU >= 576 {
+		definitions = append(definitions, fmt.Sprintf(
+			"scrub in on %s inet proto tcp max-mss %d",
+			config.Downstream, config.EgressMTU-40,
+		))
+	}
 	translations := []string{
-		fmt.Sprintf("nat on %s inet from %s to any -> (%s)", config.Upstream, subnet, config.Upstream),
+		fmt.Sprintf("nat on %s inet from %s to %s -> (%s)", config.Upstream, subnet, destinations, config.Upstream),
 	}
 	forwards := append([]PortForward(nil), config.PortForwards...)
 	sort.Slice(forwards, func(i, j int) bool {
@@ -71,19 +88,58 @@ func compilePF(config Config, policyFilters []string) (string, error) {
 		)
 	}
 	filters := []string{
-		"block drop quick inet6 all",
-		fmt.Sprintf("pass in quick on %s inet proto udp from any port 68 to 255.255.255.255 port 67", config.Downstream),
-		fmt.Sprintf("pass out quick on %s inet proto udp from %s port 67 to any port 68", config.Downstream, config.Subnet.Masked().Addr().Next()),
+		fmt.Sprintf("block drop quick on %s inet6 all", config.Downstream),
+		fmt.Sprintf("pass in quick on %s inet proto udp from any port 68 to { 255.255.255.255, %s } port 67", config.Downstream, server),
+		fmt.Sprintf("pass out quick on %s inet proto udp from %s port 67 to any port 68", config.Downstream, server),
+		fmt.Sprintf("block in quick on %s inet from ! %s to any", config.Downstream, subnet),
+	}
+	if requiresDNSRelay(config.DNS) {
+		filters = append(filters, fmt.Sprintf(
+			"pass in quick on %s inet proto { tcp, udp } from %s to %s port 53 keep state",
+			config.Downstream, subnet, server,
+		))
+	}
+	// The downstream device is untrusted. Permit the owned DHCP/DNS endpoints
+	// above, then prevent it from reaching any other address hosted by the Mac.
+	filters = append(filters, fmt.Sprintf("block in quick on %s inet from %s to self", config.Downstream, subnet))
+	if config.EffectiveEgress() == EgressVPN && destinations != "any" {
+		filters = append(filters, fmt.Sprintf("block in quick on %s inet from %s to ! %s", config.Downstream, subnet, destinations))
 	}
 	filters = append(filters, policyFilters...)
-	filters = append(filters,
-		fmt.Sprintf("pass in quick on %s inet from %s to any keep state", config.Downstream, subnet),
-		fmt.Sprintf("pass out quick on %s inet from %s to any keep state", config.Upstream, subnet),
-		fmt.Sprintf("pass out quick on %s inet from any to %s keep state", config.Downstream, subnet),
-		fmt.Sprintf("block in quick on %s inet all", config.Upstream),
-	)
-	lines := append(translations, filters...)
+	if config.EffectiveEgress() == EgressVPN {
+		routeTarget := fmt.Sprintf("(%s %s)", config.Upstream, config.VPNRouteAddress)
+		filters = append(filters,
+			fmt.Sprintf("pass in quick on %s route-to %s inet from %s to %s keep state", config.Downstream, routeTarget, subnet, destinations),
+			fmt.Sprintf("pass out quick on %s inet from %s to %s keep state", config.Upstream, subnet, destinations),
+			fmt.Sprintf("pass out quick on %s inet from any to %s keep state", config.Downstream, subnet),
+			fmt.Sprintf("block out quick inet from %s to any", subnet),
+			fmt.Sprintf("block in quick on %s inet from any to %s", config.Upstream, subnet),
+			fmt.Sprintf("block in quick on %s inet from %s to any", config.Downstream, subnet),
+		)
+	} else {
+		filters = append(filters,
+			fmt.Sprintf("pass in quick on %s inet from %s to any keep state", config.Downstream, subnet),
+			fmt.Sprintf("pass out quick on %s inet from %s to any keep state", config.Upstream, subnet),
+			fmt.Sprintf("pass out quick on %s inet from any to %s keep state", config.Downstream, subnet),
+			fmt.Sprintf("block in quick on %s inet from any to %s", config.Upstream, subnet),
+		)
+	}
+	lines := append(definitions, translations...)
+	lines = append(lines, filters...)
 	return strings.Join(lines, "\n") + "\n", nil
+}
+
+func pfVPNDestinationEntries(values []netip.Prefix) []string {
+	items := make([]string, 0, len(values))
+	for _, value := range values {
+		value = value.Masked()
+		if value.Bits() == 0 {
+			return nil
+		}
+		items = append(items, value.String())
+	}
+	sort.Strings(items)
+	return items
 }
 
 func compilePolicyFilters(config Config, revision string, rules []policy.Rule) ([]string, error) {
@@ -114,10 +170,23 @@ func compilePolicyFilters(config Config, revision string, rules []policy.Rule) (
 		directions := policyDirections(rule.Match.Directions)
 		for _, direction := range directions {
 			interfaceName := config.Downstream
+			destinations := pfAddresses(rule.Match.DstCIDRs)
 			if direction == traffic.DirectionInbound {
 				interfaceName = config.Upstream
+				scopedDestinations, scopeErr := pfScopedPolicyDestinations(config.Subnet, rule.Match.DstCIDRs)
+				if scopeErr != nil {
+					return nil, fmt.Errorf("scope edge policy rule %s: %w", rule.ID, scopeErr)
+				}
+				if len(scopedDestinations) == 0 {
+					continue
+				}
+				destinations = pfutil.List(scopedDestinations)
 			}
-			parts := []string{verdict, "in", "quick", "on", interfaceName, "inet"}
+			parts := []string{verdict, "in", "quick", "on", interfaceName}
+			if verdict == "pass" && direction == traffic.DirectionOutbound && config.EffectiveEgress() == EgressVPN {
+				parts = append(parts, "route-to", fmt.Sprintf("(%s %s)", config.Upstream, config.VPNRouteAddress))
+			}
+			parts = append(parts, "inet")
 			protocols := pfProtocols(rule.Match.Protocols, rule.Match.SrcPorts, rule.Match.DstPorts)
 			if protocols != "" {
 				parts = append(parts, "proto", protocols)
@@ -126,7 +195,7 @@ func compilePolicyFilters(config Config, revision string, rules []policy.Rule) (
 			if ports := pfutil.Ports(rule.Match.SrcPorts); ports != "" {
 				parts = append(parts, "port", ports)
 			}
-			parts = append(parts, "to", pfAddresses(rule.Match.DstCIDRs))
+			parts = append(parts, "to", destinations)
 			if ports := pfutil.Ports(rule.Match.DstPorts); ports != "" {
 				parts = append(parts, "port", ports)
 			}
@@ -137,6 +206,40 @@ func compilePolicyFilters(config Config, revision string, rules []policy.Rule) (
 		}
 	}
 	return lines, nil
+}
+
+// pfScopedPolicyDestinations keeps rules entering the upstream interface
+// inside Edge's client subnet. Without this intersection, an inbound Edge
+// policy using "to any" could also filter traffic addressed to the Mac itself.
+func pfScopedPolicyDestinations(subnet netip.Prefix, values []string) ([]string, error) {
+	subnet = subnet.Masked()
+	if len(values) == 0 {
+		return []string{subnet.String()}, nil
+	}
+	seen := make(map[netip.Prefix]bool, len(values))
+	for _, value := range values {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
+		if err != nil {
+			return nil, err
+		}
+		prefix = prefix.Masked()
+		var intersection netip.Prefix
+		switch {
+		case prefix.Contains(subnet.Addr()):
+			intersection = subnet
+		case subnet.Contains(prefix.Addr()):
+			intersection = prefix
+		default:
+			continue
+		}
+		seen[intersection] = true
+	}
+	result := make([]string, 0, len(seen))
+	for prefix := range seen {
+		result = append(result, prefix.String())
+	}
+	sort.Strings(result)
+	return result, nil
 }
 
 func policyDirections(values []traffic.Direction) []traffic.Direction {

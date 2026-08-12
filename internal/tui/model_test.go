@@ -218,6 +218,31 @@ func TestEdgeSettingsStageWithoutStartingNetworking(t *testing.T) {
 	}
 }
 
+func TestEdgeVPNSettingsStageNormalizeAndSwitchEgress(t *testing.T) {
+	m := NewModel()
+	m.adapters = []adapters.Adapter{{Name: "en0"}, {Name: "en7"}}
+	m.executeCommand("set edge egress vpn utun4")
+	m.executeCommand("set edge vpn-destination 10.20.7.9/16")
+	m.executeCommand("set edge dns 10.20.0.53")
+	if m.edgeConfiguredMode != string(edge.ModeRoute) || m.edgeEgress != string(edge.EgressVPN) || m.edgeUpstream != "utun4" {
+		t.Fatalf("VPN staging mode=%q egress=%q upstream=%q", m.edgeConfiguredMode, m.edgeEgress, m.edgeUpstream)
+	}
+	if !reflect.DeepEqual(m.edgeVPNDestinations, []string{"10.20.0.0/16"}) || !reflect.DeepEqual(m.edgeDNS, []string{"10.20.0.53"}) {
+		t.Fatalf("VPN destinations=%v DNS=%v", m.edgeVPNDestinations, m.edgeDNS)
+	}
+	m.executeCommand("show edge")
+	for _, want := range []string{"next mode=route upstream=utun4 egress=vpn", "VPN destination 10.20.0.0/16", "DNS 10.20.0.53"} {
+		if !containsOutput(m.output, want) {
+			t.Fatalf("show edge missing %q: %v", want, m.output)
+		}
+	}
+
+	m.executeCommand("set edge egress system en0")
+	if m.edgeEgress != string(edge.EgressSystem) || m.edgeUpstream != "en0" || len(m.edgeVPNDestinations) != 0 {
+		t.Fatalf("system switch egress=%q upstream=%q destinations=%v", m.edgeEgress, m.edgeUpstream, m.edgeVPNDestinations)
+	}
+}
+
 func TestCleanupResetsStagedNetworkingWithoutDeletingPersistentState(t *testing.T) {
 	m := NewModel()
 	m.offline = true
@@ -226,6 +251,9 @@ func TestCleanupResetsStagedNetworkingWithoutDeletingPersistentState(t *testing.
 	m.activeAdapter = "en11"
 	m.edgeConfiguredMode = string(edge.ModeRoute)
 	m.edgeUpstream = "en0"
+	m.edgeEgress = string(edge.EgressVPN)
+	m.edgeVPNDestinations = []string{"10.20.0.0/16"}
+	m.edgeDNS = []string{"10.20.0.53"}
 	m.edgeForwards = []edgeForwardSetting{{Protocol: "tcp", ListenPort: 8443, TargetPort: 443}}
 	m.bridgeControlledOptions.QueueDepth = 2048
 	m.eapolSuppressLogoff = false
@@ -335,9 +363,10 @@ func TestCleanupStopsCurrentEdgeSessionBeforeReset(t *testing.T) {
 	next, _ := m.Update(cmd())
 	got := next.(Model)
 	if got.edgeSession != nil || got.edgeMode != "" || got.edgeConfiguredMode != string(edge.ModeObserve) ||
+		got.edgeEgress != string(edge.EgressSystem) || got.edgeUpstream != "auto" || len(got.edgeVPNDestinations) != 0 || len(got.edgeDNS) != 0 ||
 		!containsOutput(got.output, "cleanup [PASS]") {
-		t.Fatalf("edge cleanup did not finish: session=%v active=%q configured=%q output=%v",
-			got.edgeSession, got.edgeMode, got.edgeConfiguredMode, got.output)
+		t.Fatalf("edge cleanup did not finish: session=%v active=%q configured=%q egress=%q upstream=%q destinations=%v DNS=%v output=%v",
+			got.edgeSession, got.edgeMode, got.edgeConfiguredMode, got.edgeEgress, got.edgeUpstream, got.edgeVPNDestinations, got.edgeDNS, got.output)
 	}
 }
 

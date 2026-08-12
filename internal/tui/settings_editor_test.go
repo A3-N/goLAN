@@ -191,6 +191,27 @@ func TestSettingsEditorInventoryAddRemoveResetAndValidation(t *testing.T) {
 	}
 }
 
+func TestSettingsEditorCommitsCompleteVPNEgressAtomically(t *testing.T) {
+	m := NewModel()
+	m.openSettingsEditor()
+	m.settingsEditor.draft.edgeMode = "route"
+	m.settingsEditor.draft.edgeEgress = "vpn"
+	m.settingsEditor.draft.edgeUpstream = "utun4"
+	m.settingsEditor.draft.vpnDestinations = []string{"10.20.0.0/16"}
+	m.settingsEditor.draft.dns = []string{"192.0.2.53"}
+	m.commitSettingsEditor()
+	if !m.settingsEditor.open || !strings.Contains(m.settingsEditor.err, "outside") || m.edgeEgress != "system" {
+		t.Fatalf("unsafe VPN draft committed editor=%#v egress=%q", m.settingsEditor, m.edgeEgress)
+	}
+	m.settingsEditor.draft.dns = []string{"10.20.0.53"}
+	m.commitSettingsEditor()
+	if m.settingsEditor.open || m.edgeConfiguredMode != "route" || m.edgeEgress != "vpn" || m.edgeUpstream != "utun4" ||
+		!equalStrings(m.edgeVPNDestinations, []string{"10.20.0.0/16"}) || !equalStrings(m.edgeDNS, []string{"10.20.0.53"}) {
+		t.Fatalf("VPN commit mode=%q egress=%q upstream=%q destinations=%v DNS=%v editor=%#v",
+			m.edgeConfiguredMode, m.edgeEgress, m.edgeUpstream, m.edgeVPNDestinations, m.edgeDNS, m.settingsEditor)
+	}
+}
+
 func TestSettingsCommandAndMainShortcutOpenEditor(t *testing.T) {
 	m := NewModel()
 	m.executeCommand("settings")
@@ -210,7 +231,10 @@ func TestSettingsCommandAndMainShortcutOpenEditor(t *testing.T) {
 func TestRuntimeSettingsSnapshotRoundTripAndLegacyInterceptNormalization(t *testing.T) {
 	m := NewModel()
 	m.edgeConfiguredMode = "route"
-	m.edgeUpstream = "en0"
+	m.edgeEgress = "vpn"
+	m.edgeUpstream = "utun4"
+	m.edgeVPNDestinations = []string{"10.20.0.0/16"}
+	m.edgeDNS = []string{"10.20.0.53"}
 	m.edgeForwards = []edgeForwardSetting{{Protocol: "tcp", ListenPort: 8080, TargetPort: 80}}
 	m.bridgeControlledOptions = bridge.DefaultControlledOptions()
 	m.bridgeControlledOptions.QueueDepth = 512
@@ -222,7 +246,8 @@ func TestRuntimeSettingsSnapshotRoundTripAndLegacyInterceptNormalization(t *test
 
 	got := NewModel()
 	got.applySnapshotSettings(&settings)
-	if got.edgeConfiguredMode != m.edgeConfiguredMode || got.edgeUpstream != m.edgeUpstream ||
+	if got.edgeConfiguredMode != m.edgeConfiguredMode || got.edgeEgress != m.edgeEgress || got.edgeUpstream != m.edgeUpstream ||
+		!equalStrings(got.edgeVPNDestinations, m.edgeVPNDestinations) || !equalStrings(got.edgeDNS, m.edgeDNS) ||
 		!equalEdgeForwards(got.edgeForwards, m.edgeForwards) || got.bridgeControlledOptions != m.bridgeControlledOptions || got.redactObservedSecrets != m.redactObservedSecrets {
 		t.Fatalf("runtime restore got=%#v want=%#v", got.settingsSnapshot(), m.settingsSnapshot())
 	}

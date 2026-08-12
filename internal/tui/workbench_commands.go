@@ -974,7 +974,13 @@ func (m *Model) showEdge() {
 		state = "on " + m.edgeMode
 	}
 	m.print("edge state: " + state)
-	m.print(fmt.Sprintf("  next mode=%s upstream=%s", m.edgeConfiguredMode, m.edgeUpstream))
+	m.print(fmt.Sprintf("  next mode=%s upstream=%s egress=%s", m.edgeConfiguredMode, m.edgeUpstream, m.edgeEgress))
+	for _, destination := range m.edgeVPNDestinations {
+		m.print("  VPN destination " + vpnDestinationLabel(destination))
+	}
+	for _, address := range m.edgeDNS {
+		m.print("  DNS " + address)
+	}
 	for _, forward := range m.edgeForwards {
 		m.print(fmt.Sprintf("  forward %s/%d -> client:%d", forward.Protocol, forward.ListenPort, forward.TargetPort))
 	}

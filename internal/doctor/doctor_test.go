@@ -96,6 +96,55 @@ func TestRunWarnsWhenPhysicalAdapterHasNoNetworkServiceMapping(t *testing.T) {
 	}
 }
 
+func TestRunAuditsStagedMacOSVPNRouteAndLoopbackDNSRelay(t *testing.T) {
+	var validatedRules string
+	report := Run(context.Background(), Input{
+		Platform: "darwin", EffectiveUID: 0,
+		Adapters: []adapters.Adapter{{Name: "en7", HardwarePort: "USB Ethernet", NetworkService: "Target"}},
+		Edge: EdgePlan{
+			Mode: "route", Egress: "vpn", Downstream: "en7", Upstream: "utun4",
+			VPNDestinations: []string{"198.51.100.0/24"}, DNS: []string{"127.0.0.1"},
+		},
+	}, Probes{
+		ProjectRoot: func() (string, error) { return t.TempDir(), nil },
+		LoadRecents: func() (workproject.RecentState, error) { return workproject.RecentState{Version: 1}, nil },
+		Lstat:       os.Lstat,
+		DiscoverDefaultRoute: func(context.Context) (edge.Route, error) {
+			return edge.Route{Interface: "en0", Gateway: netip.MustParseAddr("192.0.2.1"), Default: true}, nil
+		},
+		OccupiedIPv4Prefixes: func() ([]netip.Prefix, error) { return nil, nil },
+		SelectSubnet: func([]netip.Prefix) (netip.Prefix, error) {
+			return netip.MustParsePrefix("10.77.2.0/24"), nil
+		},
+		LookPath: func(string) (string, error) { return "/sbin/pfctl", nil },
+		PFInfo:   func(context.Context, string) error { return nil },
+		PFValidate: func(_ context.Context, _ string, rules string) error {
+			validatedRules = rules
+			return nil
+		},
+		VPNRouteAddress:  func(string) (netip.Addr, error) { return netip.MustParseAddr("10.8.0.1"), nil },
+		InterfaceMTU:     func(string) (int, error) { return 1280, nil },
+		ProbeDNSResolver: func(context.Context, netip.Addr) error { return nil },
+	})
+	joined := strings.Join(report.Lines(), "\n")
+	for _, want := range []string{
+		"[PASS] VPN/tunnel",
+		"loopback-relay=true",
+		"[PASS] DNS/Edge resolver",
+		"[PASS] DNS/port 53",
+		"[PASS] PF/staged Edge syntax",
+		"TCP MSS clamp=1240",
+		"[WARN] VPN/provider forwarding",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("VPN doctor report missing %q:\n%s", want, joined)
+		}
+	}
+	if !strings.Contains(validatedRules, "to 10.77.2.1 port 53") || strings.Contains(validatedRules, "127.0.0.1") {
+		t.Fatalf("validated rules do not use the downstream relay:\n%s", validatedRules)
+	}
+}
+
 func sortedReportAreas(report Report) []string {
 	seen := make(map[string]bool)
 	for _, check := range report.Checks {

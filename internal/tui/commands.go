@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -171,8 +172,12 @@ func (m *Model) showHealth() {
 	))
 	if m.edgeSession != nil {
 		health := m.edgeSession.Health()
-		m.print(fmt.Sprintf("  edge path=%s>%s subnet=%s", health.Downstream, health.Upstream, health.Subnet))
+		m.print(fmt.Sprintf("  edge path=%s>%s subnet=%s egress=%s mtu=%d", health.Downstream, health.Upstream, health.Subnet, health.Egress, health.EgressMTU))
+		if len(health.VPNDestinations) > 0 {
+			m.print("  edge VPN route-address=" + health.VPNRouteAddress + " destinations=" + strings.Join(health.VPNDestinations, ","))
+		}
 		m.print(fmt.Sprintf("  dhcp server=%s endpoint=%s gateway=%s replies=%d", health.LeaseServer, health.LeaseClient, health.LeaseGateway, health.Stats.DHCPReplies))
+		m.print(fmt.Sprintf("  dns advertised=%s upstreams=%s relay=%t", strings.Join(health.DNS, ","), strings.Join(health.DNSUpstreams, ","), health.DNSRelay))
 		m.print(fmt.Sprintf("  pf anchor=%s loaded=%t enable-token-owned=%t", health.PF.Anchor, health.PF.Loaded, health.PF.EnableTokenOwned))
 		m.print(fmt.Sprintf("  edge packets original=%d forwarded=%d blocked=%d", health.Stats.OriginalPackets, health.Stats.ForwardedPackets, health.Stats.BlockedPackets))
 		if m.edgeSession.CleanupPending() {
@@ -261,7 +266,7 @@ func (m *Model) executeSet(args []string) tea.Cmd {
 	}
 	if key == "edge" {
 		if len(args) < 2 {
-			m.print("use: set edge mode|upstream|port-forward ...")
+			m.print("use: set edge mode|egress|upstream|vpn-destination|dns|port-forward ...")
 			return nil
 		}
 		switch strings.ToLower(args[1]) {
@@ -273,6 +278,10 @@ func (m *Model) executeSet(args []string) tea.Cmd {
 			mode := strings.ToLower(args[2])
 			if mode != string(edge.ModeObserve) && mode != string(edge.ModeRoute) {
 				m.print("use: set edge mode <observe|route>")
+				return nil
+			}
+			if mode == string(edge.ModeObserve) && m.edgeEgress == string(edge.EgressVPN) {
+				m.print("edge err: switch egress to system before selecting observe mode")
 				return nil
 			}
 			m.edgeConfiguredMode = mode
@@ -291,7 +300,45 @@ func (m *Model) executeSet(args []string) tea.Cmd {
 				}
 			}
 			m.edgeUpstream = value
+			m.edgeEgress = string(edge.EgressSystem)
+			m.edgeVPNDestinations = nil
 			m.print("edge upstream: " + value + " (applies to next session)")
+		case "egress":
+			if len(args) != 4 {
+				m.print("use: set edge egress system <auto|adapter> | vpn <tunnel-interface>")
+				return nil
+			}
+			mode := strings.ToLower(strings.TrimSpace(args[2]))
+			value := strings.TrimSpace(args[3])
+			switch mode {
+			case string(edge.EgressSystem):
+				if !strings.EqualFold(value, "auto") {
+					adapter, ok := m.findAdapter(value)
+					if !ok || adapter.Name == "" {
+						m.print("edge err: upstream adapter not found: " + value)
+						return nil
+					}
+				}
+				m.edgeEgress = mode
+				m.edgeUpstream = value
+				m.edgeVPNDestinations = nil
+				m.print("edge egress: system upstream=" + value + " (applies to next session)")
+			case string(edge.EgressVPN):
+				if strings.EqualFold(value, "auto") || !edge.ValidInterfaceName(value) {
+					m.print("edge err: vpn egress requires an explicit valid tunnel interface")
+					return nil
+				}
+				m.edgeEgress = mode
+				m.edgeUpstream = value
+				m.edgeConfiguredMode = string(edge.ModeRoute)
+				m.print("edge egress: vpn tunnel=" + value + " fail-closed (applies to next session)")
+			default:
+				m.print("use: set edge egress system <auto|adapter> | vpn <tunnel-interface>")
+			}
+		case "vpn-destination":
+			m.setEdgeVPNDestination(args[2:])
+		case "dns":
+			m.setEdgeDNS(args[2:])
 		case "port-forward":
 			if len(args) == 3 && strings.EqualFold(args[2], "list") {
 				if len(m.edgeForwards) == 0 {
@@ -348,7 +395,7 @@ func (m *Model) executeSet(args []string) tea.Cmd {
 			m.edgeForwards = append(m.edgeForwards, setting)
 			m.print(fmt.Sprintf("edge port-forward: %s/%d -> client:%d (applies to next session)", protocol, listenPort, targetPort))
 		default:
-			m.print("use: set edge mode|upstream|port-forward ...")
+			m.print("use: set edge mode|egress|upstream|vpn-destination|dns|port-forward ...")
 		}
 		return nil
 	}
@@ -401,6 +448,149 @@ func (m *Model) executeSet(args []string) tea.Cmd {
 	}
 	m.print(fmt.Sprintf("%s %s: %s -> %s%s", cfg.Name, canonical, old, next, suffix))
 	return nil
+}
+
+func (m *Model) setEdgeVPNDestination(args []string) {
+	usage := "use: set edge vpn-destination <cidr|all|list|clear|remove cidr>"
+	if len(args) == 1 && strings.EqualFold(args[0], "list") {
+		if len(m.edgeVPNDestinations) == 0 {
+			m.print("edge VPN destinations: none")
+			return
+		}
+		m.print(fmt.Sprintf("edge VPN destinations: %d", len(m.edgeVPNDestinations)))
+		for _, destination := range m.edgeVPNDestinations {
+			m.print("  " + vpnDestinationLabel(destination))
+		}
+		return
+	}
+	if len(args) == 1 && strings.EqualFold(args[0], "clear") {
+		m.edgeVPNDestinations = nil
+		m.print("edge VPN destinations: cleared (applies to next session)")
+		return
+	}
+	if len(args) == 2 && strings.EqualFold(args[0], "remove") {
+		target, err := parseVPNDestination(args[1])
+		if err != nil {
+			m.print("edge err: " + err.Error())
+			return
+		}
+		for index, existing := range m.edgeVPNDestinations {
+			if existing != target {
+				continue
+			}
+			m.edgeVPNDestinations = append(m.edgeVPNDestinations[:index], m.edgeVPNDestinations[index+1:]...)
+			m.print("edge VPN destination: removed " + vpnDestinationLabel(target) + " (applies to next session)")
+			return
+		}
+		m.print("edge err: VPN destination not found: " + vpnDestinationLabel(target))
+		return
+	}
+	if len(args) != 1 {
+		m.print(usage)
+		return
+	}
+	destination, err := parseVPNDestination(args[0])
+	if err != nil {
+		m.print("edge err: " + err.Error())
+		return
+	}
+	if destination == "0.0.0.0/0" {
+		m.edgeVPNDestinations = []string{destination}
+		m.print("edge VPN destination: all (applies to next session)")
+		return
+	}
+	for _, existing := range m.edgeVPNDestinations {
+		if existing == "0.0.0.0/0" {
+			m.print("edge err: VPN destination all must be cleared before adding a prefix")
+			return
+		}
+		if existing == destination {
+			m.print("edge err: VPN destination is duplicated")
+			return
+		}
+	}
+	m.edgeVPNDestinations = append(m.edgeVPNDestinations, destination)
+	m.print("edge VPN destination: " + destination + " (applies to next session)")
+}
+
+func parseVPNDestination(raw string) (string, error) {
+	if strings.EqualFold(strings.TrimSpace(raw), "all") {
+		return "0.0.0.0/0", nil
+	}
+	destination, err := netip.ParsePrefix(strings.TrimSpace(raw))
+	if err != nil || !destination.Addr().Is4() {
+		return "", fmt.Errorf("VPN destination must be an IPv4 CIDR or all")
+	}
+	return destination.Masked().String(), nil
+}
+
+func vpnDestinationLabel(value string) string {
+	if value == "0.0.0.0/0" {
+		return "all"
+	}
+	return value
+}
+
+func (m *Model) setEdgeDNS(args []string) {
+	usage := "use: set edge dns <ipv4|list|clear|remove ipv4>"
+	if len(args) == 1 && strings.EqualFold(args[0], "list") {
+		if len(m.edgeDNS) == 0 {
+			m.print("edge DNS: automatic")
+			return
+		}
+		m.print(fmt.Sprintf("edge DNS: %d", len(m.edgeDNS)))
+		for _, address := range m.edgeDNS {
+			m.print("  " + address)
+		}
+		return
+	}
+	if len(args) == 1 && strings.EqualFold(args[0], "clear") {
+		m.edgeDNS = nil
+		m.print("edge DNS: automatic (applies to next session)")
+		return
+	}
+	if len(args) == 2 && strings.EqualFold(args[0], "remove") {
+		address, err := parseEdgeDNS(args[1])
+		if err != nil {
+			m.print("edge err: " + err.Error())
+			return
+		}
+		for index, existing := range m.edgeDNS {
+			if existing != address {
+				continue
+			}
+			m.edgeDNS = append(m.edgeDNS[:index], m.edgeDNS[index+1:]...)
+			m.print("edge DNS: removed " + address + " (applies to next session)")
+			return
+		}
+		m.print("edge err: DNS address not found: " + address)
+		return
+	}
+	if len(args) != 1 {
+		m.print(usage)
+		return
+	}
+	address, err := parseEdgeDNS(args[0])
+	if err != nil {
+		m.print("edge err: " + err.Error())
+		return
+	}
+	for _, existing := range m.edgeDNS {
+		if existing == address {
+			m.print("edge err: DNS address is duplicated")
+			return
+		}
+	}
+	m.edgeDNS = append(m.edgeDNS, address)
+	m.print("edge DNS: " + address + " (applies to next session)")
+}
+
+func parseEdgeDNS(raw string) (string, error) {
+	address, err := netip.ParseAddr(strings.TrimSpace(raw))
+	if err != nil || !address.Is4() || address.IsUnspecified() || address.IsMulticast() {
+		return "", fmt.Errorf("DNS address must be usable IPv4")
+	}
+	return address.String(), nil
 }
 
 func (m *Model) stageAdapter(name, roleValue string) tea.Cmd {
@@ -700,6 +890,9 @@ func (m Model) snapshotSettings() configs.Settings {
 	runtime := configs.RuntimeSettings{
 		EdgeMode:             m.edgeConfiguredMode,
 		EdgeUpstream:         m.edgeUpstream,
+		EdgeEgress:           m.edgeEgress,
+		EdgeVPNDestinations:  append([]string(nil), m.edgeVPNDestinations...),
+		EdgeDNS:              append([]string(nil), m.edgeDNS...),
 		ControlledQueueDepth: m.bridgeControlledOptions.QueueDepth,
 		ControlledOverload:   string(m.bridgeControlledOptions.Overload),
 	}
@@ -733,6 +926,12 @@ func (m *Model) applySnapshotSettings(settings *configs.Settings) {
 			m.print("load warn: legacy edge intercept settings are retired; staged as route")
 		}
 		m.edgeUpstream = runtime.EdgeUpstream
+		m.edgeEgress = runtime.EdgeEgress
+		if m.edgeEgress == "" {
+			m.edgeEgress = string(edge.EgressSystem)
+		}
+		m.edgeVPNDestinations = append([]string(nil), runtime.EdgeVPNDestinations...)
+		m.edgeDNS = append([]string(nil), runtime.EdgeDNS...)
 		m.edgeForwards = make([]edgeForwardSetting, 0, len(runtime.EdgePortForwards))
 		for _, forward := range runtime.EdgePortForwards {
 			m.edgeForwards = append(m.edgeForwards, edgeForwardSetting{
@@ -887,10 +1086,11 @@ func (m *Model) executeStart(args []string) tea.Cmd {
 			m.beginRuntimeOperation("listen start")
 			return m.trackEffect(startListenPolicyCmd(targets, "edge-observe", dataplane.ModeEdgeObserve, revision, rules))
 		}
-		m.print("edge: start " + mode + " upstream=" + m.edgeUpstream)
+		m.print("edge: start " + mode + " egress=" + m.edgeEgress + " upstream=" + m.edgeUpstream)
 		m.beginRuntimeOperation("edge start")
 		return m.trackEffect(startEdgeCmd(
-			targets[0].Name, m.edgeUpstream, edge.Mode(mode), revision, rules, m.edgeForwards,
+			targets[0].Name, m.edgeUpstream, edge.Mode(mode), edge.EgressMode(m.edgeEgress),
+			m.edgeVPNDestinations, m.edgeDNS, revision, rules, m.edgeForwards,
 		))
 	case "nat":
 		if pending := m.pendingRuntimeOperation(); pending != "" {
@@ -1288,6 +1488,7 @@ func (m *Model) showConfig() {
 
 func (m *Model) showConfigSettings() {
 	m.print("settings:")
+	m.print(fmt.Sprintf("  edge mode=%s egress=%s upstream=%s VPN-destinations=%d dns=%d", m.edgeConfiguredMode, m.edgeEgress, m.edgeUpstream, len(m.edgeVPNDestinations), len(m.edgeDNS)))
 	m.print("  " + eapolLogoffStatus(m.eapolSuppressLogoff))
 	m.print("  " + macsecStatus(m.eapolDowngradeMACsec))
 }

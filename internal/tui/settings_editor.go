@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,7 +33,12 @@ type settingsRowKind int
 
 const (
 	settingsRowEdgeMode settingsRowKind = iota
+	settingsRowEdgeEgress
 	settingsRowEdgeUpstream
+	settingsRowVPNDestinationSummary
+	settingsRowVPNDestination
+	settingsRowDNSSummary
+	settingsRowDNS
 	settingsRowPortForwardSummary
 	settingsRowPortForward
 	settingsRowEAPOLLogoff
@@ -47,16 +53,21 @@ type settingsInputKind int
 const (
 	settingsInputNone settingsInputKind = iota
 	settingsInputPortForward
+	settingsInputVPNDestination
+	settingsInputDNS
 )
 
 type settingsDraft struct {
-	edgeMode      string
-	edgeUpstream  string
-	forwards      []edgeForwardSetting
-	eapolLogoff   bool
-	eapolMACsec   bool
-	redactSecrets bool
-	controlled    bridge.ControlledOptions
+	edgeMode        string
+	edgeEgress      string
+	edgeUpstream    string
+	vpnDestinations []string
+	dns             []string
+	forwards        []edgeForwardSetting
+	eapolLogoff     bool
+	eapolMACsec     bool
+	redactSecrets   bool
+	controlled      bridge.ControlledOptions
 }
 
 type settingsEditorState struct {
@@ -84,13 +95,16 @@ type settingsEditorRow struct {
 
 func (m Model) settingsSnapshot() settingsDraft {
 	return settingsDraft{
-		edgeMode:      m.edgeConfiguredMode,
-		edgeUpstream:  m.edgeUpstream,
-		forwards:      append([]edgeForwardSetting(nil), m.edgeForwards...),
-		eapolLogoff:   m.eapolSuppressLogoff,
-		eapolMACsec:   m.eapolDowngradeMACsec,
-		redactSecrets: m.redactObservedSecrets,
-		controlled:    m.bridgeControlledOptions,
+		edgeMode:        m.edgeConfiguredMode,
+		edgeEgress:      m.edgeEgress,
+		edgeUpstream:    m.edgeUpstream,
+		vpnDestinations: append([]string(nil), m.edgeVPNDestinations...),
+		dns:             append([]string(nil), m.edgeDNS...),
+		forwards:        append([]edgeForwardSetting(nil), m.edgeForwards...),
+		eapolLogoff:     m.eapolSuppressLogoff,
+		eapolMACsec:     m.eapolDowngradeMACsec,
+		redactSecrets:   m.redactObservedSecrets,
+		controlled:      m.bridgeControlledOptions,
 	}
 }
 
@@ -108,6 +122,8 @@ func (m *Model) openSettingsEditor() {
 }
 
 func cloneSettingsDraft(source settingsDraft) settingsDraft {
+	source.vpnDestinations = append([]string(nil), source.vpnDestinations...)
+	source.dns = append([]string(nil), source.dns...)
 	source.forwards = append([]edgeForwardSetting(nil), source.forwards...)
 	return source
 }
@@ -181,8 +197,18 @@ func (m *Model) cycleSettingsValue(delta int) {
 	switch row.kind {
 	case settingsRowEdgeMode:
 		draft.edgeMode = cycleSettingString(draft.edgeMode, []string{"observe", "route"}, delta)
+	case settingsRowEdgeEgress:
+		draft.edgeEgress = cycleSettingString(draft.edgeEgress, []string{string(edge.EgressSystem), string(edge.EgressVPN)}, delta)
+		if draft.edgeEgress == string(edge.EgressSystem) {
+			draft.vpnDestinations = nil
+		} else {
+			draft.edgeMode = string(edge.ModeRoute)
+		}
 	case settingsRowEdgeUpstream:
-		values := append([]string{"auto"}, m.adapterNames()...)
+		values := []string{draft.edgeUpstream}
+		if draft.edgeEgress == string(edge.EgressSystem) {
+			values = append([]string{"auto"}, m.adapterNames()...)
+		}
 		draft.edgeUpstream = cycleSettingString(draft.edgeUpstream, values, delta)
 	case settingsRowEAPOLLogoff:
 		draft.eapolLogoff = !draft.eapolLogoff
@@ -252,8 +278,12 @@ func (m *Model) startSettingsInventoryInput() {
 	switch row.kind {
 	case settingsRowPortForwardSummary, settingsRowPortForward:
 		m.settingsEditor.inputKind = settingsInputPortForward
+	case settingsRowVPNDestinationSummary, settingsRowVPNDestination:
+		m.settingsEditor.inputKind = settingsInputVPNDestination
+	case settingsRowDNSSummary, settingsRowDNS:
+		m.settingsEditor.inputKind = settingsInputDNS
 	default:
-		m.settingsEditor.err = "Select a port-forward inventory row before adding."
+		m.settingsEditor.err = "Select a VPN destination, DNS, or port-forward inventory row before adding."
 		return
 	}
 	m.settingsEditor.input = ""
@@ -271,6 +301,10 @@ func (m *Model) updateSettingsInventoryInput(key tea.KeyMsg) {
 		switch m.settingsEditor.inputKind {
 		case settingsInputPortForward:
 			err = m.addSettingsPortForward(m.settingsEditor.input)
+		case settingsInputVPNDestination:
+			err = m.addSettingsVPNDestination(m.settingsEditor.input)
+		case settingsInputDNS:
+			err = m.addSettingsDNS(m.settingsEditor.input)
 		}
 		if err != nil {
 			m.settingsEditor.err = err.Error()
@@ -314,6 +348,41 @@ func (m *Model) addSettingsPortForward(input string) error {
 	return nil
 }
 
+func (m *Model) addSettingsVPNDestination(input string) error {
+	destination, err := parseVPNDestination(strings.TrimSpace(input))
+	if err != nil {
+		return err
+	}
+	if destination == "0.0.0.0/0" {
+		m.settingsEditor.draft.vpnDestinations = []string{destination}
+		return nil
+	}
+	for _, existing := range m.settingsEditor.draft.vpnDestinations {
+		if existing == "0.0.0.0/0" {
+			return fmt.Errorf("VPN destination all must be removed before adding a prefix")
+		}
+		if existing == destination {
+			return fmt.Errorf("VPN destination %s is duplicated", destination)
+		}
+	}
+	m.settingsEditor.draft.vpnDestinations = append(m.settingsEditor.draft.vpnDestinations, destination)
+	return nil
+}
+
+func (m *Model) addSettingsDNS(input string) error {
+	address, err := parseEdgeDNS(strings.TrimSpace(input))
+	if err != nil {
+		return err
+	}
+	for _, existing := range m.settingsEditor.draft.dns {
+		if existing == address {
+			return fmt.Errorf("DNS address %s is duplicated", address)
+		}
+	}
+	m.settingsEditor.draft.dns = append(m.settingsEditor.draft.dns, address)
+	return nil
+}
+
 func (m *Model) removeSettingsInventoryItem() {
 	rows := m.settingsRows()
 	if len(rows) == 0 {
@@ -323,6 +392,10 @@ func (m *Model) removeSettingsInventoryItem() {
 	switch row.kind {
 	case settingsRowPortForward:
 		m.settingsEditor.draft.forwards = append(m.settingsEditor.draft.forwards[:row.index], m.settingsEditor.draft.forwards[row.index+1:]...)
+	case settingsRowVPNDestination:
+		m.settingsEditor.draft.vpnDestinations = append(m.settingsEditor.draft.vpnDestinations[:row.index], m.settingsEditor.draft.vpnDestinations[row.index+1:]...)
+	case settingsRowDNS:
+		m.settingsEditor.draft.dns = append(m.settingsEditor.draft.dns[:row.index], m.settingsEditor.draft.dns[row.index+1:]...)
 	default:
 		m.settingsEditor.err = "Select an inventory item before removing."
 		return
@@ -353,7 +426,10 @@ func (m *Model) commitSettingsEditor() {
 	}
 
 	m.edgeConfiguredMode = draft.edgeMode
+	m.edgeEgress = draft.edgeEgress
 	m.edgeUpstream = draft.edgeUpstream
+	m.edgeVPNDestinations = append([]string(nil), draft.vpnDestinations...)
+	m.edgeDNS = append([]string(nil), draft.dns...)
 	m.edgeForwards = append([]edgeForwardSetting(nil), draft.forwards...)
 	m.eapolSuppressLogoff = draft.eapolLogoff
 	m.eapolDowngradeMACsec = draft.eapolMACsec
@@ -366,17 +442,61 @@ func (m *Model) commitSettingsEditor() {
 	m.settingsEditor = settingsEditorState{}
 	m.activeCard = returnCard
 	m.print(fmt.Sprintf("settings: committed %d changes impacts=%s", changes, strings.Join(settingsImpactStrings(impacts), ",")))
-	m.print(fmt.Sprintf("settings: edge=%s upstream=%s forwards=%d controlled-queue=%d redact-secrets=%t", m.edgeConfiguredMode, m.edgeUpstream, len(m.edgeForwards), m.bridgeControlledOptions.QueueDepth, m.redactObservedSecrets))
+	m.print(fmt.Sprintf("settings: edge=%s egress=%s upstream=%s VPN-destinations=%d dns=%d forwards=%d controlled-queue=%d redact-secrets=%t", m.edgeConfiguredMode, m.edgeEgress, m.edgeUpstream, len(m.edgeVPNDestinations), len(m.edgeDNS), len(m.edgeForwards), m.bridgeControlledOptions.QueueDepth, m.redactObservedSecrets))
 }
 
 func (m Model) validateSettingsDraft(draft settingsDraft) error {
 	if draft.edgeMode != string(edge.ModeObserve) && draft.edgeMode != string(edge.ModeRoute) {
 		return fmt.Errorf("edge mode must be observe or route")
 	}
-	if !strings.EqualFold(draft.edgeUpstream, "auto") {
+	if draft.edgeEgress != string(edge.EgressSystem) && draft.edgeEgress != string(edge.EgressVPN) {
+		return fmt.Errorf("edge egress must be system or vpn")
+	}
+	if draft.edgeEgress == string(edge.EgressVPN) && draft.edgeMode != string(edge.ModeRoute) {
+		return fmt.Errorf("vpn egress requires edge route mode")
+	}
+	if draft.edgeEgress == string(edge.EgressSystem) && !strings.EqualFold(draft.edgeUpstream, "auto") {
 		adapter, ok := m.findAdapter(draft.edgeUpstream)
 		if !ok || adapter.Name == "" {
 			return fmt.Errorf("edge upstream adapter is no longer available: %s", draft.edgeUpstream)
+		}
+	}
+	if draft.edgeEgress == string(edge.EgressVPN) {
+		if strings.EqualFold(draft.edgeUpstream, "auto") || !edge.ValidInterfaceName(draft.edgeUpstream) {
+			return fmt.Errorf("vpn egress requires an explicit tunnel interface; use set edge egress vpn <interface>")
+		}
+		if len(draft.vpnDestinations) == 0 {
+			return fmt.Errorf("vpn egress requires at least one destination or all")
+		}
+	}
+	prefixes := make([]netip.Prefix, 0, len(draft.vpnDestinations))
+	for _, raw := range draft.vpnDestinations {
+		destination, err := netip.ParsePrefix(raw)
+		if err != nil || !destination.Addr().Is4() {
+			return fmt.Errorf("invalid VPN destination %q", raw)
+		}
+		prefixes = append(prefixes, destination.Masked())
+	}
+	if draft.edgeEgress == string(edge.EgressSystem) && len(prefixes) != 0 {
+		return fmt.Errorf("VPN destinations require vpn egress")
+	}
+	for _, raw := range draft.dns {
+		address, err := netip.ParseAddr(raw)
+		if err != nil || !address.Is4() || address.IsUnspecified() || address.IsMulticast() {
+			return fmt.Errorf("invalid DNS address %q", raw)
+		}
+		if draft.edgeEgress != string(edge.EgressVPN) {
+			continue
+		}
+		if address.IsLoopback() {
+			continue
+		}
+		contained := false
+		for _, prefix := range prefixes {
+			contained = contained || prefix.Contains(address)
+		}
+		if !contained {
+			return fmt.Errorf("VPN DNS address %s is outside the permitted destinations", address)
 		}
 	}
 	if err := bridge.ValidateControlledOptions(draft.controlled); err != nil {
@@ -411,7 +531,10 @@ func settingsDraftSummary(before, after settingsDraft) (int, []settingsImpact, b
 		}
 	}
 	add(before.edgeMode != after.edgeMode, true, settingsImpactReconfigure, settingsImpactDisrupts)
+	add(before.edgeEgress != after.edgeEgress, true, settingsImpactReconfigure, settingsImpactDisrupts)
 	add(before.edgeUpstream != after.edgeUpstream, true, settingsImpactReconfigure, settingsImpactDisrupts)
+	add(!equalStrings(before.vpnDestinations, after.vpnDestinations), true, settingsImpactReconfigure, settingsImpactDisrupts)
+	add(!equalStrings(before.dns, after.dns), true, settingsImpactReconfigure, settingsImpactDisrupts)
 	add(!equalEdgeForwards(before.forwards, after.forwards), true, settingsImpactReconfigure, settingsImpactDisrupts)
 	add(before.eapolLogoff != after.eapolLogoff, false, settingsImpactLive)
 	add(before.eapolMACsec != after.eapolMACsec, false, settingsImpactLive)
@@ -425,6 +548,18 @@ func settingsDraftSummary(before, after settingsDraft) (int, []settingsImpact, b
 		}
 	}
 	return changes, impacts, requiresInactive
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func equalEdgeForwards(left, right []edgeForwardSetting) bool {
@@ -444,9 +579,18 @@ func (m Model) settingsRows() []settingsEditorRow {
 	after := m.settingsEditor.draft
 	rows := []settingsEditorRow{
 		settingRow("Session", "Edge mode", before.edgeMode, after.edgeMode, settingsRowEdgeMode, settingsImpactReconfigure, settingsImpactDisrupts),
+		settingRow("Addressing", "Egress", before.edgeEgress, after.edgeEgress, settingsRowEdgeEgress, settingsImpactReconfigure, settingsImpactDisrupts),
 		settingRow("Addressing", "Upstream adapter", before.edgeUpstream, after.edgeUpstream, settingsRowEdgeUpstream, settingsImpactReconfigure, settingsImpactDisrupts),
-		settingCountRow("Addressing", "Port forwards", len(before.forwards), len(after.forwards), settingsRowPortForwardSummary, settingsImpactReconfigure, settingsImpactDisrupts),
+		settingCountRow("Addressing", "VPN destinations", len(before.vpnDestinations), len(after.vpnDestinations), settingsRowVPNDestinationSummary, settingsImpactReconfigure, settingsImpactDisrupts),
 	}
+	for index, destination := range after.vpnDestinations {
+		rows = append(rows, settingsInventoryRow("Addressing", "VPN destination", vpnDestinationLabel(destination), stringPresent(before.vpnDestinations, destination), settingsRowVPNDestination, index, settingsImpactReconfigure, settingsImpactDisrupts))
+	}
+	rows = append(rows, settingCountRow("Addressing", "DNS servers", len(before.dns), len(after.dns), settingsRowDNSSummary, settingsImpactReconfigure, settingsImpactDisrupts))
+	for index, address := range after.dns {
+		rows = append(rows, settingsInventoryRow("Addressing", "DNS server", address, stringPresent(before.dns, address), settingsRowDNS, index, settingsImpactReconfigure, settingsImpactDisrupts))
+	}
+	rows = append(rows, settingCountRow("Addressing", "Port forwards", len(before.forwards), len(after.forwards), settingsRowPortForwardSummary, settingsImpactReconfigure, settingsImpactDisrupts))
 	for index, forward := range after.forwards {
 		value := fmt.Sprintf("%s/%d -> client:%d", forward.Protocol, forward.ListenPort, forward.TargetPort)
 		rows = append(rows, settingsInventoryRow("Addressing", "Port forward", value, edgeForwardPresent(before.forwards, forward), settingsRowPortForward, index, settingsImpactReconfigure, settingsImpactDisrupts))
@@ -478,6 +622,15 @@ func settingsInventoryRow(group, label, after string, existed bool, kind setting
 }
 
 func edgeForwardPresent(values []edgeForwardSetting, target edgeForwardSetting) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func stringPresent(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
 			return true
@@ -548,6 +701,12 @@ func (m Model) settingsEditorDocument(rowWidth int) ([]string, int) {
 	}
 	if m.settingsEditor.inputKind != settingsInputNone {
 		prompt := "Port forward: <tcp|udp> <listen-port> <client-port>"
+		switch m.settingsEditor.inputKind {
+		case settingsInputVPNDestination:
+			prompt = "VPN destination: <IPv4 CIDR|all>"
+		case settingsInputDNS:
+			prompt = "DNS server: <IPv4 address>"
+		}
 		document = append(document, "", styleHeader.Render("ADD INVENTORY"), prompt, "> "+m.settingsEditor.input+"|")
 		selectedLine = len(document) - 1
 	}
